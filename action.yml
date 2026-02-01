@@ -1,0 +1,101 @@
+name: 'QA Bot'
+description: 'AI-powered website QA testing using Claude - explores user flows and finds bugs, broken elements, or usability problems'
+author: 'integuide'
+
+branding:
+  icon: 'search'
+  color: 'purple'
+
+inputs:
+  url:
+    description: 'Target URL to test'
+    required: true
+
+  goal:
+    description: 'Testing goal/focus - what should the AI look for?'
+    required: false
+    default: 'Explore user flows and find bugs, broken elements, or usability problems.'
+
+  max-agents:
+    description: 'Maximum parallel AI agents (more = faster but more API usage)'
+    required: false
+    default: '3'
+
+  max-cost:
+    description: 'Maximum cost in USD (default: $5.00)'
+    required: false
+    default: '5.0'
+
+  max-duration:
+    description: 'Maximum exploration duration in minutes'
+    required: false
+    default: '30'
+
+  anthropic-api-key:
+    description: 'Anthropic API key for Claude'
+    required: true
+
+  model:
+    description: 'Claude model to use (claude-haiku-4-5, claude-sonnet-4-5, etc.)'
+    required: false
+    default: 'claude-haiku-4-5'
+
+  post-comment:
+    description: 'Post results as a PR comment (true/false)'
+    required: false
+    default: 'true'
+
+  fail-on-critical:
+    description: 'Fail the workflow if critical issues are found (true/false)'
+    required: false
+    default: 'true'
+
+  credentials:
+    description: 'Test credentials in env format (KEY=value per line). Use secrets for sensitive values.'
+    required: false
+    default: ''
+
+  testmail-api-key:
+    description: 'Testmail.app API key for testing email verification flows (signup, password reset, etc.)'
+    required: false
+
+  testmail-namespace:
+    description: 'Testmail.app namespace for email testing'
+    required: false
+
+  dangerously-skip-permissions:
+    description: 'Auto-approve all irreversible actions (payments, deletions). Use with caution.'
+    required: false
+    default: 'false'
+
+outputs:
+  report:
+    description: 'Markdown QA report with findings'
+
+  issues-count:
+    description: 'Total number of issues found'
+
+  critical-issues:
+    description: 'Number of critical issues found'
+
+  flows-explored:
+    description: 'Number of user flows explored'
+
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+  env:
+    ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+    INPUT_URL: ${{ inputs.url }}
+    INPUT_GOAL: ${{ inputs.goal }}
+    INPUT_MAX_AGENTS: ${{ inputs.max-agents }}
+    INPUT_MAX_COST: ${{ inputs.max-cost }}
+    INPUT_MAX_DURATION: ${{ inputs.max-duration }}
+    INPUT_MODEL: ${{ inputs.model }}
+    INPUT_POST_COMMENT: ${{ inputs.post-comment }}
+    INPUT_FAIL_ON_CRITICAL: ${{ inputs.fail-on-critical }}
+    INPUT_CREDENTIALS: ${{ inputs.credentials }}
+    TESTMAIL_API_KEY: ${{ inputs.testmail-api-key }}
+    TESTMAIL_NAMESPACE: ${{ inputs.testmail-namespace }}
+    INPUT_DANGEROUSLY_SKIP_PERMISSIONS: ${{ inputs.dangerously-skip-permissions }}
+    GITHUB_TOKEN: ${{ github.token }}

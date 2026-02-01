@@ -1,0 +1,92 @@
+# QA Bot - Manual Dispatch
+#
+# This workflow allows manually triggering QA testing via the GitHub Actions UI.
+# Go to Actions > QA Bot (Manual) > Run workflow, then enter the URL to test.
+#
+# Setup:
+# 1. Copy this file to .github/workflows/qa-bot-manual.yml
+# 2. Add ANTHROPIC_API_KEY to repository secrets
+# 3. Go to Actions tab and run manually
+
+name: QA Bot (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL to test'
+        required: true
+        type: string
+
+      goal:
+        description: 'Testing focus (optional)'
+        required: false
+        type: string
+        default: 'Explore user flows and find bugs, broken elements, or usability problems.'
+
+      max-agents:
+        description: 'Maximum parallel agents'
+        required: false
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '5'
+        default: '3'
+
+      max-duration:
+        description: 'Maximum duration (minutes)'
+        required: false
+        type: choice
+        options:
+          - '5'
+          - '10'
+          - '15'
+          - '30'
+        default: '30'
+
+      max-cost:
+        description: 'Maximum cost in USD (default: $5.00)'
+        required: false
+        type: string
+        default: '5.0'
+
+jobs:
+  qa-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run QA Bot
+        id: qa
+        uses: ./qa-bot/action
+        with:
+          url: ${{ inputs.url }}
+          goal: ${{ inputs.goal }}
+          max-agents: ${{ inputs.max-agents }}
+          max-duration: ${{ inputs.max-duration }}
+          max-cost: ${{ inputs.max-cost }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          post-comment: 'false'  # No PR to comment on
+
+      - name: Write Summary
+        run: |
+          echo "### QA Bot Results for ${{ inputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Flows explored:** ${{ steps.qa.outputs.flows-explored }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Issues found:** ${{ steps.qa.outputs.issues-count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Critical issues:** ${{ steps.qa.outputs.critical-issues }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Full Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '${{ steps.qa.outputs.report }}' >> $GITHUB_STEP_SUMMARY
+
+      - name: Save report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-report
+          path: |
+            /tmp/qa-result.json
