@@ -101,13 +101,13 @@ class BrowserController:
         """Set up event listeners for console, network, dialogs, and popups."""
         if not self._page:
             return  # No page, no listeners to set up
-        self._setup_console_listener()
-        self._setup_network_listeners()
-        self._setup_dialog_listener()
+        self._setup_console_listener(self._page)
+        self._setup_network_listeners(self._page)
+        self._setup_dialog_listener(self._page)
         self._setup_popup_listener()
 
-    def _setup_console_listener(self):
-        """Set up console message listener on the page."""
+    def _setup_console_listener(self, page: Page):
+        """Set up console message listener on a page."""
 
         def on_console(msg: ConsoleMessage):
             location_str = ""
@@ -119,16 +119,16 @@ class BrowserController:
                 CapturedConsoleMessage(
                     level=msg.type,  # "error", "warning", "info", etc.
                     text=msg.text,
-                    url=self._page.url if self._page else "",
+                    url=page.url if page else "",
                     timestamp=datetime.now().isoformat(),
                     location=location_str,
                 )
             )
 
-        self._page.on("console", on_console)
+        page.on("console", on_console)
 
-    def _setup_network_listeners(self):
-        """Set up network request/response listeners."""
+    def _setup_network_listeners(self, page: Page):
+        """Set up network request/response listeners on a page."""
 
         def on_request(request: Request):
             self._pending_requests[request.url] = {
@@ -221,19 +221,19 @@ class BrowserController:
                     )
                 )
 
-        self._page.on("request", on_request)
-        self._page.on("response", on_response)
-        self._page.on("requestfailed", on_request_failed)
+        page.on("request", on_request)
+        page.on("response", on_response)
+        page.on("requestfailed", on_request_failed)
 
-    def _setup_dialog_listener(self):
-        """Set up dialog auto-handling and recording."""
+    def _setup_dialog_listener(self, page: Page):
+        """Set up dialog auto-handling and recording on a page."""
 
         async def on_dialog(dialog: Dialog):
             captured = CapturedDialog(
                 dialog_type=dialog.type,
                 message=dialog.message,
                 default_value=dialog.default_value or "",
-                url=self._page.url if self._page else "",
+                url=page.url if page else "",
                 timestamp=datetime.now().isoformat(),
                 was_accepted=True,  # Will be updated based on action
                 response_value="",
@@ -264,7 +264,7 @@ class BrowserController:
 
             self._dialogs.append(captured)
 
-        self._page.on("dialog", on_dialog)
+        page.on("dialog", on_dialog)
 
     def _setup_popup_listener(self):
         """Set up popup window listener."""
@@ -307,119 +307,13 @@ class BrowserController:
         self._page.on("popup", on_popup)
 
     def _setup_popup_monitoring(self, popup: Page):
-        """Set up console/network/dialog monitoring on a popup page."""
-        # Console listener for popup
-        def on_console(msg: ConsoleMessage):
-            location_str = ""
-            if msg.location:
-                loc = msg.location
-                location_str = f"{loc.get('url', '')}:{loc.get('lineNumber', '')}:{loc.get('columnNumber', '')}"
+        """Set up console/network/dialog monitoring on a popup page.
 
-            self._console_messages.append(
-                CapturedConsoleMessage(
-                    level=msg.type,
-                    text=msg.text,
-                    url=popup.url if popup else "",
-                    timestamp=datetime.now().isoformat(),
-                    location=location_str,
-                )
-            )
-
-        popup.on("console", on_console)
-
-        # Network listeners for popup
-        def on_request(request: Request):
-            self._pending_requests[request.url] = {
-                "method": request.method,
-                "resource_type": request.resource_type,
-                "start_time": time.time(),
-            }
-
-        def on_response(response: Response):
-            url = response.url
-            if url in self._pending_requests:
-                start_info = self._pending_requests.pop(url)
-                duration = (time.time() - start_info["start_time"]) * 1000
-
-                self._network_requests.append(
-                    CapturedNetworkRequest(
-                        url=url,
-                        method=start_info["method"],
-                        status=response.status,
-                        status_text=response.status_text,
-                        resource_type=start_info["resource_type"],
-                        timestamp=datetime.now().isoformat(),
-                        duration_ms=duration,
-                        failed=response.status >= 400,
-                        failure_reason="" if response.status < 400 else f"HTTP {response.status}",
-                    )
-                )
-
-        def on_request_failed(request: Request):
-            url = request.url
-            if url in self._pending_requests:
-                start_info = self._pending_requests.pop(url)
-                duration = (time.time() - start_info["start_time"]) * 1000
-
-                failure_text = ""
-                if request.failure:
-                    failure_text = request.failure
-
-                self._network_requests.append(
-                    CapturedNetworkRequest(
-                        url=url,
-                        method=start_info["method"],
-                        status=0,
-                        status_text="",
-                        resource_type=start_info["resource_type"],
-                        timestamp=datetime.now().isoformat(),
-                        duration_ms=duration,
-                        failed=True,
-                        failure_reason=failure_text or "Request failed",
-                    )
-                )
-
-        popup.on("request", on_request)
-        popup.on("response", on_response)
-        popup.on("requestfailed", on_request_failed)
-
-        # Dialog listener for popup
-        async def on_dialog(dialog: Dialog):
-            captured = CapturedDialog(
-                dialog_type=dialog.type,
-                message=dialog.message,
-                default_value=dialog.default_value or "",
-                url=popup.url if popup else "",
-                timestamp=datetime.now().isoformat(),
-                was_accepted=True,
-                response_value="",
-            )
-
-            if self._dialog_handler == "auto":
-                if dialog.type == "alert":
-                    await dialog.accept()
-                    captured.was_accepted = True
-                elif dialog.type == "confirm":
-                    await dialog.accept()
-                    captured.was_accepted = True
-                elif dialog.type == "prompt":
-                    response_val = dialog.default_value or "test"
-                    await dialog.accept(response_val)
-                    captured.was_accepted = True
-                    captured.response_value = response_val
-                elif dialog.type == "beforeunload":
-                    await dialog.dismiss()
-                    captured.was_accepted = False
-            elif self._dialog_handler == "accept":
-                await dialog.accept()
-                captured.was_accepted = True
-            else:
-                await dialog.dismiss()
-                captured.was_accepted = False
-
-            self._dialogs.append(captured)
-
-        popup.on("dialog", on_dialog)
+        Reuses the same listener setup methods as the main page.
+        """
+        self._setup_console_listener(popup)
+        self._setup_network_listeners(popup)
+        self._setup_dialog_listener(popup)
 
     @classmethod
     def from_page(cls, page: Page) -> "BrowserController":
@@ -443,11 +337,12 @@ class BrowserController:
         """
         if level:
             msgs = [m for m in self._console_messages if m.level == level]
+            if clear:
+                self._console_messages = [m for m in self._console_messages if m.level != level]
         else:
             msgs = list(self._console_messages)
-
-        if clear:
-            self._console_messages.clear()
+            if clear:
+                self._console_messages.clear()
         return msgs
 
     def get_console_errors(self) -> list[CapturedConsoleMessage]:
@@ -493,13 +388,18 @@ class BrowserController:
             requests = [r for r in requests if r.status >= min_status]
 
         if clear:
-            self._network_requests.clear()
+            # Only clear the requests that matched our filters
+            returned_set = set(id(r) for r in requests)
+            self._network_requests = [r for r in self._network_requests if id(r) not in returned_set]
         return list(requests)
 
     def clear_network_requests(self):
-        """Clear all captured network requests."""
+        """Clear all captured (completed) network requests to free memory.
+
+        Does not clear _pending_requests so in-flight requests can still
+        be tracked to completion.
+        """
         self._network_requests.clear()
-        self._pending_requests.clear()
 
     # ===== Dialog Handling =====
 
@@ -597,10 +497,12 @@ class BrowserController:
                     self._active_popup.close(),
                     timeout=timeout / 1000  # Convert ms to seconds
                 )
+                self._active_popup = None
+                return True
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout closing popup after {timeout}ms")
-            self._active_popup = None
-            return True
+                # Don't clear reference - popup may still be open
+                return False
         return False
 
     def switch_to_main_page(self) -> None:

@@ -1,6 +1,7 @@
 """Flow-based exploration orchestrator that spawns workers per flow."""
 
 import asyncio
+import gc
 import logging
 from typing import AsyncGenerator, Optional
 from datetime import datetime
@@ -14,7 +15,7 @@ from qa_bot.orchestrator.worker import FlowExplorationWorker
 from qa_bot.orchestrator.supervisor import SupervisorAgent
 from qa_bot.orchestrator.synthesis import SynthesisAgent
 from qa_bot.orchestrator.flow import FlowTask, FlowStatus
-from qa_bot.config import VIEWPORT_WIDTH, VIEWPORT_HEIGHT, LOG_CHAT_HISTORY, LOG_DIR, LOG_SCREENSHOTS, LOG_MAX_RUNS, ENVIRONMENT, TESTMAIL_API_KEY, TESTMAIL_NAMESPACE, MAX_COST_CAP_USD
+from qa_bot.config import VIEWPORT_WIDTH, VIEWPORT_HEIGHT, LOG_CHAT_HISTORY, LOG_DIR, LOG_SCREENSHOTS, LOG_MAX_RUNS, ENVIRONMENT, TESTMAIL_API_KEY, TESTMAIL_NAMESPACE, MAX_COST_CAP_USD, DEFAULT_MODEL
 from qa_bot.utils.chat_logger import ChatLogger
 from qa_bot.services.email_service import EmailService
 
@@ -86,7 +87,8 @@ class FlowExplorationOrchestrator:
         max_duration_minutes: int = 30,
         max_cost_usd: float = 5.0,
         testmail_api_key: Optional[str] = None,
-        testmail_namespace: Optional[str] = None
+        testmail_namespace: Optional[str] = None,
+        exploration_id: Optional[str] = None,
     ) -> AsyncGenerator[dict, None]:
         """
         Run flow-based parallel exploration of target URL.
@@ -108,7 +110,7 @@ class FlowExplorationOrchestrator:
         self._available_worker_numbers = set(range(1, num_agents + 1))
 
         # Get model from AI provider for cost tracking
-        model = getattr(self.ai, 'model', 'claude-haiku-4-5')
+        model = getattr(self.ai, 'model', DEFAULT_MODEL)
 
         # Initialize shared flow state
         self._shared_state = SharedFlowState.create(
@@ -119,6 +121,7 @@ class FlowExplorationOrchestrator:
             max_cost_usd=max_cost_usd,
             model=model,
             skip_permissions=self._skip_permissions,
+            exploration_id=exploration_id,
         )
 
         # Set initial credentials if provided
@@ -343,7 +346,8 @@ class FlowExplorationOrchestrator:
                         # remain as workers left them (should be fully released)
                         active_workers = self._shared_state._active_workers
                         if active_workers > 0:
-                            logger.warning(f"Resuming with {active_workers} active workers still tracked in shared state")
+                            logger.warning(f"Resuming with {active_workers} active workers still tracked - resetting to 0")
+                            self._shared_state._active_workers = 0
                         self._active_worker_tasks.clear()
                         self._available_worker_numbers = set(range(1, num_agents + 1))
                         # Reset semaphore to full capacity for fresh start
@@ -466,9 +470,21 @@ class FlowExplorationOrchestrator:
                 }
             }
             _log_event(event)
+
+            # Write summary.json before yielding final event — code after
+            # yield in an async generator may not execute if consumer stops iterating
+            self._write_summary(final_progress, status="completed")
+
             yield event
 
         except Exception as e:
+            # Write summary.json even on error
+            try:
+                error_progress = await self._shared_state.get_progress()
+                self._write_summary(error_progress, status="error", error=str(e))
+            except Exception:
+                pass  # Best-effort, don't mask the original error
+
             event = {
                 "type": "error",
                 "data": {
@@ -600,6 +616,32 @@ class FlowExplorationOrchestrator:
                 "data": {"error": str(e)}
             })
 
+    def _write_summary(self, progress: dict, status: str = "completed", error: Optional[str] = None):
+        """Write summary.json to the log directory for monitoring."""
+        if not self._shared_state or not self._shared_state.chat_logger:
+            return
+
+        summary = {
+            "exploration_id": progress.get("exploration_id", ""),
+            "url": progress.get("target_url", ""),
+            "started": self._shared_state.start_time.isoformat(),
+            "duration_seconds": round(progress.get("elapsed_seconds", 0), 1),
+            "model": self._shared_state.model,
+            "tokens": progress.get("token_breakdown", {}),
+            "estimated_cost_usd": round(progress.get("cost_usd", 0), 4),
+            "flows": {
+                "completed": progress.get("flows", {}).get("completed", 0),
+                "total": progress.get("flows", {}).get("total", 0),
+            },
+            "issues_found": progress.get("issues_found", 0),
+            "total_actions": progress.get("total_actions", 0),
+            "status": status,
+        }
+        if error is not None:
+            summary["error"] = error
+
+        self._shared_state.chat_logger.write_summary(summary)
+
     async def _cleanup(self):
         """Clean up all resources."""
         # Stop supervisor
@@ -633,6 +675,14 @@ class FlowExplorationOrchestrator:
         # Close chat logger to prevent resource leaks
         if self._shared_state and self._shared_state.chat_logger:
             self._shared_state.chat_logger.close()
+
+        # Release heavy data structures inside shared state so the GC can
+        # reclaim memory without waiting for the full object graph to die.
+        if self._shared_state:
+            await self._shared_state.cleanup()
+
+        # Force a GC cycle to collect any circular references promptly.
+        gc.collect()
 
     def request_stop(self):
         """Request exploration to stop gracefully."""

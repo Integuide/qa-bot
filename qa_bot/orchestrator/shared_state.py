@@ -1,6 +1,7 @@
 """Shared state for coordinating flow-based parallel exploration."""
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING
@@ -8,7 +9,7 @@ from urllib.parse import urlparse
 import uuid
 
 from qa_bot.agent.state import Issue
-from qa_bot.config import calculate_cost
+from qa_bot.config import calculate_cost, DEFAULT_MODEL
 from qa_bot.orchestrator.flow import FlowTask, FlowCheckpoint, FlowPath, FlowStatus, FlowExplorationData
 
 
@@ -141,7 +142,7 @@ class SharedFlowState:
     max_branches_per_flow: int = 10  # Limit branching to prevent explosion
     max_duration_minutes: int = 30  # 30 minutes default
     max_cost_usd: float = 5.0  # Max cost limit in USD
-    model: str = "claude-haiku-4-5"  # Model for cost calculation
+    model: str = DEFAULT_MODEL  # Model for cost calculation
 
     # State tracking
     start_time: datetime = field(default_factory=datetime.now)
@@ -181,6 +182,7 @@ class SharedFlowState:
 
     # Results aggregation
     _all_issues: list[Issue] = field(default_factory=list)
+    _issue_screenshot_counter: int = 0
 
     # Lock for thread-safe operations
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -220,6 +222,9 @@ class SharedFlowState:
     # Email service (set by coordinator if Mailslurp configured)
     email_service: Optional["EmailService"] = None
 
+    # HTTP Basic Auth (shared across all workers)
+    _http_auth: Optional[dict] = None  # {username, password, target_url}
+
     # Pause/resume state
     paused: bool = False
     paused_at: Optional[datetime] = None
@@ -234,11 +239,12 @@ class SharedFlowState:
         max_branches_per_flow: int = 10,
         max_duration_minutes: int = 30,
         max_cost_usd: float = 5.0,
-        model: str = "claude-haiku-4-5",
+        model: str = DEFAULT_MODEL,
         skip_permissions: bool = False,
+        exploration_id: Optional[str] = None,
     ) -> "SharedFlowState":
         """Create a new shared flow state with initial root flow."""
-        exploration_id = str(uuid.uuid4())
+        exploration_id = exploration_id or str(uuid.uuid4())
         target_domain = extract_domain(target_url)
 
         state = cls(
@@ -272,6 +278,37 @@ class SharedFlowState:
         state._task_queue.put_nowait(root_flow)
 
         return state
+
+    async def cleanup(self):
+        """Release all heavy data structures to free memory after exploration ends.
+
+        Called by the coordinator during cleanup.  Clears registries, queues,
+        and accumulated results so the Python GC can reclaim memory promptly
+        without waiting for the entire object graph to become unreachable.
+        """
+        async with self._lock:
+            self._checkpoint_registry.clear()
+            self._flow_registry.clear()
+            self._all_issues.clear()
+            self._approval_responses.clear()
+            self._pending_approval_requests.clear()
+            self._blocked_workers.clear()
+            self._unblock_events.clear()
+            self._unblock_responses.clear()
+            self._worker_messages.clear()
+            self._pause_checkpoints.clear()
+            self._skip_set.clear()
+            self._skip_reasons.clear()
+            self._pending_credential_requests.clear()
+            self._pending_data_requests.clear()
+            self._user_data.clear()
+            self._credentials.clear()
+            # Drain the task queue
+            while not self._task_queue.empty():
+                try:
+                    self._task_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
 
     # -------------------------------------------------------------------------
     # Flow Task Management
@@ -378,7 +415,8 @@ class SharedFlowState:
                 flow_name=flow_task.flow_name,
                 flow_path=flow_task.flow_path,
                 status=FlowStatus.PENDING,
-                parent_flow_id=checkpoint.parent_flow_id
+                parent_flow_id=checkpoint.parent_flow_id,
+                checkpoint_id=checkpoint.checkpoint_id,
             )
 
             # Track as child of parent flow
@@ -429,6 +467,7 @@ class SharedFlowState:
                 flow_path=flow_task.flow_path,
                 status=FlowStatus.BLOCKED_FOR_PAUSE,
                 parent_flow_id=checkpoint.parent_flow_id,
+                checkpoint_id=checkpoint.checkpoint_id,
                 is_first_worker=parent_is_first_worker  # Propagate first worker flag
             )
             self._pause_checkpoints.append(flow_task)
@@ -487,7 +526,8 @@ class SharedFlowState:
                     flow_id=flow_task.flow_id,
                     flow_name=flow_task.flow_name,
                     flow_path=flow_task.flow_path,
-                    parent_flow_id=flow_task.parent_flow_id
+                    parent_flow_id=flow_task.parent_flow_id,
+                    checkpoint_id=flow_task.checkpoint_id,
                 )
 
             flow_data = self._flow_registry[flow_task.flow_id]
@@ -496,6 +536,19 @@ class SharedFlowState:
             flow_data.started_at = datetime.now()
 
             return flow_data
+
+    def _prune_checkpoint_data(self, checkpoint_id: Optional[str]):
+        """Clear heavy payload data from a claimed checkpoint to free memory.
+
+        Preserves metadata (ids, timestamps, branch_name) but clears
+        conversation_history and browser_storage_state.
+        Must be called while holding self._lock.
+        """
+        if checkpoint_id and checkpoint_id in self._checkpoint_registry:
+            cp = self._checkpoint_registry[checkpoint_id]
+            if cp.claimed:
+                cp.conversation_history = []
+                cp.browser_storage_state = {}
 
     async def complete_flow(
         self,
@@ -509,6 +562,7 @@ class SharedFlowState:
                 flow_data.status = FlowStatus.COMPLETED
                 flow_data.completed_at = datetime.now()
                 flow_data.completion_reason = completion_reason
+                self._prune_checkpoint_data(flow_data.checkpoint_id)
 
     async def fail_flow(self, flow_id: str, error: str = ""):
         """Mark a flow as failed."""
@@ -518,6 +572,7 @@ class SharedFlowState:
                 flow_data.status = FlowStatus.FAILED
                 flow_data.completed_at = datetime.now()
                 flow_data.completion_reason = f"Failed: {error}"
+                self._prune_checkpoint_data(flow_data.checkpoint_id)
 
     # -------------------------------------------------------------------------
     # Recording Events
@@ -547,6 +602,13 @@ class SharedFlowState:
             if flow_id in self._flow_registry:
                 if url not in self._flow_registry[flow_id].urls_visited:
                     self._flow_registry[flow_id].urls_visited.append(url)
+
+    async def get_next_issue_screenshot_index(self) -> int:
+        """Get next unique index for issue screenshot filename."""
+        async with self._lock:
+            idx = self._issue_screenshot_counter
+            self._issue_screenshot_counter += 1
+            return idx
 
     async def add_issue(self, issue: Issue) -> bool:
         """Add an issue (with deduplication)."""
@@ -643,7 +705,7 @@ class SharedFlowState:
     async def decrement_active_workers(self):
         """Decrement active worker count when a worker stops."""
         async with self._lock:
-            self._active_workers -= 1
+            self._active_workers = max(0, self._active_workers - 1)
 
     # -------------------------------------------------------------------------
     # State Queries
@@ -765,6 +827,50 @@ class SharedFlowState:
         except asyncio.TimeoutError:
             return False
 
+    # -------------------------------------------------------------------------
+    # HTTP Basic Auth
+    # -------------------------------------------------------------------------
+
+    def _detect_http_auth(self, credentials: dict[str, str]):
+        """Detect HTTP auth credentials from key patterns and store them.
+
+        NOTE: Caller must hold self._lock.
+        Looks for username/password-like keys in the provided credentials.
+        Uses exact match or suffix matching to avoid false positives
+        (e.g., "POWER_USER", "BYPASS" should not match).
+        """
+        _USERNAME_KEYS = {"username", "user_name", "http_username", "login", "user"}
+        _PASSWORD_KEYS = {"password", "pass_word", "http_password", "pass"}
+
+        username = None
+        password = None
+        for key, value in credentials.items():
+            key_lower = key.lower()
+            if key_lower in _USERNAME_KEYS or key_lower.endswith("_username") or key_lower.endswith("_user"):
+                username = value
+            elif key_lower in _PASSWORD_KEYS or key_lower.endswith("_password") or key_lower.endswith("_pass"):
+                password = value
+        if username and password:
+            self._http_auth = {
+                "username": username,
+                "password": password,
+                "target_url": self.target_url
+            }
+
+    async def set_http_auth(self, username: str, password: str, target_url: str):
+        """Explicitly set HTTP Basic Auth credentials."""
+        async with self._lock:
+            self._http_auth = {
+                "username": username,
+                "password": password,
+                "target_url": target_url
+            }
+
+    async def get_http_auth(self) -> Optional[dict]:
+        """Get HTTP auth credentials if set. Returns {username, password, target_url} or None."""
+        async with self._lock:
+            return self._http_auth
+
     async def add_token_usage(
         self,
         input_tokens: int = 0,
@@ -799,30 +905,48 @@ class SharedFlowState:
             self._dialog_count += 1
 
     def is_complete(self) -> bool:
-        """Check if exploration is complete (no active workers, no pending flows, no blocked flows)."""
+        """Check if exploration is complete (no active workers, no pending flows, no blocked flows).
+
+        Note: This reads shared state without the async lock since it's called from
+        synchronous contexts. The values read are set under the lock elsewhere, and
+        a momentarily stale read here is safe (the caller will re-check on next loop).
+        """
         if not self._task_queue.empty() or self._active_workers > 0:
             return False
         # Don't complete if there are pause checkpoints waiting
         if self._pause_checkpoints:
             return False
         # Don't complete if there are flows blocked waiting for credentials, approval, or pause
-        blocked_flows = sum(
-            1 for f in self._flow_registry.values()
-            if f.status in (FlowStatus.BLOCKED_FOR_CREDENTIALS, FlowStatus.BLOCKED_FOR_APPROVAL, FlowStatus.BLOCKED_FOR_PAUSE)
+        has_blocked = any(
+            f.status in (FlowStatus.BLOCKED_FOR_CREDENTIALS, FlowStatus.BLOCKED_FOR_APPROVAL, FlowStatus.BLOCKED_FOR_PAUSE)
+            for f in self._flow_registry.values()
         )
-        return blocked_flows == 0
+        return not has_blocked
 
     async def get_progress(self) -> dict:
         """Get current progress snapshot."""
         async with self._lock:
-            completed = sum(1 for f in self._flow_registry.values() if f.status == FlowStatus.COMPLETED)
-            pending = sum(1 for f in self._flow_registry.values() if f.status == FlowStatus.PENDING)
-            exploring = sum(1 for f in self._flow_registry.values() if f.status == FlowStatus.EXPLORING)
-            failed = sum(1 for f in self._flow_registry.values() if f.status == FlowStatus.FAILED)
-            skipped = sum(1 for f in self._flow_registry.values() if f.status == FlowStatus.SKIPPED)
-            blocked_for_credentials = sum(1 for f in self._flow_registry.values() if f.status == FlowStatus.BLOCKED_FOR_CREDENTIALS)
-            blocked_for_approval = sum(1 for f in self._flow_registry.values() if f.status == FlowStatus.BLOCKED_FOR_APPROVAL)
-            blocked_for_pause = sum(1 for f in self._flow_registry.values() if f.status == FlowStatus.BLOCKED_FOR_PAUSE)
+            # Single pass over flow registry to count all statuses
+            completed = pending = exploring = failed = skipped = 0
+            blocked_for_credentials = blocked_for_approval = blocked_for_pause = 0
+            for f in self._flow_registry.values():
+                status = f.status
+                if status == FlowStatus.COMPLETED:
+                    completed += 1
+                elif status == FlowStatus.PENDING:
+                    pending += 1
+                elif status == FlowStatus.EXPLORING:
+                    exploring += 1
+                elif status == FlowStatus.FAILED:
+                    failed += 1
+                elif status == FlowStatus.SKIPPED:
+                    skipped += 1
+                elif status == FlowStatus.BLOCKED_FOR_CREDENTIALS:
+                    blocked_for_credentials += 1
+                elif status == FlowStatus.BLOCKED_FOR_APPROVAL:
+                    blocked_for_approval += 1
+                elif status == FlowStatus.BLOCKED_FOR_PAUSE:
+                    blocked_for_pause += 1
 
             # Calculate exploration budget (reserves portion for synthesis)
             exploration_budget = None
@@ -945,6 +1069,11 @@ class SharedFlowState:
             self._unblock_events.pop(worker_id, None)
             return response
         except asyncio.TimeoutError:
+            # Clean up stale entries to prevent supervisor from repeatedly handling this worker
+            async with self._lock:
+                self._blocked_workers.pop(worker_id, None)
+                self._unblock_events.pop(worker_id, None)
+                self._unblock_responses.pop(worker_id, None)
             return None
 
     async def unblock_worker(self, worker_id: str, response: dict):
@@ -1066,9 +1195,11 @@ class SharedFlowState:
 
         Can be called at start (pre-provided) or mid-exploration (user-provided).
         Merges with existing credentials (new values override old).
+        Also detects HTTP Basic Auth credentials from key patterns.
         """
         async with self._lock:
             self._credentials.update(credentials)
+            self._detect_http_auth(credentials)
 
     async def get_credentials(self) -> dict[str, str]:
         """Get all stored credentials."""
@@ -1126,11 +1257,13 @@ class SharedFlowState:
         User provides credentials via UI/API.
 
         Stores credentials and creates a retry flow if there were pending requests.
+        Also detects HTTP Basic Auth credentials from key patterns.
         Returns dict with new flow info if created, or None.
         """
         async with self._lock:
             # Store the credentials
             self._credentials.update(credentials)
+            self._detect_http_auth(credentials)
 
             # If there were pending requests, create a retry flow
             if self._pending_credential_requests:
@@ -1176,6 +1309,7 @@ class SharedFlowState:
                     flow_path=flow_path,
                     status=FlowStatus.PENDING,
                     parent_flow_id=original_flow_id,
+                    checkpoint_id=checkpoint_id,
                     is_first_worker=original_is_first_worker,  # Propagate first worker flag
                 )
 
@@ -1227,18 +1361,15 @@ class SharedFlowState:
 
         The flow remains in a special BLOCKED_FOR_CREDENTIALS status until
         credentials are provided and a new flow is created to resume.
-        Also clears the worker_id since the worker is no longer exploring this flow.
+        Clears worker_id for display purposes; the active worker count is
+        decremented by the coordinator when the worker task finishes.
         """
         async with self._lock:
             if flow_id in self._flow_registry:
                 flow_data = self._flow_registry[flow_id]
                 flow_data.status = FlowStatus.BLOCKED_FOR_CREDENTIALS
                 flow_data.completion_reason = f"Blocked for credentials: {reason}"
-
-                # Decrement active worker count and clear worker_id
-                if flow_data.worker_id:
-                    self._active_workers = max(0, self._active_workers - 1)
-                    flow_data.worker_id = None  # Worker no longer on this flow
+                flow_data.worker_id = None  # Worker no longer on this flow
 
     # -------------------------------------------------------------------------
     # User Data Management (new flexible system)
@@ -1345,6 +1476,7 @@ class SharedFlowState:
                     flow_path=flow_path,
                     status=FlowStatus.PENDING,
                     parent_flow_id=original_flow_id,
+                    checkpoint_id=request.checkpoint_id,
                     is_first_worker=original_is_first_worker,  # Propagate first worker flag
                 )
 
@@ -1406,7 +1538,6 @@ class SharedFlowState:
         Extracts the action type (delete, publish, send, purchase) and normalizes it.
         Uses word boundary matching to avoid false positives (e.g., "unpublished" shouldn't match "publish").
         """
-        import re
         action_lower = action_description.lower()
         # Extract key action verbs using word boundaries to avoid substring matches
         # e.g., "unpublished" should NOT match "publish"
@@ -1562,6 +1693,7 @@ class SharedFlowState:
                 flow_path=flow_path,
                 status=FlowStatus.PENDING,
                 parent_flow_id=original_flow_id,
+                checkpoint_id=checkpoint_id,
                 is_first_worker=original_is_first_worker,  # Propagate first worker flag
             )
 
@@ -1614,15 +1746,12 @@ class SharedFlowState:
         Mark a flow as blocked waiting for user approval of an irreversible action.
 
         Similar to block_flow_for_credentials but for approval requests.
-        Also clears the worker_id since the worker is no longer exploring this flow.
+        Clears worker_id for display purposes; the active worker count is
+        decremented by the coordinator when the worker task finishes.
         """
         async with self._lock:
             if flow_id in self._flow_registry:
                 flow_data = self._flow_registry[flow_id]
                 flow_data.status = FlowStatus.BLOCKED_FOR_APPROVAL
                 flow_data.completion_reason = f"Blocked for approval: {reason}"
-
-                # Decrement active worker count and clear worker_id
-                if flow_data.worker_id:
-                    self._active_workers = max(0, self._active_workers - 1)
-                    flow_data.worker_id = None  # Worker no longer on this flow
+                flow_data.worker_id = None  # Worker no longer on this flow

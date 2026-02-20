@@ -627,6 +627,28 @@ class ChatLogger:
 
         return filepath
 
+    def save_issue_screenshot(self, screenshot_bytes: bytes, issue_index: int) -> Optional[str]:
+        """
+        Save an issue screenshot to the screenshots directory.
+
+        Unlike save_screenshot(), this is NOT gated by the _save_screenshots flag
+        because issue screenshots are saved unconditionally (they replace in-memory
+        base64 storage to reduce memory usage).
+
+        Returns relative path from base_dir (e.g. "screenshots/issue_000.png") or None on error.
+        """
+        try:
+            screenshots_dir = self.base_dir / "screenshots"
+            screenshots_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"issue_{issue_index:03d}.png"
+            filepath = screenshots_dir / filename
+            with open(filepath, "wb") as f:
+                f.write(screenshot_bytes)
+            return f"screenshots/{filename}"
+        except Exception as e:
+            self._ops_logger.warning(f"Failed to save issue screenshot {issue_index}: {e}")
+            return None
+
     # =========================================================================
     # Supervisor Chat Logging
     # =========================================================================
@@ -697,6 +719,24 @@ class ChatLogger:
         self._append(file_path, "--- REPORT ---\n")
         self._append(file_path, report)
         self._append(file_path, "\n\n")
+
+    # =========================================================================
+    # Exploration Summary
+    # =========================================================================
+
+    def write_summary(self, data: dict):
+        """
+        Write a summary.json file to the exploration log directory.
+
+        This is called at the end of an exploration (success or error) to
+        provide a machine-readable summary for monitoring and analytics.
+        """
+        summary_path = self.base_dir / "summary.json"
+        try:
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, default=str)
+        except Exception as e:
+            logging.warning(f"Failed to write summary.json: {e}")
 
     def close(self):
         """Clean up logger resources to prevent memory leaks."""

@@ -38,37 +38,44 @@ def _get_port_from_branch() -> int:
 
 # AI Provider Configuration
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-AI_MODEL = os.getenv("AI_MODEL", "claude-haiku-4-5")
+
+# Model ID constants (single source of truth for model identifiers)
+MODEL_HAIKU = "claude-haiku-4-5"
+MODEL_SONNET = "claude-sonnet-4-6"
+MODEL_OPUS = "claude-opus-4-6"
+DEFAULT_MODEL = MODEL_HAIKU
+
+AI_MODEL = os.getenv("AI_MODEL", DEFAULT_MODEL)
 
 # Model pricing per million tokens (USD)
 # Used for cost tracking and Max Cost -> Max Tokens conversion
-# Source: https://www.anthropic.com/pricing (as of 2025)
+# Source: https://platform.claude.com/docs/en/about-claude/pricing (Feb 2026)
 MODEL_PRICING: dict[str, dict[str, float]] = {
-    "claude-haiku-4-5": {
+    MODEL_HAIKU: {
         "input": 1.0,           # $1/MTok for input tokens
         "output": 5.0,          # $5/MTok for output tokens
         "cache_read": 0.10,     # $0.10/MTok (10% of input)
         "cache_creation": 1.25,    # $1.25/MTok (125% of input)
         "estimated_blended": 2.2,  # For max cost conversion (~70% input, ~30% output)
     },
-    "claude-sonnet-4": {
+    MODEL_SONNET: {
         "input": 3.0,           # $3/MTok for input tokens
         "output": 15.0,         # $15/MTok for output tokens
         "cache_read": 0.30,     # $0.30/MTok (10% of input)
         "cache_creation": 3.75,    # $3.75/MTok (125% of input)
         "estimated_blended": 6.6,  # For max cost conversion (~70% input, ~30% output)
     },
-    "claude-opus-4": {
-        "input": 15.0,          # $15/MTok for input tokens
-        "output": 75.0,         # $75/MTok for output tokens
-        "cache_read": 1.50,     # $1.50/MTok (10% of input)
-        "cache_creation": 18.75,   # $18.75/MTok (125% of input)
-        "estimated_blended": 33.0,  # For max cost conversion (~70% input, ~30% output)
+    MODEL_OPUS: {
+        "input": 5.0,           # $5/MTok for input tokens
+        "output": 25.0,         # $25/MTok for output tokens
+        "cache_read": 0.50,     # $0.50/MTok (10% of input)
+        "cache_creation": 6.25,    # $6.25/MTok (125% of input)
+        "estimated_blended": 11.0,  # For max cost conversion (~70% input, ~30% output)
     },
 }
 
 # Default pricing for unknown models (uses haiku rates)
-DEFAULT_MODEL_PRICING = MODEL_PRICING["claude-haiku-4-5"]
+DEFAULT_MODEL_PRICING = MODEL_PRICING[DEFAULT_MODEL]
 
 
 def get_model_pricing(model: str) -> dict[str, float]:
@@ -127,7 +134,7 @@ if IGNORE_HTTPS_ERRORS:
         )
 
 # Flow Exploration Settings
-_max_agents_raw = int(os.getenv("MAX_AGENTS", "5"))
+_max_agents_raw = int(os.getenv("MAX_AGENTS", "3"))
 MAX_AGENTS = max(1, min(20, _max_agents_raw))  # Clamp to 1-20 range
 MAX_DURATION_MINUTES = int(os.getenv("MAX_DURATION_MINUTES", "30"))  # 30 minutes default
 MAX_CONCURRENT_API_CALLS = int(os.getenv("MAX_CONCURRENT_API_CALLS", "2"))  # Limit concurrent Anthropic API calls

@@ -26,114 +26,170 @@ class SynthesisAgent:
         """
         Create a human-readable summary of an action.
 
-        Extracts the key action type and target from the code.
+        Handles the current JSON action format with action_type, ref, text, etc.
         """
-        code = action.get("code", "")
         success = action.get("success", True)
-        url = action.get("url", "")
+        url = action.get("page_url", action.get("url", ""))
 
-        # Try to extract a description from the code
-        description = self._extract_action_description(code)
+        description = self._describe_action(action)
 
         return {
             "description": description,
             "success": success,
             "url": url,
-            "code": code[:100] if code else ""  # Keep short code snippet for context
         }
 
-    def _extract_action_description(self, code: str) -> str:
+    def _describe_action(self, action: dict) -> str:
         """
-        Extract a human-readable description from action code.
+        Create a human-readable description from an action dict.
 
-        Parses common Playwright patterns to create descriptions like:
-        - "Click 'Login' button"
-        - "Fill email field with test@example.com"
-        - "Navigate to /products"
+        Handles the structured action format:
+        {"action_type": "left_click", "ref": "ref_5", "reasoning": "...", ...}
+        """
+        action_type = action.get("action_type", "")
+        reasoning = action.get("reasoning", "")
+        ref = action.get("ref", "")
+        element = action.get("element", "")
+
+        if not action_type:
+            # Fallback for legacy code-based actions
+            code = action.get("code", "")
+            return self._extract_action_description_from_code(code) if code else "Unknown action"
+
+        # Stringify ref in case it's an integer
+        if ref and not isinstance(ref, str):
+            ref = str(ref)
+
+        # Click actions
+        if action_type in ("left_click", "right_click", "double_click", "triple_click"):
+            click_name = action_type.replace("_", " ").title()
+            target = element or ref or "element"
+            return f"{click_name} {target}"
+
+        # Hover
+        if action_type == "hover":
+            target = element or ref or "element"
+            return f"Hover over {target}"
+
+        # Type text
+        if action_type == "type":
+            text = action.get("text", "")
+            target = element or ref or "field"
+            # Mask sensitive fields (passwords, tokens, etc.)
+            sensitive_keywords = [
+                'password', 'pwd', 'secret', 'token', 'key', 'auth',
+                'credential', 'pin', 'api', 'private', 'ssn', 'cvv'
+            ]
+            target_lower = (element or ref or "").lower()
+            if any(s in target_lower for s in sensitive_keywords):
+                text = "***"
+            elif len(text) > 30:
+                text = text[:27] + "..."
+            return f"Type '{text}' into {target}"
+
+        # Form input
+        if action_type == "form_input":
+            value = action.get("value", "")
+            target = element or ref or "field"
+            return f"Set {target} to '{value}'"
+
+        # Scroll
+        if action_type == "scroll":
+            direction = action.get("scroll_direction", "down")
+            amount = action.get("scroll_amount", 3)
+            return f"Scroll {direction} ({amount} ticks)"
+
+        # Scroll to element
+        if action_type == "scroll_to":
+            target = element or ref or "element"
+            return f"Scroll to {target}"
+
+        # Key press
+        if action_type == "key":
+            key = action.get("key", "")
+            modifiers = action.get("modifiers", [])
+            if modifiers:
+                return f"Press {'+'.join(modifiers)}+{key}"
+            return f"Press {key} key"
+
+        # Navigate
+        if action_type == "navigate":
+            target_url = action.get("target_url", action.get("url", ""))
+            if target_url in ("back", "forward"):
+                return f"Navigate {target_url}"
+            return f"Navigate to {target_url[:50]}" if target_url else "Navigate"
+
+        # Wait
+        if action_type == "wait":
+            duration = action.get("duration", "")
+            return f"Wait {duration}s" if duration else "Wait for page update"
+
+        # Resize
+        if action_type == "resize":
+            width = action.get("width", "?")
+            height = action.get("height", "?")
+            return f"Resize viewport to {width}x{height}"
+
+        # Screenshot/Zoom
+        if action_type == "screenshot":
+            return "Take screenshot"
+        if action_type == "zoom":
+            return "Zoom into region for inspection"
+
+        # Done
+        if action_type == "done":
+            reason = action.get("reason", "")
+            return f"Completed: {reason[:60]}" if reason else "Flow completed"
+
+        # Block
+        if action_type == "block":
+            reason = action.get("reason", "")
+            return f"Blocked: {reason[:60]}" if reason else "Blocked"
+
+        # Report issue
+        if action_type == "report_issue":
+            desc = action.get("issue_description", "")
+            return f"Reported issue: {desc[:50]}" if desc else "Reported issue"
+
+        # Add flow
+        if action_type == "add_flow":
+            flow_name = action.get("flow_name", "")
+            return f"Created flow: {flow_name}" if flow_name else "Created new flow"
+
+        # Request data
+        if action_type == "request_data":
+            name = action.get("request_name", "")
+            return f"Requested data: {name}" if name else "Requested user data"
+
+        # Close popup
+        if action_type == "close_popup":
+            return "Close popup window"
+
+        # Fallback: use reasoning or action_type
+        if reasoning:
+            return reasoning[:60]
+        return action_type.replace("_", " ").title()
+
+    def _extract_action_description_from_code(self, code: str) -> str:
+        """
+        Legacy fallback: extract description from Playwright-style action code.
         """
         if not code:
             return "Unknown action"
 
         code = code.strip()
 
-        # qa.done() - completion
         if match := re.search(r'qa\.done\(["\'](.+?)["\']\)', code):
             return f"Completed: {match.group(1)[:60]}"
-
-        # qa.block() - blocking
         if match := re.search(r'qa\.block\(["\'](.+?)["\']\)', code):
             return f"Blocked: {match.group(1)[:60]}"
-
-        # qa.report_issue() - issue reported
         if match := re.search(r'qa\.report_issue\(["\'](.+?)["\']', code):
             return f"Reported issue: {match.group(1)[:50]}"
-
-        # qa.add_flow() - new flow
         if match := re.search(r'qa\.add_flow\(["\'](.+?)["\']', code):
             return f"Created flow: {match.group(1)}"
-
-        # page.goto() - navigation
         if match := re.search(r'page\.goto\(["\'](.+?)["\']\)', code):
             return f"Navigate to {match.group(1)[:50]}"
 
-        # Click actions
-        if "click" in code.lower():
-            # get_by_role("button", name="X").click()
-            if match := re.search(r'get_by_role\(["\'](\w+)["\'],\s*name=["\'](.+?)["\']\)\.click', code):
-                return f"Click '{match.group(2)}' {match.group(1)}"
-            # get_by_text("X").click()
-            if match := re.search(r'get_by_text\(["\'](.+?)["\']\)\.click', code):
-                return f"Click text '{match.group(1)}'"
-            # get_by_label("X").click()
-            if match := re.search(r'get_by_label\(["\'](.+?)["\']\)\.click', code):
-                return f"Click '{match.group(1)}' field"
-            # qa.click_ref()
-            if match := re.search(r'qa\.click_ref\((\d+)\)', code):
-                return f"Click element ref {match.group(1)}"
-            return "Click action"
-
-        # Fill actions
-        if "fill" in code.lower():
-            # get_by_label("X").fill("Y")
-            if match := re.search(r'get_by_label\(["\'](.+?)["\']\)\.fill\(["\'](.+?)["\']\)', code):
-                value = match.group(2)
-                # Mask sensitive values
-                sensitive_patterns = [
-                    'password', 'pwd', 'secret', 'token', 'key', 'auth',
-                    'credential', 'pin', 'api', 'private', 'ssn', 'cvv'
-                ]
-                if any(s in match.group(1).lower() for s in sensitive_patterns):
-                    value = "***"
-                elif len(value) > 20:
-                    value = value[:17] + "..."
-                return f"Fill '{match.group(1)}' with '{value}'"
-            # get_by_placeholder("X").fill("Y")
-            if match := re.search(r'get_by_placeholder\(["\'](.+?)["\']\)\.fill\(["\'](.+?)["\']\)', code):
-                value = match.group(2)
-                if len(value) > 20:
-                    value = value[:17] + "..."
-                return f"Fill '{match.group(1)}' field with '{value}'"
-            # qa.fill_ref()
-            if match := re.search(r'qa\.fill_ref\((\d+),\s*["\'](.+?)["\']\)', code):
-                value = match.group(2)
-                if len(value) > 20:
-                    value = value[:17] + "..."
-                return f"Fill element ref {match.group(1)} with '{value}'"
-            return "Fill form field"
-
-        # Resize actions
-        if match := re.search(r'qa\.resize\((\d+),\s*(\d+)\)', code):
-            return f"Resize viewport to {match.group(1)}x{match.group(2)}"
-
-        # Keyboard actions
-        if match := re.search(r'page\.keyboard\.press\(["\'](.+?)["\']\)', code):
-            return f"Press {match.group(1)} key"
-
-        # Wait actions
-        if "wait" in code.lower():
-            return "Wait for page update"
-
-        # Default: first line of code, truncated
         first_line = code.split('\n')[0][:60]
         return first_line if first_line else "Unknown action"
 

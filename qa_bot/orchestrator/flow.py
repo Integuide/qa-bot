@@ -245,6 +245,7 @@ class FlowExplorationData:
     flow_path: FlowPath
     status: FlowStatus = FlowStatus.PENDING
     parent_flow_id: Optional[str] = None
+    checkpoint_id: Optional[str] = None
 
     # Worker assignment
     worker_id: Optional[str] = None
@@ -277,6 +278,7 @@ class FlowExplorationData:
             "flow_path": self.flow_path.to_list(),
             "status": self.status.value,
             "parent_flow_id": self.parent_flow_id,
+            "checkpoint_id": self.checkpoint_id,
             "worker_id": self.worker_id,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,

@@ -358,7 +358,7 @@ def get_worker_action_prompt(
     user_data: dict[str, dict[str, str]] | None = None
 ) -> str:
     """Get the worker action prompt with all context filled in."""
-    # Format user-provided data with XML tags for security
+    # Format user-provided data for inclusion in user message
     user_data_section = format_user_provided_data(credentials, user_data)
 
     # Combine additional_context with user data

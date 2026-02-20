@@ -36,7 +36,7 @@ inputs:
     required: true
 
   model:
-    description: 'Claude model to use (claude-haiku-4-5, claude-sonnet-4-5, etc.)'
+    description: 'Claude model to use (claude-haiku-4-5, claude-sonnet-4-6, claude-opus-4-6)'
     required: false
     default: 'claude-haiku-4-5'
 

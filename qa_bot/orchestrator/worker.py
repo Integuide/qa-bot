@@ -1,7 +1,6 @@
 """Flow-based exploration worker - one worker per flow."""
 
 import asyncio
-import base64
 import logging
 import uuid
 from typing import AsyncGenerator
@@ -9,14 +8,53 @@ from datetime import datetime
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
 from qa_bot.ai.base import AIProvider, AgentAction
 from qa_bot.agent.state import Issue
 from qa_bot.browser.controller import BrowserController
-from qa_bot.orchestrator.browser_pool import BrowserPool
+from qa_bot.orchestrator.browser_pool import BrowserPool, strip_url_credentials
 from qa_bot.orchestrator.shared_state import SharedFlowState, UserDataField, UserDataRequest, format_user_data_for_prompt
 from qa_bot.orchestrator.flow import FlowTask, FlowCheckpoint, FlowStatus
 
 logger = logging.getLogger(__name__)
+
+def _strip_old_screenshots(history: list[dict]) -> None:
+    """Replace all base64 image blocks with a lightweight text placeholder.
+
+    Mutates the list in-place to free memory.  The current turn's screenshot
+    lives in ``current_message`` (not in ``conversation_history``), so every
+    image in history is safe to strip.  ``_build_messages_from_history`` in
+    claude_provider performs the same replacement when building the API
+    request, but this function frees the actual bytes from the Python heap
+    between turns so they don't accumulate over long flows.
+    """
+    for msg in history:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for j, block in enumerate(content):
+                if isinstance(block, dict) and block.get("type") == "image":
+                    content[j] = {"type": "text", "text": "[Screenshot of page]"}
+
+
+async def _safe_goto(page, url: str, timeout: int = 30000) -> None:
+    """Navigate to a URL with graceful timeout handling.
+
+    If page.goto() times out but the page actually loaded (URL changed from
+    about:blank), continues instead of raising. This handles sites where
+    domcontentloaded never fires due to slow/hanging CDN resources.
+    """
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+    except (TimeoutError, PlaywrightTimeoutError):
+        if page.url and page.url != "about:blank":
+            logger.warning(
+                f"Navigation to {url} timed out waiting for domcontentloaded, "
+                f"but page loaded ({page.url}). Continuing."
+            )
+            await asyncio.sleep(2)
+        else:
+            raise
 
 
 @dataclass
@@ -54,11 +92,6 @@ class ReportedIssue:
     """An issue reported during action execution."""
     description: str
     severity: str
-
-
-def screenshot_to_base64(screenshot_bytes: bytes) -> str:
-    """Convert screenshot bytes to base64 string for SSE transport."""
-    return base64.b64encode(screenshot_bytes).decode('utf-8')
 
 
 class FlowExplorationWorker:
@@ -171,18 +204,26 @@ class FlowExplorationWorker:
         parent_flow_name = ""
 
         try:
+            # Check for HTTP Basic Auth credentials
+            http_auth = await self.state.get_http_auth()
+
             if task.is_root or task.checkpoint_id is None:
                 # Root flow or fresh flow: create fresh context
                 # Flows created via add_flow_task have checkpoint_id=None and start fresh
                 context = await self.browser_pool.create_isolated_context()
+
+                # Apply HTTP auth via route interception
+                # When credentials are pre-provided, apply to all flows including root
+                # (skipping root only made sense for credential discovery, not pre-auth)
+                if http_auth:
+                    await self.browser_pool.apply_http_auth(
+                        context, http_auth["username"], http_auth["password"], http_auth["target_url"]
+                    )
+
                 page = await context.new_page()
 
                 try:
-                    await page.goto(
-                        task.start_url,
-                        wait_until="domcontentloaded",
-                        timeout=30000
-                    )
+                    await _safe_goto(page, task.start_url)
                 except Exception as e:
                     yield {
                         "type": "navigation_error",
@@ -208,14 +249,17 @@ class FlowExplorationWorker:
                 context = await self.browser_pool.create_isolated_context(
                     storage_state=checkpoint.browser_storage_state
                 )
+
+                # Apply HTTP auth via route interception for checkpoint-restored flows
+                if http_auth:
+                    await self.browser_pool.apply_http_auth(
+                        context, http_auth["username"], http_auth["password"], http_auth["target_url"]
+                    )
+
                 page = await context.new_page()
 
                 try:
-                    await page.goto(
-                        checkpoint.current_url,
-                        wait_until="domcontentloaded",
-                        timeout=30000
-                    )
+                    await _safe_goto(page, strip_url_credentials(checkpoint.current_url))
                 except Exception as e:
                     yield {
                         "type": "checkpoint_restore_error",
@@ -270,6 +314,7 @@ class FlowExplorationWorker:
                         # Save checkpoint and exit - flow will resume when credentials arrive
                         reason = response.get("reason", "Waiting for credentials")
                         storage_state = await context.storage_state()
+                        _strip_old_screenshots(conversation_history)
                         checkpoint = FlowCheckpoint(
                             parent_flow_id=task.flow_id,
                             browser_storage_state=storage_state,
@@ -312,6 +357,7 @@ class FlowExplorationWorker:
                         # Save checkpoint and exit - flow will resume when user approves/denies
                         reason = response.get("reason", "Waiting for approval")
                         storage_state = await context.storage_state()
+                        _strip_old_screenshots(conversation_history)
                         checkpoint = FlowCheckpoint(
                             parent_flow_id=task.flow_id,
                             browser_storage_state=storage_state,
@@ -355,6 +401,7 @@ class FlowExplorationWorker:
                         reason = response.get("reason", "Waiting for user data")
                         request_name = response.get("request_name", "")
                         storage_state = await context.storage_state()
+                        _strip_old_screenshots(conversation_history)
                         checkpoint = FlowCheckpoint(
                             parent_flow_id=task.flow_id,
                             browser_storage_state=storage_state,
@@ -530,6 +577,7 @@ class FlowExplorationWorker:
                 if context and page:
                     try:
                         storage_state = await context.storage_state()
+                        _strip_old_screenshots(conversation_history)
                         checkpoint = FlowCheckpoint(
                             parent_flow_id=task.flow_id,
                             browser_storage_state=storage_state,
@@ -706,6 +754,9 @@ class FlowExplorationWorker:
                     "content": ai_event["user_content"]
                 })
 
+            # Free memory from old screenshots no longer needed for API calls
+            _strip_old_screenshots(conversation_history)
+
             # Execute the action
             exec_result = await self._execute_action(action, page, browser, context, conversation_history, task)
 
@@ -740,6 +791,7 @@ class FlowExplorationWorker:
                 })
 
             action_history.append(action_dict)
+            await self.state.record_action_for_flow(task.flow_id, action_dict)
             result["action_executed"] = True
 
             # Handle flow control from action result
@@ -820,10 +872,11 @@ class FlowExplorationWorker:
                     flow_created = False
                     if pending_flow.keep_state:
                         storage_state = await context.storage_state()
+                        _strip_old_screenshots(conversation_history)
                         checkpoint = FlowCheckpoint(
                             parent_flow_id=task.flow_id,
                             browser_storage_state=storage_state,
-                            current_url=page.url,
+                            current_url=strip_url_credentials(page.url),
                             conversation_history=conversation_history.copy(),
                             flow_path=task.flow_path.extend(pending_flow.name),
                             branch_name=pending_flow.name,
@@ -834,7 +887,7 @@ class FlowExplorationWorker:
                     else:
                         new_flow_task = await self.state.add_flow_task(
                             flow_name=pending_flow.name,
-                            start_url=page.url,
+                            start_url=strip_url_credentials(page.url),
                             goal=pending_flow.description,
                             parent_flow_id=task.flow_id
                         )
@@ -845,11 +898,14 @@ class FlowExplorationWorker:
                             "type": "flow_created",
                             "worker_id": self.worker_id,
                             "data": {
+                                "flow_id": new_flow_task.flow_id,
                                 "flow_name": pending_flow.name,
                                 "description": pending_flow.description,
                                 "keep_state": pending_flow.keep_state,
                                 "created_by": self.worker_id,
-                                "parent_flow": task.flow_name
+                                "parent_flow": task.flow_name,
+                                "parent_flow_id": task.flow_id,
+                                "parent_action_index": action_count
                             }
                         })
                     else:
@@ -863,18 +919,23 @@ class FlowExplorationWorker:
                         })
 
             # Process reported issues
-            issue_screenshot_b64 = None
+            issue_screenshot_path = None
             for reported_issue in exec_result.reported_issues:
-                if issue_screenshot_b64 is None:
+                if issue_screenshot_path is None:
                     issue_screenshot = await browser.screenshot()
-                    issue_screenshot_b64 = screenshot_to_base64(issue_screenshot)
+                    idx = await self.state.get_next_issue_screenshot_index()
+                    if self.state.chat_logger:
+                        issue_screenshot_path = self.state.chat_logger.save_issue_screenshot(issue_screenshot, idx) or ""
+                    else:
+                        issue_screenshot_path = ""
+                        logger.debug("chat_logger unavailable, issue screenshot discarded")
 
                 issue = Issue(
                     description=reported_issue.description,
                     severity=reported_issue.severity,
                     url=page.url,
                     action_context=f"{action.action_type}: {action.reasoning[:100]}",
-                    screenshot_base64=issue_screenshot_b64
+                    screenshot_path=issue_screenshot_path
                 )
                 is_new = await self.state.add_issue(issue)
 
@@ -887,25 +948,30 @@ class FlowExplorationWorker:
                         "severity": issue.severity,
                         "url": issue.url,
                         "is_new": is_new,
-                        "screenshot": issue_screenshot_b64
+                        "screenshot_path": issue_screenshot_path
                     }
                 })
 
             # Auto-report console errors
             console_errors = browser.get_console_errors()
-            console_screenshot_b64 = None
+            console_screenshot_path = None
             for error in console_errors:
                 if any(keyword in error.text.lower() for keyword in ["uncaught", "exception", "typeerror", "referenceerror"]):
-                    if console_screenshot_b64 is None:
+                    if console_screenshot_path is None:
                         console_screenshot = await browser.screenshot()
-                        console_screenshot_b64 = screenshot_to_base64(console_screenshot)
+                        idx = await self.state.get_next_issue_screenshot_index()
+                        if self.state.chat_logger:
+                            console_screenshot_path = self.state.chat_logger.save_issue_screenshot(console_screenshot, idx) or ""
+                        else:
+                            console_screenshot_path = ""
+                            logger.debug("chat_logger unavailable, console error screenshot discarded")
 
                     issue = Issue(
                         description=f"JavaScript error: {error.text[:200]}",
                         severity="major",
                         url=error.url or page.url,
                         action_context=f"Console error at {error.location}" if error.location else "Console error",
-                        screenshot_base64=console_screenshot_b64
+                        screenshot_path=console_screenshot_path
                     )
                     is_new = await self.state.add_issue(issue)
                     if is_new:
@@ -919,7 +985,7 @@ class FlowExplorationWorker:
                                 "url": issue.url,
                                 "source": "console",
                                 "is_new": True,
-                                "screenshot": console_screenshot_b64
+                                "screenshot_path": console_screenshot_path
                             }
                         })
                         await self.state.record_console_error()
@@ -927,7 +993,7 @@ class FlowExplorationWorker:
 
             # Auto-report failed network requests
             failed_requests = browser.get_failed_requests(clear=True)
-            network_screenshot_b64 = None
+            network_screenshot_path = None
             for req in failed_requests:
                 if req.status >= 500 or req.status == 0:
                     severity = "major"
@@ -939,16 +1005,21 @@ class FlowExplorationWorker:
                     severity = "minor"
                     desc = f"HTTP {req.status}: {req.method} {req.url[:100]}"
 
-                if network_screenshot_b64 is None:
+                if network_screenshot_path is None:
                     network_screenshot = await browser.screenshot()
-                    network_screenshot_b64 = screenshot_to_base64(network_screenshot)
+                    idx = await self.state.get_next_issue_screenshot_index()
+                    if self.state.chat_logger:
+                        network_screenshot_path = self.state.chat_logger.save_issue_screenshot(network_screenshot, idx) or ""
+                    else:
+                        network_screenshot_path = ""
+                        logger.debug("chat_logger unavailable, network error screenshot discarded")
 
                 issue = Issue(
                     description=desc,
                     severity=severity,
                     url=page.url,
                     action_context=f"Network request to {req.url[:50]}",
-                    screenshot_base64=network_screenshot_b64
+                    screenshot_path=network_screenshot_path
                 )
                 is_new = await self.state.add_issue(issue)
                 if is_new:
@@ -962,10 +1033,13 @@ class FlowExplorationWorker:
                             "url": issue.url,
                             "source": "network",
                             "is_new": True,
-                            "screenshot": network_screenshot_b64
+                            "screenshot_path": network_screenshot_path
                         }
                     })
                     await self.state.record_network_failure()
+
+            # Clear all accumulated network requests to free memory
+            browser.clear_network_requests()
 
             # Detect HTTP Basic Auth challenges (401 responses)
             http_auth_challenges = browser.get_http_auth_challenges(clear=True)
@@ -999,7 +1073,7 @@ class FlowExplorationWorker:
 
             # Report dialogs
             dialogs = browser.get_dialogs(clear=True)
-            dialog_screenshot_b64 = None
+            dialog_screenshot_path = None
             for dialog in dialogs:
                 events.append({
                     "type": "dialog",
@@ -1015,16 +1089,21 @@ class FlowExplorationWorker:
                 await self.state.record_dialog()
 
                 if dialog.dialog_type == "alert" and any(kw in dialog.message.lower() for kw in ["error", "failed", "invalid"]):
-                    if dialog_screenshot_b64 is None:
+                    if dialog_screenshot_path is None:
                         dialog_screenshot = await browser.screenshot()
-                        dialog_screenshot_b64 = screenshot_to_base64(dialog_screenshot)
+                        idx = await self.state.get_next_issue_screenshot_index()
+                        if self.state.chat_logger:
+                            dialog_screenshot_path = self.state.chat_logger.save_issue_screenshot(dialog_screenshot, idx) or ""
+                        else:
+                            dialog_screenshot_path = ""
+                            logger.debug("chat_logger unavailable, dialog screenshot discarded")
 
                     issue = Issue(
                         description=f"Alert dialog with error: {dialog.message[:100]}",
                         severity="minor",
                         url=dialog.url or page.url,
                         action_context="Dialog appeared during testing",
-                        screenshot_base64=dialog_screenshot_b64
+                        screenshot_path=dialog_screenshot_path
                     )
                     is_new = await self.state.add_issue(issue)
                     if is_new:
@@ -1038,7 +1117,7 @@ class FlowExplorationWorker:
                                 "url": issue.url,
                                 "source": "dialog",
                                 "is_new": True,
-                                "screenshot": dialog_screenshot_b64
+                                "screenshot_path": dialog_screenshot_path
                             }
                         })
 
@@ -1250,7 +1329,8 @@ class FlowExplorationWorker:
                 # Add https if no scheme provided
                 if not parsed.scheme:
                     url = f"https://{url}"
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+                await _safe_goto(page, url)
                 return ActionResult(success=True, message=f"Navigated to {url}")
 
             elif action.action_type == "wait":

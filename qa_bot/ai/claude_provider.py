@@ -8,6 +8,7 @@ from typing import AsyncGenerator
 from urllib.parse import urlparse
 from anthropic import AsyncAnthropic, RateLimitError, APIError, APIConnectionError, APITimeoutError
 
+from qa_bot.config import DEFAULT_MODEL
 from .base import AIProvider, AgentAction
 from .prompts import (
     get_worker_system_prompt,
@@ -77,7 +78,7 @@ class ClaudeProvider(AIProvider):
     def __init__(
         self,
         api_key: str,
-        model: str = "claude-haiku-4-5-20251001",
+        model: str = DEFAULT_MODEL,
         max_concurrent_calls: int = 2
     ):
         self.client = AsyncAnthropic(api_key=api_key)
@@ -85,6 +86,56 @@ class ClaudeProvider(AIProvider):
         # Semaphore to limit concurrent API calls and avoid rate limiting
         self._api_semaphore = asyncio.Semaphore(max_concurrent_calls)
         self._max_concurrent_calls = max_concurrent_calls
+
+    @staticmethod
+    def _build_messages_from_history(
+        conversation_history: list[dict],
+    ) -> list[dict]:
+        """Build messages list from conversation history, stripping screenshots.
+
+        Replaces **all** image blocks with a lightweight text placeholder.
+        Only the *current turn* (appended by the caller) carries a real
+        screenshot.  This keeps the text prefix stable across turns so that
+        Anthropic prompt-caching can reuse it, and avoids resending large
+        base64 payloads that the model has already seen.
+
+        The original ``conversation_history`` is NOT mutated.
+        """
+        if not conversation_history:
+            return []
+
+        messages: list[dict] = []
+        for msg in conversation_history:
+            content = msg.get("content")
+            if isinstance(content, list):
+                new_blocks = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "image":
+                        new_blocks.append({"type": "text", "text": "[Screenshot of page]"})
+                    else:
+                        new_blocks.append(block.copy())
+                messages.append({"role": msg["role"], "content": new_blocks})
+            else:
+                messages.append({"role": msg["role"], "content": content})
+
+        return messages
+
+    @staticmethod
+    def _apply_cache_breakpoint(messages: list[dict]) -> None:
+        """Mark the last assistant message as the prompt-cache breakpoint.
+
+        History is stored as [assistant_N, user_N, ...] so the last message
+        is always a user message.  Walk backwards to find the last assistant
+        turn and add cache_control to its final content block.
+
+        Mutates ``messages`` in place.
+        """
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i]["role"] == "assistant":
+                content = messages[i]["content"]
+                if isinstance(content, list) and content:
+                    content[-1]["cache_control"] = CACHE_CONTROL_EPHEMERAL
+                break
 
     async def _retry_with_backoff(self, operation_name: str, operation):
         """
@@ -239,24 +290,10 @@ class ClaudeProvider(AIProvider):
             ]
         }
 
-        # Build complete messages: history + current turn
-        # Use deep copy to avoid mutating the original conversation history
-        messages = []
-        if conversation_history:
-            for msg in conversation_history:
-                messages.append({
-                    "role": msg["role"],
-                    "content": [block.copy() for block in msg["content"]] if isinstance(msg["content"], list) else msg["content"]
-                })
+        # Build complete messages: history (screenshots stripped) + current turn
+        messages = self._build_messages_from_history(conversation_history or [])
 
-        # Add cache_control to the last assistant message for prompt caching
-        # This caches the entire conversation prefix (system + all previous turns)
-        # reducing costs by ~90% for cached tokens on subsequent turns
-        if messages and messages[-1]["role"] == "assistant":
-            content = messages[-1]["content"]
-            if isinstance(content, list) and content:
-                # Add cache_control to the last content block
-                content[-1]["cache_control"] = CACHE_CONTROL_EPHEMERAL
+        self._apply_cache_breakpoint(messages)
 
         messages.append(current_message)
 
@@ -506,14 +543,38 @@ class ClaudeProvider(AIProvider):
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        # Try to find JSON object in text
-        match = re.search(r'\{[^{}]*"action_type"[^{}]*\}', text, re.DOTALL)
+        # Try to find JSON object in text (supports nested objects/arrays)
+        match = re.search(r'\{(?:[^{}]|\{[^{}]*\}|\[[^\[\]]*\])*"action_type"(?:[^{}]|\{[^{}]*\}|\[[^\[\]]*\])*\}', text, re.DOTALL)
         if match:
             try:
                 data = json.loads(match.group(0))
                 return AgentAction(**data)
             except (json.JSONDecodeError, TypeError):
                 pass
+
+        # Last resort: find each { before "action_type" and try brace-matching
+        idx = text.find('"action_type"')
+        if idx >= 0:
+            # Try each opening brace before "action_type", from closest to farthest
+            search_end = idx
+            while search_end > 0:
+                start = text.rfind('{', 0, search_end)
+                if start < 0:
+                    break
+                # Walk forward to find matching closing brace
+                depth = 0
+                for i in range(start, len(text)):
+                    if text[i] == '{':
+                        depth += 1
+                    elif text[i] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                data = json.loads(text[start:i + 1])
+                                return AgentAction(**data)
+                            except (json.JSONDecodeError, TypeError):
+                                break
+                search_end = start
 
         # Show context in error
         preview = text[:500] if len(text) > 500 else text
@@ -598,13 +659,32 @@ class ClaudeProvider(AIProvider):
         except json.JSONDecodeError:
             pass
 
-        # Try to extract JSON from markdown
-        match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+        # Try to extract JSON from markdown code block
+        match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group(0))
+                return json.loads(match.group(1).strip())
             except json.JSONDecodeError:
                 pass
+
+        # Try to find JSON object with brace matching (try each { position)
+        search_start = 0
+        while search_start < len(text):
+            start = text.find('{', search_start)
+            if start < 0:
+                break
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start:i + 1])
+                        except json.JSONDecodeError:
+                            break
+            search_start = start + 1
 
         return {"action": "observe", "reasoning": f"Could not parse response: {text[:200]}"}
 

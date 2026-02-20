@@ -11,7 +11,7 @@ class Issue:
     url: str
     timestamp: datetime = field(default_factory=datetime.now)
     action_context: str = ""
-    screenshot_base64: str = ""  # Base64-encoded PNG screenshot when issue detected
+    screenshot_path: str = ""  # Relative path to screenshot file on disk
 
     def to_dict(self) -> dict:
         result = {
@@ -21,8 +21,8 @@ class Issue:
             "timestamp": self.timestamp.isoformat(),
             "context": self.action_context
         }
-        if self.screenshot_base64:
-            result["screenshot"] = self.screenshot_base64
+        if self.screenshot_path:
+            result["screenshot_path"] = self.screenshot_path
         return result
 
 

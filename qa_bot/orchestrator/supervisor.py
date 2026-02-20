@@ -1,6 +1,7 @@
 """Supervisor agent that monitors and coordinates workers."""
 
 import asyncio
+import re
 import uuid
 from typing import AsyncGenerator
 from datetime import datetime
@@ -129,7 +130,6 @@ class SupervisorAgent:
 
     def _is_approval_block(self, reason: str) -> bool:
         """Check if the block reason is requesting user approval for an irreversible action."""
-        import re
         reason_lower = reason.lower()
         # Explicit approval request prefix
         if 'approval_needed' in reason_lower:

@@ -4,11 +4,29 @@ import asyncio
 import base64
 import logging
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Playwright
 
 from qa_bot.config import IGNORE_HTTPS_ERRORS
+
+
+def strip_url_credentials(url: str) -> str:
+    """Strip embedded credentials from a URL.
+
+    http://user:pass@host/path → http://host/path
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.username or parsed.password:
+            # Reconstruct netloc without credentials
+            netloc = parsed.hostname or ''
+            if parsed.port:
+                netloc += f':{parsed.port}'
+            return urlunparse(parsed._replace(netloc=netloc))
+        return url
+    except Exception:
+        return url
 
 
 logger = logging.getLogger(__name__)
@@ -54,31 +72,33 @@ class BrowserPool:
 
     async def start(self):
         """Initialize Playwright and launch browser."""
-        if self._started:
-            return
+        async with self._lock:
+            if self._started:
+                return
 
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(headless=self.headless)
-        self._started = True
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(headless=self.headless)
+            self._started = True
 
     async def stop(self):
         """Close browser and stop Playwright."""
-        if not self._started:
-            return
+        async with self._lock:
+            if not self._started:
+                return
 
-        if self._browser:
-            await self._browser.close()
-            self._browser = None
+            if self._browser:
+                await self._browser.close()
+                self._browser = None
 
-        if self._playwright:
-            await self._playwright.stop()
-            self._playwright = None
+            if self._playwright:
+                await self._playwright.stop()
+                self._playwright = None
 
-        self._started = False
+            self._started = False
 
     async def create_isolated_context(
         self,
-        storage_state: Optional[dict] = None
+        storage_state: Optional[dict] = None,
     ) -> BrowserContext:
         """
         Create a new isolated browser context for a flow.
@@ -102,7 +122,7 @@ class BrowserPool:
         context = await self._browser.new_context(
             viewport=self.viewport,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 QABot/1.0",
-            storage_state=storage_state if storage_state else None,
+            storage_state=storage_state,
             # Auto-grant permissions to prevent prompts from blocking automation
             permissions=AUTO_GRANT_PERMISSIONS,
             # Bypass HTTPS/certificate errors (self-signed certs, expired certs, etc.)

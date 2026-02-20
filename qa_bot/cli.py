@@ -27,7 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
 
-from qa_bot.config import LOG_LEVEL, MAX_CONCURRENT_API_CALLS
+from qa_bot.config import LOG_LEVEL, MAX_CONCURRENT_API_CALLS, DEFAULT_MODEL
 
 # Configure logging with level from environment
 logging.basicConfig(
@@ -500,8 +500,8 @@ Examples:
     )
     parser.add_argument(
         "--model",
-        default="claude-haiku-4-5",
-        help="Claude model to use (default: claude-haiku-4-5)"
+        default=DEFAULT_MODEL,
+        help=f"Claude model to use (default: {DEFAULT_MODEL})"
     )
     parser.add_argument(
         "--testmail-api-key",
