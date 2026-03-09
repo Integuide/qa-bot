@@ -193,7 +193,6 @@ class FlowExplorationOrchestrator:
             # Main event loop
             last_progress_time = datetime.now()
             progress_interval = 5.0
-            final_report_already_generated = False  # Track if we used interim as final
             report = None  # Will hold synthesis report
 
             while True:
@@ -214,7 +213,7 @@ class FlowExplorationOrchestrator:
                             task.cancel()
                         break
                     else:
-                        # Limit reached - generate interim report then pause
+                        # Limit reached - pause and let user decide
                         event = {
                             "type": "stopping",
                             "data": {"message": f"Limit reached: {stop_reason}. Waiting for workers..."}
@@ -229,7 +228,7 @@ class FlowExplorationOrchestrator:
                         for task in self._active_worker_tasks:
                             task.cancel()
 
-                        # Wait for workers to finish
+                        # Wait for workers to finish (they may be saving checkpoints)
                         if self._active_worker_tasks:
                             try:
                                 await asyncio.wait_for(
@@ -237,9 +236,9 @@ class FlowExplorationOrchestrator:
                                     timeout=15.0
                                 )
                             except asyncio.TimeoutError:
-                                pass
+                                logger.warning("Pause: workers did not finish within 15s — proceeding")
 
-                        # Drain events from queue before generating report
+                        # Drain events from queue before pausing
                         while not self._event_queue.empty():
                             try:
                                 queued_event = self._event_queue.get_nowait()
@@ -265,44 +264,14 @@ class FlowExplorationOrchestrator:
                             _log_event(event)
                             yield event
 
-                        # Generate interim synthesis report
-                        event = {
-                            "type": "synthesis_started",
-                            "data": {"timestamp": datetime.now().isoformat(), "interim": True}
-                        }
-                        _log_event(event)
-                        yield event
-
-                        synthesis = SynthesisAgent(self.ai)
-                        try:
-                            interim_report = await synthesis.generate_report(self._shared_state)
-                            event = {
-                                "type": "synthesis_complete",
-                                "data": {
-                                    "report": interim_report,
-                                    "timestamp": datetime.now().isoformat(),
-                                    "interim": True
-                                }
-                            }
-                            _log_event(event)
-                            yield event
-                        except Exception as e:
-                            interim_report = f"Error generating interim report: {e}"
-                            event = {
-                                "type": "synthesis_error",
-                                "data": {"error": str(e), "interim": True}
-                            }
-                            _log_event(event)
-                            yield event
-
                         # Emit paused event (pause state already set before worker cancellation)
+                        # Synthesis is deferred until the user decides to stop or exploration completes
                         progress = await self._shared_state.get_progress()
                         event = {
                             "type": "exploration_paused",
                             "data": {
                                 "reason": stop_reason,
                                 "progress": progress,
-                                "interim_report": interim_report,
                                 "timestamp": datetime.now().isoformat()
                             }
                         }
@@ -314,7 +283,7 @@ class FlowExplorationOrchestrator:
                         resumed = await self._shared_state.wait_for_resume(timeout=PAUSE_TIMEOUT_SECONDS)
 
                         if not resumed or self._shared_state.stop_requested:
-                            # Timed out or user stopped during pause - use interim report as final
+                            # Timed out or user stopped during pause - run synthesis after break
                             if not resumed:
                                 event = {
                                     "type": "exploration_pause_timeout",
@@ -322,9 +291,6 @@ class FlowExplorationOrchestrator:
                                 }
                                 _log_event(event)
                                 yield event
-                            # Skip to final summary (interim report already generated)
-                            final_report_already_generated = True
-                            report = interim_report
                             break
 
                         # Resume exploration
@@ -400,8 +366,13 @@ class FlowExplorationOrchestrator:
                     for task in self._active_worker_tasks:
                         if not task.done():
                             task.cancel()
-                    await asyncio.gather(*self._active_worker_tasks, return_exceptions=True)
-
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*self._active_worker_tasks, return_exceptions=True),
+                            timeout=10.0
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("Workers did not exit after cancellation — proceeding without them")
             # Drain remaining events from queue
             while not self._event_queue.empty():
                 try:
@@ -411,38 +382,34 @@ class FlowExplorationOrchestrator:
                 except asyncio.QueueEmpty:
                     break
 
-            # Generate synthesis report (skip if we already used interim report as final)
-            if not final_report_already_generated:
+            # Generate synthesis report
+            event = {
+                "type": "synthesis_started",
+                "data": {"timestamp": datetime.now().isoformat()}
+            }
+            _log_event(event)
+            yield event
+
+            synthesis = SynthesisAgent(self.ai)
+            try:
+                report = await synthesis.generate_report(self._shared_state)
                 event = {
-                    "type": "synthesis_started",
-                    "data": {"timestamp": datetime.now().isoformat()}
+                    "type": "synthesis_complete",
+                    "data": {
+                        "report": report,
+                        "timestamp": datetime.now().isoformat()
+                    }
                 }
                 _log_event(event)
                 yield event
-
-                synthesis = SynthesisAgent(self.ai)
-                try:
-                    report = await synthesis.generate_report(self._shared_state)
-                    event = {
-                        "type": "synthesis_complete",
-                        "data": {
-                            "report": report,
-                            "timestamp": datetime.now().isoformat()
-                        }
-                    }
-                    _log_event(event)
-                    yield event
-                except Exception as e:
-                    event = {
-                        "type": "synthesis_error",
-                        "data": {"error": str(e)}
-                    }
-                    _log_event(event)
-                    yield event
-                    report = None
-            else:
-                # report was already set from interim report during pause handling
-                pass
+            except Exception as e:
+                event = {
+                    "type": "synthesis_error",
+                    "data": {"error": str(e)}
+                }
+                _log_event(event)
+                yield event
+                report = None
 
             # Final summary
             all_issues = await self._shared_state.get_all_issues()
@@ -650,26 +617,36 @@ class FlowExplorationOrchestrator:
         if self._supervisor_task and not self._supervisor_task.done():
             self._supervisor_task.cancel()
             try:
-                await self._supervisor_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(self._supervisor_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
         self._supervisor = None
         self._supervisor_task = None
 
-        # Cancel any remaining worker tasks
-        for task in list(self._active_worker_tasks):
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+        # Cancel any remaining worker tasks (with timeout to prevent hanging)
+        remaining = [t for t in self._active_worker_tasks if not t.done()]
+        for task in remaining:
+            task.cancel()
+        if remaining:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*remaining, return_exceptions=True),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Cleanup: workers did not exit after cancellation")
 
         self._active_worker_tasks.clear()
 
-        # Stop browser pool
+        # Stop browser pool (with timeout — Playwright cleanup can hang
+        # if there are stuck browser operations)
         if self._browser_pool:
-            await self._browser_pool.stop()
+            try:
+                await asyncio.wait_for(self._browser_pool.stop(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("Cleanup: browser pool stop timed out")
+            except Exception as e:
+                logger.warning(f"Cleanup: browser pool stop error: {e}")
             self._browser_pool = None
 
         # Close chat logger to prevent resource leaks

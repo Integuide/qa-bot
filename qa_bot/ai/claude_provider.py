@@ -8,6 +8,7 @@ from typing import AsyncGenerator
 from urllib.parse import urlparse
 from anthropic import AsyncAnthropic, RateLimitError, APIError, APIConnectionError, APITimeoutError
 
+from qa_bot.browser.controller import DUPLICATE_REF_PREFIX
 from qa_bot.config import DEFAULT_MODEL
 from .base import AIProvider, AgentAction
 from .prompts import (
@@ -506,7 +507,9 @@ class ClaudeProvider(AIProvider):
             if url:
                 line += f"\n   URL: {simplify_url(url)}"
             if error:
-                line += f"\n   Error: {error[:100]}"
+                # Allow longer error text for duplicate-ref disambiguation
+                max_err = 300 if error.startswith(DUPLICATE_REF_PREFIX) else 100
+                line += f"\n   Error: {error[:max_err]}"
 
             lines.append(line)
 

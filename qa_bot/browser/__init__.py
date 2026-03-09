@@ -5,6 +5,8 @@ from .controller import (
     CapturedDialog,
     CapturedHttpAuthChallenge,
     CapturedPopup,
+    DUPLICATE_REF_PREFIX,
+    DuplicateRefError,
 )
 
 __all__ = [
@@ -14,4 +16,6 @@ __all__ = [
     "CapturedDialog",
     "CapturedHttpAuthChallenge",
     "CapturedPopup",
+    "DUPLICATE_REF_PREFIX",
+    "DuplicateRefError",
 ]

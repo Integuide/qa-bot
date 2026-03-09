@@ -564,6 +564,18 @@ Prioritized list of fixes, ranked by:
 2. Severity
 3. Ease of fix (if apparent)
 
+## Network Error Interpretation
+
+**IMPORTANT**: Not all network failures are bugs in the site under test. Apply these rules:
+
+1. **Third-party service failures are NOT site bugs**: Failed requests to analytics services (Google Analytics, Segment, Mixpanel, etc.), ad networks, CDNs for external assets, or social media widgets should NOT be reported as critical/major issues. At most, note them as minor observations.
+
+2. **Focus on the site's own functionality**: Only report network failures as major/critical if they affect the site's own API endpoints, pages, or core assets (same-origin requests).
+
+3. **Distinguish infrastructure from application bugs**: If every network request fails (including the site's own pages), this likely indicates a testing environment issue, not a site bug. Note it but don't generate a long list of individual failures — summarize as a single observation.
+
+4. **Browser-level errors are often noise**: Errors like `net::ERR_ABORTED` (request cancelled by browser during navigation) and `net::ERR_BLOCKED_BY_CLIENT` (blocked by ad blocker/privacy extension) are normal browser behavior, NOT site bugs. Do not report these.
+
 ## Deduplication Guidelines
 
 **IMPORTANT**: Deduplicate aggressively but intelligently:
@@ -574,7 +586,9 @@ Prioritized list of fixes, ranked by:
 
 3. **Same API endpoint failing = one issue**: Multiple "Network error on /api/users" should be consolidated
 
-4. **Keep separate if**: Different root causes (two distinct JS errors), different severity (login broken vs. profile page broken), or different fix required
+4. **Network failures to the same third-party domain = one observation**: Don't list every individual failed request to analytics.example.com — summarize as one note
+
+5. **Keep separate if**: Different root causes (two distinct JS errors), different severity (login broken vs. profile page broken), or different fix required
 
 ## Reproduction Steps
 

@@ -12,12 +12,66 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from qa_bot.ai.base import AIProvider, AgentAction
 from qa_bot.agent.state import Issue
-from qa_bot.browser.controller import BrowserController
+from qa_bot.browser.controller import BrowserController, BENIGN_FAILURE_REASONS, DuplicateRefError
 from qa_bot.orchestrator.browser_pool import BrowserPool, strip_url_credentials
 from qa_bot.orchestrator.shared_state import SharedFlowState, UserDataField, UserDataRequest, format_user_data_for_prompt
 from qa_bot.orchestrator.flow import FlowTask, FlowCheckpoint, FlowStatus
 
 logger = logging.getLogger(__name__)
+
+
+# ── Network failure classification ──────────────────────────────────────
+
+
+def classify_network_failure(
+    req_url: str,
+    req_method: str,
+    req_status: int,
+    req_resource_type: str,
+    req_failure_reason: str,
+    page_url: str,
+) -> tuple[str, str] | None:
+    """Classify a failed network request into (severity, description) or None to skip.
+
+    Returns None if the failure is benign (browser abort, ad-blocker, etc.)
+    and should not be reported as an issue.
+    """
+    failure = req_failure_reason or ""
+
+    # Skip benign browser-initiated aborts entirely
+    if failure in BENIGN_FAILURE_REASONS:
+        return None
+
+    # Determine if the failed request is same-origin.
+    # Only strips "www." — subdomains like api.example.com are treated as
+    # third-party. This is intentional: most cross-subdomain failures are
+    # external services, and same-site APIs typically share the main domain.
+    page_origin = urlparse(page_url).netloc.removeprefix("www.")
+    req_origin = urlparse(req_url).netloc.removeprefix("www.")
+    is_same_origin = req_origin == page_origin
+
+    if req_status >= 500:
+        severity = "major" if is_same_origin else "minor"
+        desc = f"Server error {req_status}: {req_method} {req_url[:100]}"
+    elif req_status == 0:
+        # Real connection failures (not aborted — those were filtered above)
+        if is_same_origin:
+            severity = "major"
+        elif req_resource_type in ("document", "xhr", "fetch"):
+            severity = "minor"
+        else:
+            # Third-party image/font/style failures — not actionable
+            return None
+        desc = f"Network failure: {req_method} {req_url[:100]} - {failure}"
+    elif req_status == 404:
+        severity = "minor" if is_same_origin else "cosmetic"
+        desc = f"404 Not Found: {req_method} {req_url[:100]}"
+    else:
+        severity = "minor"
+        desc = f"HTTP {req_status}: {req_method} {req_url[:100]}"
+
+    return severity, desc
+
 
 def _strip_old_screenshots(history: list[dict]) -> None:
     """Replace all base64 image blocks with a lightweight text placeholder.
@@ -576,7 +630,7 @@ class FlowExplorationWorker:
                 # Only try to create checkpoint if browser context is available
                 if context and page:
                     try:
-                        storage_state = await context.storage_state()
+                        storage_state = await asyncio.wait_for(context.storage_state(), timeout=5.0)
                         _strip_old_screenshots(conversation_history)
                         checkpoint = FlowCheckpoint(
                             parent_flow_id=task.flow_id,
@@ -596,9 +650,9 @@ class FlowExplorationWorker:
         finally:
             if context:
                 try:
-                    await context.close()
+                    await asyncio.wait_for(context.close(), timeout=5.0)
                 except Exception:
-                    pass  # Ignore errors when closing context
+                    pass  # Ignore errors/timeouts when closing context
 
     def _build_flow_context(self, task: FlowTask, conversation_history: list[dict]) -> str:
         """Build context string from flow path and history."""
@@ -994,16 +1048,19 @@ class FlowExplorationWorker:
             # Auto-report failed network requests
             failed_requests = browser.get_failed_requests(clear=True)
             network_screenshot_path = None
+
             for req in failed_requests:
-                if req.status >= 500 or req.status == 0:
-                    severity = "major"
-                    desc = f"Server error {req.status}: {req.method} {req.url[:100]}" if req.status else f"Network failure: {req.method} {req.url[:100]} - {req.failure_reason}"
-                elif req.status == 404:
-                    severity = "minor"
-                    desc = f"404 Not Found: {req.method} {req.url[:100]}"
-                else:
-                    severity = "minor"
-                    desc = f"HTTP {req.status}: {req.method} {req.url[:100]}"
+                result = classify_network_failure(
+                    req_url=req.url,
+                    req_method=req.method,
+                    req_status=req.status,
+                    req_resource_type=req.resource_type,
+                    req_failure_reason=req.failure_reason,
+                    page_url=page.url,
+                )
+                if result is None:
+                    continue
+                severity, desc = result
 
                 if network_screenshot_path is None:
                     network_screenshot = await browser.screenshot()
@@ -1447,6 +1504,13 @@ class FlowExplorationWorker:
                     message=f"Unknown action type: {action.action_type}",
                     error=f"Unsupported action type: {action.action_type}"
                 )
+
+        except DuplicateRefError as e:
+            return ActionResult(
+                success=False,
+                message=f"Multiple elements match {e.ref}",
+                error=str(e)
+            )
 
         except Exception as e:
             return ActionResult(

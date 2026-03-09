@@ -12,6 +12,44 @@ from playwright.async_api import Page, ConsoleMessage, Request, Response, Dialog
 logger = logging.getLogger(__name__)
 
 
+DUPLICATE_REF_PREFIX = "[duplicate-ref] "
+
+
+class DuplicateRefError(Exception):
+    """Raised when a ref matches multiple DOM elements.
+
+    Attributes:
+        ref: The original ref string (e.g. "ref_5").
+        descriptions: List of human-readable descriptions for each duplicate,
+            including position and parent context so the AI can disambiguate.
+    """
+
+    def __init__(self, ref: str, descriptions: list[str]):
+        self.ref = ref
+        self.descriptions = descriptions
+        summary = "; ".join(f"({i+1}) {d}" for i, d in enumerate(descriptions))
+        super().__init__(
+            f"{DUPLICATE_REF_PREFIX}{ref} matches {len(descriptions)} elements: "
+            f"{summary}. "
+            f"Look at the screenshot and element list to pick the correct one."
+        )
+
+
+# Browser-initiated abort reasons that are not real failures.
+# These occur during normal navigation, ad-blocking, or page unload.
+# Shared with qa_bot.orchestrator.worker.classify_network_failure (Layer 2).
+BENIGN_FAILURE_REASONS = frozenset({
+    "net::ERR_ABORTED",
+    "net::ERR_BLOCKED_BY_CLIENT",
+})
+
+# Resource types where aborts are almost always harmless
+# (tracking pixels, analytics beacons, prefetched assets, etc.)
+_NOISE_RESOURCE_TYPES = frozenset({
+    "ping", "beacon", "cspviolationreport", "preflight",
+})
+
+
 @dataclass
 class CapturedConsoleMessage:
     """A captured console message from the browser."""
@@ -207,13 +245,21 @@ class BrowserController:
                 if request.failure:
                     failure_text = request.failure
 
+                resource_type = start_info["resource_type"]
+
+                # Layer 1: Skip benign aborts for noise resource types entirely.
+                # Layer 2 (classify_network_failure in worker.py) handles the
+                # remaining cases for non-noise resource types.
+                if failure_text in BENIGN_FAILURE_REASONS and resource_type in _NOISE_RESOURCE_TYPES:
+                    return
+
                 self._network_requests.append(
                     CapturedNetworkRequest(
                         url=url,
                         method=start_info["method"],
                         status=0,
                         status_text="",
-                        resource_type=start_info["resource_type"],
+                        resource_type=resource_type,
                         timestamp=datetime.now().isoformat(),
                         duration_ms=duration,
                         failed=True,
@@ -627,6 +673,11 @@ class BrowserController:
 
         script = """
         () => {
+            // Clean up refs from previous injection to avoid duplicates
+            document.querySelectorAll('[data-qabot-ref]').forEach(el => {
+                el.removeAttribute('data-qabot-ref');
+            });
+
             const refMap = {};
             let refCounter = 1;
 
@@ -693,18 +744,105 @@ class BrowserController:
         """
         Get a Playwright locator by ref string (on active page).
 
+        If exactly one element matches, returns it directly. If multiple
+        elements share the same ref (page cloned elements after injection),
+        tries to narrow to a single visible element. If that still leaves
+        ambiguity, raises DuplicateRefError with descriptions of each
+        duplicate so the AI can choose on its next turn.
+
         Args:
             ref: The ref string (e.g., "ref_5")
 
         Returns:
             Playwright Locator for the element
+
+        Raises:
+            DuplicateRefError: When multiple elements match and can't be
+                auto-resolved to a single visible one.
         """
         page = self.active_page
         if not page:
             raise RuntimeError("No page available")
 
         ref_num = self._extract_ref_number(ref)
-        return page.locator(f'[data-qabot-ref="{ref_num}"]')
+        locator = page.locator(f'[data-qabot-ref="{ref_num}"]')
+
+        count = await locator.count()
+        if count > 1:
+            # Multiple elements share this ref (page cloned elements after
+            # injection, e.g. sticky header, modal overlay, responsive layout).
+            # Try to narrow to the single visible element.
+            visible = locator.locator("visible=true")
+            visible_count = await visible.count()
+            if visible_count == 1:
+                return visible
+
+            # Can't auto-resolve — gather descriptions so the AI can choose.
+            descriptions = await self._describe_duplicate_elements(
+                locator, count
+            )
+            raise DuplicateRefError(ref, descriptions)
+
+        if count == 0:
+            logger.warning("Ref %s matched no elements — ref map may be stale", ref)
+
+        return locator
+
+    _MAX_DUPLICATE_DESCRIPTIONS = 5
+
+    async def _describe_duplicate_elements(
+        self, locator, count: int
+    ) -> list[str]:
+        """Build human-readable descriptions for each element matched by a
+        duplicate-ref locator, including tag, text, position and parent context.
+        """
+        descriptions: list[str] = []
+        for i in range(min(count, self._MAX_DUPLICATE_DESCRIPTIONS)):
+            el = locator.nth(i)
+            try:
+                info = await el.evaluate("""el => {
+                    const rect = el.getBoundingClientRect();
+                    const tag = el.tagName.toLowerCase();
+                    const role = el.getAttribute('role') || '';
+                    const text = (el.textContent || '').trim().slice(0, 60);
+                    const ariaLabel = el.getAttribute('aria-label') || '';
+                    const visible = rect.width > 0 && rect.height > 0
+                        && getComputedStyle(el).visibility !== 'hidden';
+
+                    // Walk up to find a landmark parent for context
+                    let parent = el.parentElement;
+                    let parentDesc = '';
+                    for (let j = 0; j < 5 && parent; j++) {
+                        const pTag = parent.tagName.toLowerCase();
+                        const pRole = parent.getAttribute('role') || '';
+                        if (['header','footer','nav','main','aside','dialog',
+                             'form','section'].includes(pTag) || pRole) {
+                            parentDesc = pRole ? pRole : pTag;
+                            const pLabel = parent.getAttribute('aria-label') || '';
+                            if (pLabel) parentDesc += ' "' + pLabel + '"';
+                            break;
+                        }
+                        parent = parent.parentElement;
+                    }
+
+                    return {tag, role, text, ariaLabel, parentDesc, visible,
+                            x: Math.round(rect.x), y: Math.round(rect.y)};
+                }""")
+                label = info.get("ariaLabel") or info.get("text", "")
+                if len(label) > 50:
+                    label = label[:47] + "..."
+                role = info.get("role") or info.get("tag", "?")
+                vis = "visible" if info.get("visible") else "hidden"
+                parent = info.get("parentDesc", "")
+                parent_str = f" in <{parent}>" if parent else ""
+                desc = (
+                    f'{role} "{label}" at y={info.get("y", "?")}'
+                    f"{parent_str} ({vis})"
+                )
+            except Exception:
+                desc = f"element #{i + 1} (could not inspect)"
+            descriptions.append(desc)
+        return descriptions
 
     async def click_ref(self, ref: str) -> None:
         """
