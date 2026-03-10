@@ -29,9 +29,9 @@ else
     echo "Email Testing: Disabled (no Testmail.app credentials)"
 fi
 if [ "$INPUT_DANGEROUSLY_SKIP_PERMISSIONS" = "true" ]; then
-    echo "Skip Permissions: ENABLED (auto-approving all irreversible actions)"
+    echo "Skip Permissions: ENABLED (auto-approving all irreversible actions — default in CI)"
 else
-    echo "Skip Permissions: Disabled (will pause for approval)"
+    echo "Skip Permissions: Disabled (will pause for approval — may cause timeouts in CI)"
 fi
 echo "::endgroup::"
 

@@ -99,18 +99,78 @@ jobs:
         with:
           ref: ${{ steps.pr-details.outputs.ref || github.event.pull_request.head.sha }}
 
+      - name: Get PR description
+        if: github.event_name == 'pull_request' || steps.pr-details.outputs.valid == 'true'
+        id: pr-desc
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          PR_JSON=$(gh pr view "$PR_NUMBER" --json title,body)
+          PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
+          PR_BODY=$(echo "$PR_JSON" | jq -r '.body' | head -c 2000)
+          echo "pr_title=$PR_TITLE" >> $GITHUB_OUTPUT
+          {
+            echo "pr_body<<EOF"
+            echo "$PR_BODY"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Generate testing goal from PR
+        if: github.event_name == 'pull_request' || steps.pr-details.outputs.valid == 'true'
+        id: generate-goal
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_TITLE_RAW: ${{ steps.pr-desc.outputs.pr_title }}
+          PR_BODY_RAW: ${{ steps.pr-desc.outputs.pr_body }}
+        run: |
+          PR_TITLE=$(echo "$PR_TITLE_RAW" | jq -Rs '.')
+          PR_BODY=$(echo "$PR_BODY_RAW" | jq -Rs '.')
+
+          RESPONSE=$(curl -sf https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "{
+              \"model\": \"claude-haiku-4-5\",
+              \"max_tokens\": 200,
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": \"You are generating a QA testing goal for an AI that will explore a website. Based on this PR being deployed to production, write a concise testing goal (1-2 sentences) that focuses on testing the changed functionality. Also mention testing general critical flows (login, navigation) to check for regressions. If the PR description is empty or unclear, return a general exploration goal.\n\nPR Title: ${PR_TITLE}\n\nPR Body:\n${PR_BODY}\"
+              }]
+            }") || true
+
+          GOAL=""
+          if [ -n "$RESPONSE" ]; then
+            GOAL=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+          fi
+
+          if [ -z "$GOAL" ]; then
+            GOAL="Explore user flows and find bugs, broken elements, or usability problems."
+            echo "::warning::Goal generation failed, using default goal"
+          fi
+
+          {
+            echo "goal<<EOF"
+            echo "$GOAL"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+          echo "Generated goal: $GOAL"
+
       - name: Run QA Bot
+        if: github.event_name == 'pull_request' || steps.pr-details.outputs.valid == 'true'
         id: qa
-        uses: ./qa-bot/action
+        uses: Integuide/qa-bot@main
         with:
           url: ${{ vars.QA_BOT_TARGET_URL }}
-          goal: 'Test critical user flows before production deployment'
+          goal: ${{ steps.generate-goal.outputs.goal }}
           max-agents: '3'
           max-duration: '15'
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           fail-on-critical: 'true'
 
       - name: Summary
+        if: always() && steps.qa.outcome != 'cancelled'
         run: |
           echo "### QA Bot Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY

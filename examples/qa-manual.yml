@@ -22,28 +22,18 @@ on:
         description: 'Testing focus (optional)'
         required: false
         type: string
-        default: 'Explore user flows and find bugs, broken elements, or usability problems.'
+        default: 'Explore user flows and find bugs, broken elements, and usability problems.'
 
       max-agents:
         description: 'Maximum parallel agents'
         required: false
-        type: choice
-        options:
-          - '1'
-          - '2'
-          - '3'
-          - '5'
+        type: string
         default: '3'
 
       max-duration:
         description: 'Maximum duration (minutes)'
         required: false
-        type: choice
-        options:
-          - '5'
-          - '10'
-          - '15'
-          - '30'
+        type: string
         default: '30'
 
       max-cost:
@@ -62,7 +52,7 @@ jobs:
 
       - name: Run QA Bot
         id: qa
-        uses: ./qa-bot/action
+        uses: Integuide/qa-bot@main
         with:
           url: ${{ inputs.url }}
           goal: ${{ inputs.goal }}
@@ -73,18 +63,24 @@ jobs:
           post-comment: 'false'  # No PR to comment on
 
       - name: Write Summary
+        if: always() && steps.qa.outcome != 'cancelled'
         run: |
           echo "### QA Bot Results for ${{ inputs.url }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Flows explored:** ${{ steps.qa.outputs.flows-explored }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Issues found:** ${{ steps.qa.outputs.issues-count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Critical issues:** ${{ steps.qa.outputs.critical-issues }}" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Flows Explored | ${{ steps.qa.outputs.flows-explored }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Issues Found | ${{ steps.qa.outputs.issues-count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical Issues | ${{ steps.qa.outputs.critical-issues }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Full Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo '${{ steps.qa.outputs.report }}' >> $GITHUB_STEP_SUMMARY
+          cat <<'REPORT_EOF' >> $GITHUB_STEP_SUMMARY
+          ${{ steps.qa.outputs.report }}
+          REPORT_EOF
 
       - name: Save report as artifact
+        if: always() && steps.qa.outcome != 'cancelled'
         uses: actions/upload-artifact@v4
         with:
           name: qa-report

@@ -64,9 +64,9 @@ inputs:
     required: false
 
   dangerously-skip-permissions:
-    description: 'Auto-approve all irreversible actions (payments, deletions). Use with caution.'
+    description: 'Auto-approve all irreversible actions (payments, deletions). Enabled by default in CI since there is no human to respond to approval requests.'
     required: false
-    default: 'false'
+    default: 'true'
 
 outputs:
   report:

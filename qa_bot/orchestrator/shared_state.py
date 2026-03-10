@@ -210,6 +210,7 @@ class SharedFlowState:
     _approval_responses: dict = field(default_factory=dict)  # flow_id -> {approved: bool, always: bool}
     _always_approved_patterns: set = field(default_factory=set)  # Action patterns that user said "always approve"
     skip_permissions: bool = False  # If True, auto-approve all irreversible actions (dangerous!)
+    interactive: bool = True  # If False (CLI/CI), credential/approval blocks are terminal and don't prevent completion
 
     # Chat logger (set by coordinator if logging enabled)
     chat_logger: Optional["ChatLogger"] = None
@@ -241,6 +242,7 @@ class SharedFlowState:
         max_cost_usd: float = 5.0,
         model: str = DEFAULT_MODEL,
         skip_permissions: bool = False,
+        interactive: bool = True,
         exploration_id: Optional[str] = None,
     ) -> "SharedFlowState":
         """Create a new shared flow state with initial root flow."""
@@ -257,6 +259,7 @@ class SharedFlowState:
             max_cost_usd=max_cost_usd,
             model=model,
             skip_permissions=skip_permissions,
+            interactive=interactive,
         )
 
         # Create and queue root flow
@@ -905,7 +908,17 @@ class SharedFlowState:
             self._dialog_count += 1
 
     def is_complete(self) -> bool:
-        """Check if exploration is complete (no active workers, no pending flows, no blocked flows).
+        """Check if exploration is complete.
+
+        Complete when: no active workers, no pending flows, no pause checkpoints,
+        and no blocking flows that could still be resolved.
+
+        In interactive mode (web UI): credential and approval blocks prevent
+        completion because a human can provide input to unblock them.
+
+        In non-interactive mode (CLI/CI): credential and approval blocks are
+        terminal — those flows need external input that will never arrive.
+        They should not prevent other work from finishing.
 
         Note: This reads shared state without the async lock since it's called from
         synchronous contexts. The values read are set under the lock elsewhere, and
@@ -916,9 +929,17 @@ class SharedFlowState:
         # Don't complete if there are pause checkpoints waiting
         if self._pause_checkpoints:
             return False
-        # Don't complete if there are flows blocked waiting for credentials, approval, or pause
+
+        blocking_statuses = [FlowStatus.BLOCKED_FOR_PAUSE]
+        if self.interactive:
+            # In interactive mode, wait for user to provide credentials/approval
+            blocking_statuses.extend([
+                FlowStatus.BLOCKED_FOR_CREDENTIALS,
+                FlowStatus.BLOCKED_FOR_APPROVAL,
+            ])
+
         has_blocked = any(
-            f.status in (FlowStatus.BLOCKED_FOR_CREDENTIALS, FlowStatus.BLOCKED_FOR_APPROVAL, FlowStatus.BLOCKED_FOR_PAUSE)
+            f.status in blocking_statuses
             for f in self._flow_registry.values()
         )
         return not has_blocked

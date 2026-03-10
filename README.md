@@ -38,7 +38,7 @@ QA Bot uses Claude AI to explore your website like a real user would:
 | `credentials` | No | - | Test credentials (see below) |
 | `testmail-api-key` | No | - | Testmail.app API key for email flows |
 | `testmail-namespace` | No | - | Testmail.app namespace |
-| `dangerously-skip-permissions` | No | `false` | Auto-approve destructive actions (use with caution) |
+| `dangerously-skip-permissions` | No | `true` | Auto-approve destructive actions (enabled by default in CI) |
 
 ## Outputs
 

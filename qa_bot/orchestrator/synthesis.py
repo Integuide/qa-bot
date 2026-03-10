@@ -260,6 +260,16 @@ class SynthesisAgent:
                     "action_summary": action_summary
                 })
 
+        # Get blocked flows (credentials/approval) so synthesis can report on them
+        blocked_flows = []
+        for flow in all_flows:
+            if flow.status in (FlowStatus.BLOCKED_FOR_CREDENTIALS, FlowStatus.BLOCKED_FOR_APPROVAL):
+                blocked_flows.append({
+                    "flow_name": flow.flow_name,
+                    "status": flow.status.value,
+                    "reason": flow.completion_reason or "Blocked",
+                })
+
         # Call AI to generate report
         try:
             result = await self.ai.generate_synthesis_report(
@@ -268,6 +278,7 @@ class SynthesisAgent:
                 flows_tested=len(completed_flows),
                 issues=issues,
                 completed_flows=completed_flows,
+                blocked_flows=blocked_flows,
             )
 
             # Track token usage by type
@@ -308,6 +319,7 @@ class SynthesisAgent:
                 duration,
                 issues,
                 completed_flows,
+                blocked_flows,
             )
 
     def _generate_fallback_report(
@@ -316,6 +328,7 @@ class SynthesisAgent:
         duration: str,
         issues: list[dict],
         completed_flows: list[dict],
+        blocked_flows: list[dict] | None = None,
     ) -> str:
         """Generate a simple report without AI."""
         lines = [
@@ -360,6 +373,13 @@ class SynthesisAgent:
             lines.append("## Cosmetic Issues")
             for issue in cosmetic:
                 lines.append(f"- {issue['description']}")
+            lines.append("")
+
+        if blocked_flows:
+            lines.append("## Blocked Flows")
+            for flow in blocked_flows:
+                status_label = "missing credentials" if "credentials" in flow["status"] else "pending approval"
+                lines.append(f"- {flow['flow_name']}: {flow['reason']} ({status_label})")
             lines.append("")
 
         lines.append("## Flows Tested")

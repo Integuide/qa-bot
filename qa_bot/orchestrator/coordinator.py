@@ -54,7 +54,8 @@ class FlowExplorationOrchestrator:
         max_branches_per_flow: int = 10,
         headless: bool = True,
         credentials: Optional[dict[str, str]] = None,
-        skip_permissions: bool = False
+        skip_permissions: bool = False,
+        interactive: bool = True
     ):
         self.ai = ai_provider
         self.max_agents = max_agents
@@ -62,6 +63,7 @@ class FlowExplorationOrchestrator:
         self.headless = headless
         self._initial_credentials = credentials
         self._skip_permissions = skip_permissions
+        self._interactive = interactive
 
         self._browser_pool: Optional[BrowserPool] = None
         self._shared_state: Optional[SharedFlowState] = None
@@ -121,6 +123,7 @@ class FlowExplorationOrchestrator:
             max_cost_usd=max_cost_usd,
             model=model,
             skip_permissions=self._skip_permissions,
+            interactive=self._interactive,
             exploration_id=exploration_id,
         )
 
@@ -208,8 +211,8 @@ class FlowExplorationOrchestrator:
                         }
                         _log_event(event)
                         yield event
-                        # Cancel active workers
-                        for task in self._active_worker_tasks:
+                        # Cancel active workers (copy to avoid mutation during iteration)
+                        for task in list(self._active_worker_tasks):
                             task.cancel()
                         break
                     else:
@@ -225,7 +228,7 @@ class FlowExplorationOrchestrator:
                         await self._shared_state.pause(stop_reason)
 
                         # Cancel active workers gracefully - they will checkpoint because paused=True
-                        for task in self._active_worker_tasks:
+                        for task in list(self._active_worker_tasks):
                             task.cancel()
 
                         # Wait for workers to finish (they may be saving checkpoints)
@@ -363,7 +366,7 @@ class FlowExplorationOrchestrator:
                         timeout=15.0
                     )
                 except asyncio.TimeoutError:
-                    for task in self._active_worker_tasks:
+                    for task in list(self._active_worker_tasks):
                         if not task.done():
                             task.cancel()
                     try:
@@ -560,7 +563,10 @@ class FlowExplorationOrchestrator:
         - No pending flows in task queue
         - No active workers
         - No pause checkpoints waiting
-        - No flows blocked for credentials, approval, or pause
+        - No flows blocked for pause
+
+        Note: Credential/approval blocks are terminal — they don't prevent
+        completion. Those flows need external input that may never arrive.
         """
         # Also check our local active worker tasks as a safety net
         # (shared_state._active_workers counter should match, but belt-and-suspenders)

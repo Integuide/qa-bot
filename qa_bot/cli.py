@@ -374,7 +374,8 @@ async def run_exploration(
         max_agents=max_agents,
         headless=headless,
         credentials=credentials,
-        skip_permissions=skip_permissions
+        skip_permissions=skip_permissions,
+        interactive=False  # CLI has no human to respond to blocks
     )
 
     events = []

@@ -30,9 +30,11 @@ jobs:
     steps:
       - name: Extract URL from comment
         id: extract
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           # Extract first URL from comment body
-          URL=$(echo "${{ github.event.comment.body }}" | grep -oP 'https?://[^\s]+' | head -1)
+          URL=$(echo "$COMMENT_BODY" | grep -oP 'https?://[^\s]+' | head -1)
 
           if [ -z "$URL" ]; then
             echo "::error::No URL found in comment. Usage: @QABot https://your-url.com"
@@ -60,9 +62,9 @@ jobs:
         id: pr-details
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
         run: |
-          PR_NUMBER=${{ github.event.issue.number }}
-          PR_JSON=$(gh pr view $PR_NUMBER --json title,body)
+          PR_JSON=$(gh pr view "$PR_NUMBER" --json title,body)
           PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
           PR_BODY=$(echo "$PR_JSON" | jq -r '.body' | head -c 2000)
           echo "pr_title=$PR_TITLE" >> $GITHUB_OUTPUT
@@ -76,12 +78,13 @@ jobs:
         id: generate-goal
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_TITLE_RAW: ${{ steps.pr-details.outputs.pr_title }}
+          PR_BODY_RAW: ${{ steps.pr-details.outputs.pr_body }}
         run: |
-          # Escape special characters for JSON
-          PR_TITLE=$(echo '${{ steps.pr-details.outputs.pr_title }}' | jq -Rs '.')
-          PR_BODY=$(echo '${{ steps.pr-details.outputs.pr_body }}' | jq -Rs '.')
+          PR_TITLE=$(echo "$PR_TITLE_RAW" | jq -Rs '.')
+          PR_BODY=$(echo "$PR_BODY_RAW" | jq -Rs '.')
 
-          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+          RESPONSE=$(curl -sf https://api.anthropic.com/v1/messages \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
@@ -94,13 +97,26 @@ jobs:
               }]
             }")
 
-          GOAL=$(echo "$RESPONSE" | jq -r '.content[0].text // "Explore user flows and find bugs, broken elements, or usability problems."')
-          echo "goal=$GOAL" >> $GITHUB_OUTPUT
+          GOAL=""
+          if [ -n "$RESPONSE" ]; then
+            GOAL=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+          fi
+
+          if [ -z "$GOAL" ]; then
+            GOAL="Explore user flows and find bugs, broken elements, or usability problems."
+            echo "::warning::Goal generation failed, using default goal"
+          fi
+
+          {
+            echo "goal<<EOF"
+            echo "$GOAL"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
           echo "Generated goal: $GOAL"
 
       - name: Run QA Bot
         id: qa
-        uses: ./qa-bot/action
+        uses: Integuide/qa-bot@main
         with:
           url: ${{ steps.extract.outputs.url }}
           goal: ${{ steps.generate-goal.outputs.goal }}
@@ -109,6 +125,7 @@ jobs:
           fail-on-critical: 'false'  # Don't fail, just report
 
       - name: Summary
+        if: always() && steps.qa.outcome != 'cancelled'
         run: |
           echo "### QA Bot Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY

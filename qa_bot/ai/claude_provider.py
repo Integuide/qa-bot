@@ -698,6 +698,7 @@ class ClaudeProvider(AIProvider):
         flows_tested: int,
         issues: list[dict],
         completed_flows: list[dict],
+        blocked_flows: list[dict] | None = None,
     ) -> dict:
         """
         Generate final QA synthesis report.
@@ -714,6 +715,7 @@ class ClaudeProvider(AIProvider):
             flows_tested=flows_tested,
             issues=issues,
             completed_flows=completed_flows,
+            blocked_flows=blocked_flows,
         )
 
         async def _make_synthesis_request():

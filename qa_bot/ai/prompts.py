@@ -623,7 +623,7 @@ SYNTHESIS_CONTEXT_TEMPLATE = """## QA Test Results
 
 ### Detailed Flow Summaries:
 {flow_summaries}
-
+{blocked_section}
 ---
 
 Generate a comprehensive QA report based on the above findings. Use the flow action summaries to construct reproduction steps for issues."""
@@ -635,6 +635,7 @@ def format_synthesis_context(
     flows_tested: int,
     issues: list[dict],
     completed_flows: list[dict],
+    blocked_flows: list[dict] | None = None,
 ) -> str:
     """Format the synthesis context for the AI."""
 
@@ -692,6 +693,20 @@ def format_synthesis_context(
 
         return "\n".join(lines)
 
+    def format_blocked_flows(flows: list[dict] | None) -> str:
+        if not flows:
+            return ""
+        lines = ["\n### Blocked Flows:"]
+        lines.append("These flows could not be completed and need attention:")
+        for f in flows:
+            flow_name = f.get("flow_name", "unknown")
+            status = f.get("status", "blocked")
+            reason = f.get("reason", "Blocked")
+            status_label = "missing credentials" if "credentials" in status else "pending approval"
+            lines.append(f"- **{flow_name}**: {reason} ({status_label})")
+        lines.append("")
+        return "\n".join(lines)
+
     return SYNTHESIS_CONTEXT_TEMPLATE.format(
         target_url=target_url,
         duration=duration,
@@ -699,4 +714,5 @@ def format_synthesis_context(
         total_issues=len(issues),
         issues=format_issues(issues),
         flow_summaries=format_flow_summaries(completed_flows),
+        blocked_section=format_blocked_flows(blocked_flows),
     )
