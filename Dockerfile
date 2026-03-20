@@ -31,6 +31,7 @@ RUN playwright install chromium
 COPY qa_bot/ qa_bot/
 
 # Environment variables for CI mode
+ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 ENV BROWSER_HEADLESS=true
 ENV LOG_CHAT_HISTORY=false

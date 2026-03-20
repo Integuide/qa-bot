@@ -3,10 +3,13 @@
 # This workflow allows users to request QA testing by commenting
 # "@QABot https://example.com" on any pull request.
 #
+# If no URL is provided, falls back to the QA_BOT_STAGING_URL repository variable.
+#
 # Setup:
 # 1. Copy this file to .github/workflows/qa-bot-on-demand.yml
 # 2. Add ANTHROPIC_API_KEY to repository secrets
-# 3. Comment "@QABot https://your-url.com" on any PR
+# 3. Optionally add QA_BOT_STAGING_URL as a repository variable (Settings > Variables)
+# 4. Comment "@QABot https://your-url.com" on any PR
 
 name: QA Bot (On-Demand)
 
@@ -14,16 +17,26 @@ on:
   issue_comment:
     types: [created]
 
+# Only run one QA test at a time per PR
+concurrency:
+  group: qa-bot-ondemand-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
 jobs:
   qa-test:
-    # Only run if comment mentions @QABot with a URL and is on a PR
+    # Only run if comment mentions @QABot on a PR and author is a repo member
     if: |
       contains(github.event.comment.body, '@QABot') &&
-      github.event.issue.pull_request
+      github.event.issue.pull_request &&
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR')
 
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     permissions:
+      contents: read
       pull-requests: write
       issues: write
 
@@ -32,27 +45,36 @@ jobs:
         id: extract
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
+          DEFAULT_URL: ${{ vars.QA_BOT_STAGING_URL }}
         run: |
-          # Extract first URL from comment body
+          # Extract first URL from comment body, fall back to QA_BOT_STAGING_URL
           URL=$(echo "$COMMENT_BODY" | grep -oP 'https?://[^\s]+' | head -1)
 
           if [ -z "$URL" ]; then
-            echo "::error::No URL found in comment. Usage: @QABot https://your-url.com"
-            exit 1
+            if [ -z "$DEFAULT_URL" ]; then
+              echo "::error::No URL found in comment and QA_BOT_STAGING_URL not configured. Usage: @QABot https://your-url.com"
+              exit 1
+            fi
+            URL="$DEFAULT_URL"
+            echo "No URL in comment, using QA_BOT_STAGING_URL: $URL"
+          else
+            echo "Found URL in comment: $URL"
           fi
 
           echo "url=$URL" >> $GITHUB_OUTPUT
-          echo "Found URL: $URL"
 
       - name: Acknowledge request
         uses: actions/github-script@v7
+        env:
+          TARGET_URL: ${{ steps.extract.outputs.url }}
         with:
           script: |
+            const url = process.env.TARGET_URL;
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: '🤖 Starting QA Bot exploration of `${{ steps.extract.outputs.url }}`...\n\nThis may take several minutes. Results will be posted when complete.'
+              body: `🤖 Starting QA Bot exploration of \`${url}\`...\n\nThis may take several minutes. Results will be posted when complete.`
             })
 
       - name: Checkout repository
@@ -65,13 +87,13 @@ jobs:
           PR_NUMBER: ${{ github.event.issue.number }}
         run: |
           PR_JSON=$(gh pr view "$PR_NUMBER" --json title,body)
-          PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
+          PR_TITLE=$(echo "$PR_JSON" | jq -r '.title' | tr -d '\n\r' | head -c 200)
           PR_BODY=$(echo "$PR_JSON" | jq -r '.body' | head -c 2000)
           echo "pr_title=$PR_TITLE" >> $GITHUB_OUTPUT
           {
-            echo "pr_body<<EOF"
+            echo "pr_body<<QABOT_EOF"
             echo "$PR_BODY"
-            echo "EOF"
+            echo "QABOT_EOF"
           } >> $GITHUB_OUTPUT
 
       - name: Generate testing goal from PR
@@ -95,7 +117,7 @@ jobs:
                 \"role\": \"user\",
                 \"content\": \"Convert this PR description into a concise QA testing goal (1-2 sentences). Focus on what user flows and functionality should be tested. If the PR description is empty or unclear, return a general exploration goal.\n\nPR Title: ${PR_TITLE}\n\nPR Body:\n${PR_BODY}\"
               }]
-            }")
+            }") || true
 
           GOAL=""
           if [ -n "$RESPONSE" ]; then
@@ -108,9 +130,9 @@ jobs:
           fi
 
           {
-            echo "goal<<EOF"
+            echo "goal<<QABOT_EOF"
             echo "$GOAL"
-            echo "EOF"
+            echo "QABOT_EOF"
           } >> $GITHUB_OUTPUT
           echo "Generated goal: $GOAL"
 
@@ -126,9 +148,13 @@ jobs:
 
       - name: Summary
         if: always() && steps.qa.outcome != 'cancelled'
+        env:
+          FLOWS: ${{ steps.qa.outputs.flows-explored }}
+          ISSUES: ${{ steps.qa.outputs.issues-count }}
+          CRITICAL: ${{ steps.qa.outputs.critical-issues }}
         run: |
           echo "### QA Bot Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Flows explored:** ${{ steps.qa.outputs.flows-explored }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Issues found:** ${{ steps.qa.outputs.issues-count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Critical issues:** ${{ steps.qa.outputs.critical-issues }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Flows explored:** $FLOWS" >> $GITHUB_STEP_SUMMARY
+          echo "- **Issues found:** $ISSUES" >> $GITHUB_STEP_SUMMARY
+          echo "- **Critical issues:** $CRITICAL" >> $GITHUB_STEP_SUMMARY

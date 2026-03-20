@@ -7,7 +7,7 @@
 # Setup:
 # 1. Copy this file to .github/workflows/qa-bot-staging-to-prod.yml
 # 2. Add ANTHROPIC_API_KEY to repository secrets
-# 3. Add QA_BOT_TARGET_URL as a repository variable (Settings > Variables)
+# 3. Add QA_BOT_STAGING_URL as a repository variable (Settings > Variables)
 #
 # Note: This example uses lighter settings (3 agents, 15 min) than the main
 # workflow (5 agents, 20 min) for faster/cheaper runs. Adjust as needed.
@@ -35,9 +35,13 @@ jobs:
     # 2. Comment contains @QABot on a PR from staging
     if: |
       (github.event_name == 'pull_request' && github.head_ref == 'staging') ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@QABot'))
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@QABot') &&
+       (github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'))
 
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     permissions:
       contents: read
@@ -86,12 +90,14 @@ jobs:
 
       - name: Check for target URL
         if: github.event_name == 'pull_request' || steps.pr-details.outputs.valid == 'true'
+        env:
+          STAGING_URL: ${{ vars.QA_BOT_STAGING_URL }}
         run: |
-          if [ -z "${{ vars.QA_BOT_TARGET_URL }}" ]; then
-            echo "::error::QA_BOT_TARGET_URL not configured. Go to Settings > Variables to add it."
+          if [ -z "$STAGING_URL" ]; then
+            echo "::error::QA_BOT_STAGING_URL not configured. Go to Settings > Variables to add it."
             exit 1
           fi
-          echo "Target URL: ${{ vars.QA_BOT_TARGET_URL }}"
+          echo "Target URL: $STAGING_URL"
 
       - name: Checkout repository
         if: github.event_name == 'pull_request' || steps.pr-details.outputs.valid == 'true'
@@ -107,13 +113,13 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
         run: |
           PR_JSON=$(gh pr view "$PR_NUMBER" --json title,body)
-          PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
+          PR_TITLE=$(echo "$PR_JSON" | jq -r '.title' | tr -d '\n\r' | head -c 200)
           PR_BODY=$(echo "$PR_JSON" | jq -r '.body' | head -c 2000)
           echo "pr_title=$PR_TITLE" >> $GITHUB_OUTPUT
           {
-            echo "pr_body<<EOF"
+            echo "pr_body<<QABOT_EOF"
             echo "$PR_BODY"
-            echo "EOF"
+            echo "QABOT_EOF"
           } >> $GITHUB_OUTPUT
 
       - name: Generate testing goal from PR
@@ -151,9 +157,9 @@ jobs:
           fi
 
           {
-            echo "goal<<EOF"
+            echo "goal<<QABOT_EOF"
             echo "$GOAL"
-            echo "EOF"
+            echo "QABOT_EOF"
           } >> $GITHUB_OUTPUT
           echo "Generated goal: $GOAL"
 
@@ -162,7 +168,7 @@ jobs:
         id: qa
         uses: Integuide/qa-bot@main
         with:
-          url: ${{ vars.QA_BOT_TARGET_URL }}
+          url: ${{ vars.QA_BOT_STAGING_URL }}
           goal: ${{ steps.generate-goal.outputs.goal }}
           max-agents: '3'
           max-duration: '15'
@@ -171,13 +177,18 @@ jobs:
 
       - name: Summary
         if: always() && steps.qa.outcome != 'cancelled'
+        env:
+          TARGET_URL: ${{ vars.QA_BOT_STAGING_URL }}
+          FLOWS: ${{ steps.qa.outputs.flows-explored }}
+          ISSUES: ${{ steps.qa.outputs.issues-count }}
+          CRITICAL: ${{ steps.qa.outputs.critical-issues }}
         run: |
           echo "### QA Bot Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Target:** ${{ vars.QA_BOT_TARGET_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** $TARGET_URL" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Flows Explored | ${{ steps.qa.outputs.flows-explored }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Issues Found | ${{ steps.qa.outputs.issues-count }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Critical Issues | ${{ steps.qa.outputs.critical-issues }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Flows Explored | $FLOWS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Issues Found | $ISSUES |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical Issues | $CRITICAL |" >> $GITHUB_STEP_SUMMARY

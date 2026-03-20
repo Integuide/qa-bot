@@ -36,6 +36,16 @@ on:
         type: string
         default: '30'
 
+      model:
+        description: 'Claude model'
+        required: false
+        type: choice
+        options:
+          - claude-haiku-4-5
+          - claude-sonnet-4-6
+          - claude-opus-4-6
+        default: 'claude-haiku-4-5'
+
       max-cost:
         description: 'Maximum cost in USD (default: $5.00)'
         required: false
@@ -45,6 +55,7 @@ on:
 jobs:
   qa-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -56,6 +67,7 @@ jobs:
         with:
           url: ${{ inputs.url }}
           goal: ${{ inputs.goal }}
+          model: ${{ inputs.model }}
           max-agents: ${{ inputs.max-agents }}
           max-duration: ${{ inputs.max-duration }}
           max-cost: ${{ inputs.max-cost }}
@@ -64,20 +76,24 @@ jobs:
 
       - name: Write Summary
         if: always() && steps.qa.outcome != 'cancelled'
+        env:
+          INPUT_URL: ${{ inputs.url }}
+          FLOWS: ${{ steps.qa.outputs.flows-explored }}
+          ISSUES: ${{ steps.qa.outputs.issues-count }}
+          CRITICAL: ${{ steps.qa.outputs.critical-issues }}
+          REPORT: ${{ steps.qa.outputs.report }}
         run: |
-          echo "### QA Bot Results for ${{ inputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "### QA Bot Results for $INPUT_URL" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Flows Explored | ${{ steps.qa.outputs.flows-explored }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Issues Found | ${{ steps.qa.outputs.issues-count }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Critical Issues | ${{ steps.qa.outputs.critical-issues }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Flows Explored | $FLOWS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Issues Found | $ISSUES |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical Issues | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Full Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          cat <<'REPORT_EOF' >> $GITHUB_STEP_SUMMARY
-          ${{ steps.qa.outputs.report }}
-          REPORT_EOF
+          echo "$REPORT" >> $GITHUB_STEP_SUMMARY
 
       - name: Save report as artifact
         if: always() && steps.qa.outcome != 'cancelled'
