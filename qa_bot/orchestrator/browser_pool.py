@@ -99,6 +99,7 @@ class BrowserPool:
     async def create_isolated_context(
         self,
         storage_state: Optional[dict] = None,
+        http_credentials: Optional[dict] = None,
     ) -> BrowserContext:
         """
         Create a new isolated browser context for a flow.
@@ -109,6 +110,9 @@ class BrowserPool:
         Args:
             storage_state: Optional storage state to restore (from checkpoint).
                           If None, creates a fresh context.
+            http_credentials: Optional dict with 'username' and 'password' for
+                             HTTP Basic Auth. Playwright handles 401 challenges
+                             natively when this is set.
 
         Returns:
             A new BrowserContext that is independent of other contexts.
@@ -128,6 +132,10 @@ class BrowserPool:
             # Bypass HTTPS/certificate errors (self-signed certs, expired certs, etc.)
             # Controlled by IGNORE_HTTPS_ERRORS config flag (default: false)
             ignore_https_errors=IGNORE_HTTPS_ERRORS,
+            # HTTP Basic Auth — Playwright handles 401 challenges at the protocol
+            # level, before route handlers fire. This is required for the initial
+            # navigation; route interception alone misses it.
+            http_credentials=http_credentials,
         )
 
         return context

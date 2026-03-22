@@ -260,15 +260,20 @@ class FlowExplorationWorker:
         try:
             # Check for HTTP Basic Auth credentials
             http_auth = await self.state.get_http_auth()
+            pw_credentials = (
+                {"username": http_auth["username"], "password": http_auth["password"]}
+                if http_auth else None
+            )
 
             if task.is_root or task.checkpoint_id is None:
                 # Root flow or fresh flow: create fresh context
                 # Flows created via add_flow_task have checkpoint_id=None and start fresh
-                context = await self.browser_pool.create_isolated_context()
+                context = await self.browser_pool.create_isolated_context(
+                    http_credentials=pw_credentials,
+                )
 
-                # Apply HTTP auth via route interception
-                # When credentials are pre-provided, apply to all flows including root
-                # (skipping root only made sense for credential discovery, not pre-auth)
+                # Also apply via route interception to proactively send the header
+                # (avoids 401 round-trip on subrequests after initial navigation)
                 if http_auth:
                     await self.browser_pool.apply_http_auth(
                         context, http_auth["username"], http_auth["password"], http_auth["target_url"]
@@ -301,10 +306,11 @@ class FlowExplorationWorker:
                 parent_flow_name = checkpoint.branch_name or ""
 
                 context = await self.browser_pool.create_isolated_context(
-                    storage_state=checkpoint.browser_storage_state
+                    storage_state=checkpoint.browser_storage_state,
+                    http_credentials=pw_credentials,
                 )
 
-                # Apply HTTP auth via route interception for checkpoint-restored flows
+                # Also apply via route interception for checkpoint-restored flows
                 if http_auth:
                     await self.browser_pool.apply_http_auth(
                         context, http_auth["username"], http_auth["password"], http_auth["target_url"]
