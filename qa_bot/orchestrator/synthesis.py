@@ -165,6 +165,10 @@ class SynthesisAgent:
         if action_type == "close_popup":
             return "Close popup window"
 
+        # Set HTTP auth
+        if action_type == "set_http_auth":
+            return "Applied HTTP Basic Auth credentials"
+
         # Fallback: use reasoning or action_type
         if reasoning:
             return reasoning[:60]

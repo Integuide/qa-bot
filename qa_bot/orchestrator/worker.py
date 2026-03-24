@@ -111,6 +111,17 @@ async def _safe_goto(page, url: str, timeout: int = 30000) -> None:
             raise
 
 
+def _target_url_for_auth(page_url: str, fallback_url: str) -> str:
+    """Return the best URL for HTTP auth scoping.
+
+    Avoids using about:blank or empty strings, which would cause
+    route interception patterns to not match the actual domain.
+    """
+    if page_url and page_url != "about:blank":
+        return page_url
+    return fallback_url
+
+
 @dataclass
 class ActionResult:
     """Result of executing an action."""
@@ -125,6 +136,7 @@ class ActionResult:
     reported_issues: list = None
     screenshot: bytes = None  # For explicit screenshot action
     data_request: "UserDataRequest" = None  # For request_data action
+    needs_context_rebuild: bool = False  # For set_http_auth: recreate browser context
 
     def __post_init__(self):
         if self.pending_flows is None:
@@ -582,6 +594,12 @@ class FlowExplorationWorker:
                         for event in result.get("events", []):
                             yield event
 
+                        # Update browser references if context was rebuilt (e.g., after set_http_auth)
+                        if "new_page" in result:
+                            page = result["new_page"]
+                            context = result["new_context"]
+                            browser = result["new_browser"]
+
                         # Check for flow completion or error
                         if result.get("flow_completed"):
                             flow_completed = True
@@ -819,6 +837,34 @@ class FlowExplorationWorker:
 
             # Execute the action
             exec_result = await self._execute_action(action, page, browser, context, conversation_history, task)
+
+            # Handle context rebuild (e.g., after set_http_auth applies credentials)
+            if exec_result.needs_context_rebuild:
+                http_auth = await self.state.get_http_auth()
+                if http_auth:
+                    reload_url = _target_url_for_auth(page.url, task.start_url)
+                    try:
+                        await page.close()
+                        await context.close()
+                        pw_credentials = {"username": http_auth["username"], "password": http_auth["password"]}
+                        context = await self.browser_pool.create_isolated_context(
+                            http_credentials=pw_credentials,
+                        )
+                        await self.browser_pool.apply_http_auth(
+                            context, http_auth["username"], http_auth["password"], http_auth["target_url"]
+                        )
+                        page = await context.new_page()
+                        await _safe_goto(page, reload_url)
+                        browser = BrowserController.from_page(page)
+                    except Exception as e:
+                        logger.error(f"Context rebuild failed after set_http_auth: {e}")
+                        # Re-raise so the worker exits cleanly via the outer try/except
+                        # rather than continuing with stale page/context references
+                        raise
+                    # Return new page/context/browser so caller can update its references
+                    result["new_page"] = page
+                    result["new_context"] = context
+                    result["new_browser"] = browser
 
             # Build action record for history
             action_dict = {
@@ -1503,6 +1549,35 @@ class FlowExplorationWorker:
                         message="No active popup to close",
                         error="No popup window is currently active"
                     )
+
+            elif action.action_type == "set_http_auth":
+                username_key = action.username_key
+                password_key = action.password_key
+                if not username_key or not password_key:
+                    return ActionResult(
+                        success=False,
+                        message="set_http_auth requires both username_key and password_key",
+                        error="Missing username_key or password_key"
+                    )
+                credentials = await self.state.get_credentials()
+                username = credentials.get(username_key)
+                password = credentials.get(password_key)
+                if username is None or password is None:
+                    available = list(credentials.keys()) if credentials else []
+                    return ActionResult(
+                        success=False,
+                        message=f"Credential keys not found. Available keys: {available}",
+                        error=f"Key {username_key!r} or {password_key!r} not in available credentials"
+                    )
+                # Store HTTP auth for this and future flows
+                target_url = _target_url_for_auth(page.url, task.start_url)
+                await self.state.set_http_auth(username, password, target_url)
+                logger.info(f"HTTP auth set via AI action: username_key={username_key!r}, password_key={password_key!r}")
+                return ActionResult(
+                    success=True,
+                    message="HTTP Basic Auth credentials applied. The page will reload with authentication.",
+                    needs_context_rebuild=True,
+                )
 
             else:
                 return ActionResult(

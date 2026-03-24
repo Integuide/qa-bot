@@ -86,6 +86,9 @@ Respond with a single JSON object. Use ref strings like "ref_1", "ref_2" from th
 **Request data from user (credentials, codes, etc.):**
 {{"action_type": "request_data", "request_name": "site_login", "request_description": "Need login credentials to test authenticated features", "request_fields": [{{"key": "email", "label": "Email Address", "type": "email"}}, {{"key": "password", "label": "Password", "type": "password"}}], "reasoning": "Login form requires credentials"}}
 
+**Apply HTTP Basic Auth (when page returns 401):**
+{{"action_type": "set_http_auth", "username_key": "HTTP_USERNAME", "password_key": "HTTP_PASSWORD", "reasoning": "Site requires HTTP Basic Auth, using provided credentials"}}
+
 **Request help (general, when stuck):**
 {{"action_type": "block", "reason": "Stuck on CAPTCHA that cannot be solved"}}
 
@@ -214,10 +217,9 @@ If a popup window opens (e.g., OAuth login, payment gateway):
 
 ## HTTP Basic Auth
 
-If you encounter an HTTP 401 authentication prompt:
-- Use `block` action with reason containing "HTTP_USERNAME, HTTP_PASSWORD"
-- The supervisor will request credentials from the user
-- After credentials are provided, retry the navigation
+If you encounter an HTTP 401 authentication prompt (a blank page or browser auth dialog, not a login form):
+- If credentials are available in your credentials list, use the `set_http_auth` action with the appropriate `username_key` and `password_key` from your available credentials. Choose the keys that look most like HTTP auth credentials (e.g., keys containing "username"/"password", "http_user"/"http_pass", or similar). The page will automatically reload after auth is applied.
+- If no credentials are available, use `request_data` to ask the user for HTTP Basic Auth credentials.
 
 ## Guidelines
 

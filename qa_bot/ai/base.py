@@ -36,6 +36,7 @@ class AgentAction(BaseModel):
         "report_issue",    # Report QA issue found
         "close_popup",     # Close active popup window
         "request_data",    # Request data from user (credentials, codes, etc.)
+        "set_http_auth",   # Apply HTTP Basic Auth using provided credential keys
     ]
     reasoning: str = ""
 
@@ -93,6 +94,10 @@ class AgentAction(BaseModel):
     request_name: Optional[str] = None  # AI-chosen name for this data request
     request_description: Optional[str] = None  # Why the data is needed
     request_fields: Optional[list[dict]] = None  # List of field definitions
+
+    # For set_http_auth action
+    username_key: Optional[str] = None  # Credential key to use as username
+    password_key: Optional[str] = None  # Credential key to use as password
 
 
 class WorkerActionResponse(BaseModel):
