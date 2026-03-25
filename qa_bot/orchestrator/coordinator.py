@@ -281,6 +281,11 @@ class FlowExplorationOrchestrator:
                         _log_event(event)
                         yield event
 
+                        if not self._interactive:
+                            # Non-interactive (CI/GitHub Actions): no user to
+                            # resume, so proceed straight to synthesis.
+                            break
+
                         # Wait for resume signal (30 minute timeout)
                         PAUSE_TIMEOUT_SECONDS = 30 * 60  # 30 minutes
                         resumed = await self._shared_state.wait_for_resume(timeout=PAUSE_TIMEOUT_SECONDS)
