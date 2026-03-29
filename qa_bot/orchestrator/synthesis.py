@@ -1,11 +1,14 @@
 """Synthesis agent that generates final QA reports."""
 
+import logging
 import re
 from datetime import datetime
 
 from qa_bot.ai.base import AIProvider
 from qa_bot.orchestrator.shared_state import SharedFlowState
 from qa_bot.orchestrator.flow import FlowStatus
+
+logger = logging.getLogger(__name__)
 
 
 class SynthesisAgent:
@@ -318,12 +321,14 @@ class SynthesisAgent:
             return report
         except Exception as e:
             # Fallback to simple report if AI fails
+            logger.warning(f"Synthesis AI call failed, using fallback report: {e}")
             return self._generate_fallback_report(
                 shared_state.target_url,
                 duration,
                 issues,
                 completed_flows,
                 blocked_flows,
+                error=str(e),
             )
 
     def _generate_fallback_report(
@@ -333,17 +338,30 @@ class SynthesisAgent:
         issues: list[dict],
         completed_flows: list[dict],
         blocked_flows: list[dict] | None = None,
+        error: str | None = None,
     ) -> str:
         """Generate a simple report without AI."""
         lines = [
             "# QA Test Report",
             "",
+        ]
+
+        if error:
+            lines.extend([
+                "> **Warning:** QA Bot encountered errors during this run. "
+                "The results below may be incomplete. Check the Actions log for details.",
+                ">",
+                f"> `{error[:300]}`",
+                "",
+            ])
+
+        lines.extend([
             f"**Target URL:** {target_url}",
             f"**Duration:** {duration}",
             f"**Flows Tested:** {len(completed_flows)}",
             f"**Issues Found:** {len(issues)}",
             "",
-        ]
+        ])
 
         # Issues by severity
         critical = [i for i in issues if i.get("severity") == "critical"]

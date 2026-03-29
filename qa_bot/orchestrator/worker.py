@@ -368,6 +368,7 @@ class FlowExplorationWorker:
             action_count = 0
             action_history = []
             flow_completed = False
+            last_error = ""
 
             # Main exploration loop - runs until AI returns done/block action, or global limits hit
             while not flow_completed and not self.state.should_stop():
@@ -619,17 +620,23 @@ class FlowExplorationWorker:
                     prior_context = ""
 
                 except Exception as e:
+                    last_error = str(e)
                     yield {
                         "type": "ai_error",
                         "worker_id": self.worker_id,
                         "flow_id": task.flow_id,
-                        "data": {"error": str(e)}
+                        "data": {"error": last_error}
                     }
                     break
 
             # Mark done if not already (loop exited due to global stop condition)
             if not flow_completed and flow_data.status == FlowStatus.EXPLORING:
                 completion_reason = self.state.get_stop_reason()
+                # If get_stop_reason returns "Unknown", the loop exited due to
+                # an exception rather than a planned stop.  Surface the error
+                # so the report and PR comment make the failure obvious.
+                if completion_reason == "Unknown" and last_error:
+                    completion_reason = f"AI error: {last_error[:200]}"
                 await self.state.complete_flow(task.flow_id, completion_reason)
                 yield {
                     "type": "flow_completed",

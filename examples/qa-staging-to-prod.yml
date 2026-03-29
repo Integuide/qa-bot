@@ -46,7 +46,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      reactions: write  # For adding rocket emoji to triggering comment
+      issues: write  # For adding rocket emoji to triggering comment
 
     steps:
       # For comment triggers, verify it's a staging -> production PR

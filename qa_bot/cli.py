@@ -128,6 +128,9 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
             issues = data.get("issues_found", 0)
             duration = data.get("duration_seconds", 0)
             return f"[Complete] {flows} flows explored, {issues} issues found ({duration:.1f}s)"
+        elif event_type == "ai_error":
+            error = data.get("error", "Unknown error")
+            return f"[AI Error] {error}"
         return None
 
     # Full level: all events (similar to web UI activity log)
@@ -292,7 +295,7 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
 
         # AI error events
         elif event_type == "ai_error":
-            error = data.get("error", "Unknown error")[:100]
+            error = data.get("error", "Unknown error")
             return f"[{timestamp}] [AI Error] {error}"
 
         # Screenshot events
