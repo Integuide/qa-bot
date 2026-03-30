@@ -68,6 +68,11 @@ inputs:
     required: false
     default: 'true'
 
+  github-token:
+    description: 'GitHub token for posting PR comments. Pass ${{ github.token }} from your workflow.'
+    required: false
+    default: ''
+
 outputs:
   report:
     description: 'Markdown QA report with findings'
@@ -98,4 +103,4 @@ runs:
     TESTMAIL_API_KEY: ${{ inputs.testmail-api-key }}
     TESTMAIL_NAMESPACE: ${{ inputs.testmail-namespace }}
     INPUT_DANGEROUSLY_SKIP_PERMISSIONS: ${{ inputs.dangerously-skip-permissions }}
-    GITHUB_TOKEN: ${{ github.token }}
+    GITHUB_TOKEN: ${{ inputs.github-token }}

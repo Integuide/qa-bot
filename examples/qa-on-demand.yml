@@ -143,6 +143,7 @@ jobs:
           url: ${{ steps.extract.outputs.url }}
           goal: ${{ steps.generate-goal.outputs.goal }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ github.token }}
           max-duration: '10'
           fail-on-critical: 'false'  # Don't fail, just report
 

@@ -34,6 +34,7 @@ QA Bot uses Claude AI to explore your website like a real user would:
 | `max-duration` | No | `30` | Maximum duration in minutes |
 | `model` | No | `claude-haiku-4-5` | Claude model |
 | `post-comment` | No | `true` | Post results as PR comment |
+| `github-token` | No | - | GitHub token for PR comments. Pass `${{ github.token }}` when `post-comment` is `true` |
 | `fail-on-critical` | No | `true` | Fail workflow on critical issues |
 | `credentials` | No | - | Test credentials (see below) |
 | `testmail-api-key` | No | - | Testmail.app API key for email flows |
@@ -97,6 +98,7 @@ jobs:
           url: ${{ github.event.inputs.url }}
           goal: ${{ github.event.inputs.goal }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ github.token }}
 ```
 
 ### With Test Credentials

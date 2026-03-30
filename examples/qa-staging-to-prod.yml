@@ -173,6 +173,7 @@ jobs:
           max-agents: '3'
           max-duration: '15'
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ github.token }}
           fail-on-critical: 'true'
 
       - name: Summary

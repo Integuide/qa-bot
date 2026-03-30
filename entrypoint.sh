@@ -109,8 +109,10 @@ echo "flows-explored=$FLOWS_EXPLORED" >> "$GITHUB_OUTPUT"
 if [ "$INPUT_POST_COMMENT" = "true" ]; then
     echo "::group::Posting PR Comment"
 
+    if [ -z "$GITHUB_TOKEN" ]; then
+        echo "::warning::post-comment is enabled but no github-token was provided. Add 'github-token: \${{ github.token }}' to your workflow's 'with:' block."
     # Check if we have the event file and a PR context
-    if [ -f "$GITHUB_EVENT_PATH" ]; then
+    elif [ -f "$GITHUB_EVENT_PATH" ]; then
         # Try to get PR number from various event types
         PR_NUMBER=$(jq -r '
             .pull_request.number //
