@@ -69,7 +69,7 @@ inputs:
     default: 'true'
 
   github-token:
-    description: 'GitHub token for posting PR comments. Pass ${{ github.token }} from your workflow.'
+    description: 'GitHub token for posting PR comments. Pass github.token from your workflow.'
     required: false
     default: ''
 
