@@ -82,7 +82,11 @@ class ClaudeProvider(AIProvider):
         model: str = DEFAULT_MODEL,
         max_concurrent_calls: int = 2
     ):
-        self.client = AsyncAnthropic(api_key=api_key)
+        # Disable SDK-level retries — we handle retries ourselves with
+        # _retry_with_backoff / the streaming retry loop. The SDK's default
+        # max_retries=2 would add a hidden retry layer that compounds backoff
+        # and generates extra 429 pressure during rate limit windows.
+        self.client = AsyncAnthropic(api_key=api_key, max_retries=0)
         self.model = model
         # Semaphore to limit concurrent API calls and avoid rate limiting
         self._api_semaphore = asyncio.Semaphore(max_concurrent_calls)

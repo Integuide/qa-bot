@@ -17,10 +17,10 @@ on:
   issue_comment:
     types: [created]
 
-# Only run one QA test at a time per PR
-concurrency:
-  group: qa-bot-ondemand-${{ github.event.issue.number }}
-  cancel-in-progress: true
+# NOTE: Concurrency is set at the JOB level, not the workflow level.
+# Workflow-level concurrency groups are evaluated before job `if` conditions,
+# so any issue_comment (even non-@QABot ones) would cancel an in-progress
+# QA run. Job-level concurrency is only evaluated for jobs that pass the `if`.
 
 jobs:
   qa-test:
@@ -31,6 +31,11 @@ jobs:
       (github.event.comment.author_association == 'OWNER' ||
        github.event.comment.author_association == 'MEMBER' ||
        github.event.comment.author_association == 'COLLABORATOR')
+
+    # Only run one QA test at a time per PR
+    concurrency:
+      group: qa-bot-ondemand-${{ github.event.issue.number }}
+      cancel-in-progress: true
 
     runs-on: ubuntu-latest
     timeout-minutes: 30
