@@ -9,7 +9,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 from qa_bot.ai.base import AIProvider
-from qa_bot.orchestrator.browser_pool import BrowserPool
+from qa_bot.orchestrator.browser_pool import BrowserPool, BROWSER_USER_AGENT
 from qa_bot.orchestrator.shared_state import SharedFlowState
 from qa_bot.orchestrator.worker import FlowExplorationWorker
 from qa_bot.orchestrator.supervisor import SupervisorAgent
@@ -28,6 +28,120 @@ def _should_save_screenshots() -> bool:
         return False
     else:  # "auto"
         return ENVIRONMENT == "development"
+
+
+# Keep this at least as lenient as the browser's navigation budget
+# (_safe_goto's 30s default in worker.py) — a probe stricter than the real
+# navigation would abort a slow-cold-start target as "unreachable" (a NOT TESTED
+# report that fails the CI deploy check) even though the browser would load it.
+PREFLIGHT_TIMEOUT_SECONDS = 30.0
+
+
+def _detect_http_auth_credentials(
+    credentials: dict[str, str],
+) -> tuple[str, str] | None:
+    """Find HTTP Basic Auth credentials among the provided keys.
+
+    Mirrors the key heuristics the worker prompt teaches the AI for
+    set_http_auth: exact HTTP_USERNAME/HTTP_PASSWORD first, then any
+    key pair containing http+user / http+pass.
+    """
+    if "HTTP_USERNAME" in credentials and "HTTP_PASSWORD" in credentials:
+        return credentials["HTTP_USERNAME"], credentials["HTTP_PASSWORD"]
+
+    username = password = None
+    for key, value in credentials.items():
+        lowered = key.lower()
+        if "http" in lowered and "user" in lowered and username is None:
+            username = value
+        elif "http" in lowered and "pass" in lowered and password is None:
+            password = value
+    if username is not None and password is not None:
+        return username, password
+    return None
+
+
+async def preflight_check(
+    target_url: str,
+    credentials: dict[str, str] | None,
+    interactive: bool = False,
+) -> str | None:
+    """Probe the target URL before spending anything on browsers or AI calls.
+
+    Returns a human-actionable fatal reason, or None when exploration should
+    proceed. Only conditions that make EVERY flow useless abort the run:
+
+    - the target doesn't respond at all (DNS failure, refused, timeout)
+    - the target demands HTTP Basic Auth and no usable credentials were
+      provided (or the provided ones are rejected) — non-interactive runs
+      only, since a web-UI user can supply credentials mid-run
+
+    Anything else (404/5xx on the root, redirects elsewhere) is left to the
+    exploration itself — a reachable server is worth testing.
+
+    Rationale: runs on mono PR #356 burned full explorations producing
+    "NOT TESTED" reports for exactly these two conditions.
+    """
+    import httpx
+
+    from qa_bot.config import IGNORE_HTTPS_ERRORS
+
+    auth = _detect_http_auth_credentials(credentials or {})
+
+    def _unreachable(err: Exception) -> str:
+        return (
+            f"Target {target_url} is unreachable: "
+            f"{type(err).__name__}: {err}. Verify the deployment is up and the "
+            f"URL is correct."
+        )
+
+    # A cold-starting staging box often times out or resets the very first
+    # request but serves the second. Retry once on those transient errors;
+    # connection-refused / DNS failures (ConnectError) won't recover in a
+    # second, so fail fast on them.
+    transient = (httpx.TimeoutException, httpx.ReadError, httpx.RemoteProtocolError)
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=PREFLIGHT_TIMEOUT_SECONDS,
+                # Match the browser's TLS posture so the probe never fails a
+                # target the browser itself would happily load.
+                verify=not IGNORE_HTTPS_ERRORS,
+                # Send the same User-Agent the real browser uses so WAF/bot
+                # protection that drops or resets non-browser clients doesn't
+                # make the probe read a target as "unreachable" when the real
+                # Chromium would load it fine. Matching exactly means the probe
+                # fails iff the browser would.
+                headers={"User-Agent": BROWSER_USER_AGENT},
+            ) as client:
+                response = await client.get(target_url)
+                if response.status_code == 401 and not interactive:
+                    if auth is None:
+                        return (
+                            f"Target {target_url} requires HTTP Basic Auth but no "
+                            f"HTTP credentials were provided. Add HTTP_USERNAME "
+                            f"and HTTP_PASSWORD to the run's credentials."
+                        )
+                    response = await client.get(target_url, auth=auth)
+                    if response.status_code == 401:
+                        return (
+                            f"Target {target_url} rejected the provided HTTP "
+                            f"Basic Auth credentials (still 401). Check "
+                            f"HTTP_USERNAME / HTTP_PASSWORD."
+                        )
+            return None
+        except httpx.ConnectError as e:
+            # Refused / DNS resolution failure — retrying won't help.
+            return _unreachable(e)
+        except transient as e:
+            if attempt == 0:
+                await asyncio.sleep(1.0)
+                continue
+            return _unreachable(e)
+        except httpx.HTTPError as e:
+            return _unreachable(e)
+    return None
 
 
 class FlowExplorationOrchestrator:
@@ -98,6 +212,12 @@ class FlowExplorationOrchestrator:
         Yields unified event stream from all workers.
         """
         num_agents = max_agents or self.max_agents
+        # Clamp to the same 1-20 range config.py enforces on the MAX_AGENTS env
+        # var (defense-in-depth): the CLI --max-agents flag and the GitHub
+        # Action's max-agents input reach here unclamped, and an out-of-range
+        # value would size the semaphore and worker-number pool nonsensically
+        # (0 or negative deadlocks; a huge value floods the target with workers).
+        num_agents = max(1, min(20, num_agents))
         max_branches = max_branches_per_flow or self.max_branches_per_flow
 
         # Cap cost at maximum allowed (defense-in-depth)
@@ -169,6 +289,20 @@ class FlowExplorationOrchestrator:
         _log_event(event)
         yield event
 
+        # Pre-flight: if the target can't be tested at all (unreachable, or
+        # behind HTTP auth with no usable credentials), fail in seconds for
+        # ~$0 instead of spinning up browsers and AI workers that can only
+        # produce a "NOT TESTED" report.
+        preflight_error = await preflight_check(
+            target_url, self._initial_credentials, interactive=self._interactive
+        )
+        if preflight_error:
+            async for event in self._abort_for_preflight(
+                target_url, preflight_error, _log_event
+            ):
+                yield event
+            return
+
         # Initialize browser pool
         self._browser_pool = BrowserPool(
             max_pages=num_agents * 2,
@@ -176,9 +310,12 @@ class FlowExplorationOrchestrator:
             viewport_width=VIEWPORT_WIDTH,
             viewport_height=VIEWPORT_HEIGHT
         )
-        await self._browser_pool.start()
 
         try:
+            # Inside the try so a startup failure (e.g. Playwright not
+            # installed) still runs _cleanup() and yields a fatal error event.
+            await self._browser_pool.start()
+
             # Spawn supervisor
             self._supervisor = SupervisorAgent(
                 ai_provider=self.ai,
@@ -401,6 +538,7 @@ class FlowExplorationOrchestrator:
             synthesis = SynthesisAgent(self.ai)
             try:
                 report = await synthesis.generate_report(self._shared_state)
+                self._persist_report(report)
                 event = {
                     "type": "synthesis_complete",
                     "data": {
@@ -448,17 +586,43 @@ class FlowExplorationOrchestrator:
 
             # Write summary.json before yielding final event — code after
             # yield in an async generator may not execute if consumer stops iterating
-            self._write_summary(final_progress, status="completed")
+            self._write_summary(
+                final_progress,
+                status="completed",
+                issues=[issue.to_dict() for issue in all_issues],
+            )
 
             yield event
 
         except Exception as e:
-            # Write summary.json even on error
+            logger.exception("Fatal error in exploration main loop")
+
+            # Salvage whatever the workers already found: a late crash must
+            # not discard an entire run's findings. Synthesize a report from
+            # collected state and emit exploration_complete so the CLI and
+            # the GitHub Action PR comment still receive the results.
+            try:
+                salvage_events = await self._build_salvage_events(target_url, str(e))
+            except Exception:
+                logger.exception("Failed to salvage results after fatal error")
+                salvage_events = []
+
+            # Write summary.json even on error. Done after salvage so the
+            # recorded cost includes the salvage synthesis call's usage.
             try:
                 error_progress = await self._shared_state.get_progress()
-                self._write_summary(error_progress, status="error", error=str(e))
+                error_issues = await self._shared_state.get_all_issues()
+                self._write_summary(
+                    error_progress,
+                    status="error",
+                    error=str(e),
+                    issues=[issue.to_dict() for issue in error_issues],
+                )
             except Exception:
                 pass  # Best-effort, don't mask the original error
+            for salvage_event in salvage_events:
+                _log_event(salvage_event)
+                yield salvage_event
 
             event = {
                 "type": "error",
@@ -478,8 +642,29 @@ class FlowExplorationOrchestrator:
         The is_first_worker flag is read from the flow_task if set there,
         otherwise falls back to the parameter (for backward compatibility).
         """
-        # Acquire semaphore slot (blocks if at max workers)
-        await self._worker_semaphore.acquire()
+        # Acquire semaphore slot (blocks if at max workers).
+        # Capture the semaphore and number pool objects so the worker's
+        # release goes to the SAME objects it acquired from. The resume path
+        # replaces both after a 15s grace period; without this, a straggler
+        # worker finishing after resume would over-credit the new semaphore
+        # beyond max_agents and exhaust the worker number pool.
+        semaphore = self._worker_semaphore
+        number_pool = self._available_worker_numbers
+        await semaphore.acquire()
+
+        # Re-check the supervisor skip set after the (possibly long) semaphore
+        # wait: claim_pending_flow leaves the flow's registry status PENDING,
+        # so the supervisor can mark a claimed-but-unspawned flow as a
+        # duplicate while all worker slots are busy. Without this re-check the
+        # flow would emit flow_skipped yet still be explored once a slot
+        # freed, spending budget on the duplicate.
+        if await self._shared_state.is_flow_skipped(flow_task.flow_id):
+            logger.info(
+                f"Discarding flow skipped while waiting for a worker slot: "
+                f"{flow_task.flow_name} ({flow_task.flow_id})"
+            )
+            semaphore.release()
+            return
 
         # Track active worker count in shared state (for UI progress)
         await self._shared_state.increment_active_workers()
@@ -487,9 +672,9 @@ class FlowExplorationOrchestrator:
         # Get a worker number from the pool (recycles 1-N)
         # Safety: The semaphore acquired above guarantees a number is available,
         # since pool size equals semaphore count. Assert defensively.
-        assert self._available_worker_numbers, "Bug: No available worker numbers despite semaphore acquisition"
-        worker_number = min(self._available_worker_numbers)
-        self._available_worker_numbers.remove(worker_number)
+        assert number_pool, "Bug: No available worker numbers despite semaphore acquisition"
+        worker_number = min(number_pool)
+        number_pool.remove(worker_number)
         worker_id = f"worker-{worker_number}"
 
         # Use is_first_worker from flow_task if set, otherwise use parameter
@@ -508,13 +693,24 @@ class FlowExplorationOrchestrator:
 
         # Create task that runs worker and releases semaphore when done
         task = asyncio.create_task(
-            self._run_worker_and_release(worker, worker_number)
+            self._run_worker_and_release(worker, worker_number, semaphore, number_pool)
         )
         self._active_worker_tasks.add(task)
         task.add_done_callback(self._active_worker_tasks.discard)
 
-    async def _run_worker_and_release(self, worker: FlowExplorationWorker, worker_number: int):
-        """Run a worker and release semaphore when done."""
+    async def _run_worker_and_release(
+        self,
+        worker: FlowExplorationWorker,
+        worker_number: int,
+        semaphore: asyncio.Semaphore,
+        number_pool: set[int],
+    ):
+        """Run a worker and release the semaphore/number pool it acquired from.
+
+        The semaphore and pool are passed explicitly (not read from self) so
+        a worker that outlives a pause/resume cycle credits the objects it
+        was spawned under, not the fresh ones created by the resume path.
+        """
         try:
             async for event in worker.run():
                 await self._event_queue.put(event)
@@ -539,8 +735,8 @@ class FlowExplorationOrchestrator:
             })
             await self._shared_state.decrement_active_workers()
             # Return worker number to the pool for reuse
-            self._available_worker_numbers.add(worker_number)
-            self._worker_semaphore.release()
+            number_pool.add(worker_number)
+            semaphore.release()
 
     async def _spawn_workers_for_pending_flows(self):
         """Check for pending flows and spawn workers for them."""
@@ -555,6 +751,17 @@ class FlowExplorationOrchestrator:
             if flow_task is None:
                 # No pending flows
                 break
+
+            # Discard flows the supervisor marked as duplicates instead of
+            # exploring them. The task stays out of the queue and keeps its
+            # SKIPPED status; a flow_skipped event was already emitted by
+            # the supervisor when it made the decision.
+            if await self._shared_state.is_flow_skipped(flow_task.flow_id):
+                logger.info(
+                    f"Discarding supervisor-skipped flow: {flow_task.flow_name} "
+                    f"({flow_task.flow_id})"
+                )
+                continue
 
             # Spawn worker - this will acquire the semaphore
             # If another coroutine grabbed it between our check and now,
@@ -594,7 +801,155 @@ class FlowExplorationOrchestrator:
                 "data": {"error": str(e)}
             })
 
-    def _write_summary(self, progress: dict, status: str = "completed", error: Optional[str] = None):
+    async def _abort_for_preflight(
+        self, target_url: str, reason: str, _log_event
+    ) -> AsyncGenerator[dict, None]:
+        """End the run before any browser/AI cost when preflight fails.
+
+        Emits the same terminal events as a normal run (synthesis_complete,
+        exploration_complete) so every consumer — CLI result file, GitHub
+        Action PR comment, web UI — receives a definitive, actionable
+        NOT TESTED report instead of a generic crash.
+        """
+        logger.error(f"Preflight check failed: {reason}")
+        event = {
+            "type": "preflight_failed",
+            "data": {
+                "reason": reason,
+                "timestamp": datetime.now().isoformat(),
+            },
+        }
+        _log_event(event)
+        yield event
+
+        duration_seconds = (
+            datetime.now() - self._shared_state.start_time
+        ).total_seconds()
+        report = SynthesisAgent(self.ai).generate_not_tested_report(
+            target_url=target_url,
+            duration=f"{int(duration_seconds)} seconds",
+            goal=self._shared_state.goal or "",
+            reason=reason,
+        )
+        self._persist_report(report)
+        event = {
+            "type": "synthesis_complete",
+            "data": {
+                "report": report,
+                "timestamp": datetime.now().isoformat(),
+            },
+        }
+        _log_event(event)
+        yield event
+
+        final_progress = await self._shared_state.get_progress()
+        flow_tree = await self._shared_state.get_flow_tree()
+        self._write_summary(final_progress, status="preflight_failed")
+        event = {
+            "type": "exploration_complete",
+            "data": {
+                "exploration_id": self._shared_state.exploration_id,
+                "target_url": target_url,
+                "issues_found": 0,
+                "issues": [],
+                "flows_explored": 0,
+                "total_flows": 0,
+                "flow_tree": flow_tree,
+                "total_actions": 0,
+                "duration_seconds": duration_seconds,
+                "final_progress": final_progress,
+                "synthesis_report": report,
+                "preflight_failed": True,
+            },
+        }
+        _log_event(event)
+        yield event
+
+    async def _build_salvage_events(self, target_url: str, error: str) -> list[dict]:
+        """Build synthesis/completion events from state collected before a fatal error.
+
+        Returns an empty list when nothing was explored yet (e.g. a startup
+        failure before any worker ran) — in that case there is nothing to
+        report and the fatal error event alone should surface the failure.
+        """
+        if not self._shared_state:
+            return []
+
+        all_issues = await self._shared_state.get_all_issues()
+        if self._shared_state.total_actions == 0 and not all_issues:
+            return []
+
+        all_flows = await self._shared_state.get_all_flows()
+        flow_tree = await self._shared_state.get_flow_tree()
+
+        # generate_report falls back to a simple non-AI report internally if
+        # the AI call fails, so this only raises on unexpected state errors.
+        report = None
+        try:
+            synthesis = SynthesisAgent(self.ai)
+            report = await synthesis.generate_report(self._shared_state)
+        except Exception as synth_error:
+            logger.warning(f"Salvage synthesis failed: {synth_error}")
+
+        events = []
+        if report:
+            report = (
+                "> **Warning:** QA Bot encountered an error during this run and "
+                "exploration ended early. The results below may be incomplete.\n"
+                ">\n"
+                f"> `{error[:300]}`\n\n"
+            ) + report
+            self._persist_report(report)
+            # CLI captures the report from synthesis_complete
+            events.append({
+                "type": "synthesis_complete",
+                "data": {
+                    "report": report,
+                    "timestamp": datetime.now().isoformat()
+                }
+            })
+
+        # Read progress AFTER synthesis so the salvaged completion event
+        # carries the synthesis call's token usage and cost (this feeds the
+        # CLI's estimated_cost_usd and the action's cost-usd output),
+        # matching the normal-completion path's ordering.
+        final_progress = await self._shared_state.get_progress()
+
+        # SSE consumers stop at exploration_complete, so embed the error here
+        events.append({
+            "type": "exploration_complete",
+            "data": {
+                "exploration_id": self._shared_state.exploration_id,
+                "target_url": target_url,
+                "error": error,
+                "issues_found": len(all_issues),
+                "issues": [issue.to_dict() for issue in all_issues],
+                "flows_explored": len([
+                    f for f in all_flows
+                    if f.status == FlowStatus.COMPLETED
+                ]),
+                "total_flows": len(all_flows),
+                "flow_tree": flow_tree,
+                "total_actions": self._shared_state.total_actions,
+                "duration_seconds": (datetime.now() - self._shared_state.start_time).total_seconds(),
+                "final_progress": final_progress,
+                "synthesis_report": report
+            }
+        })
+        return events
+
+    def _persist_report(self, report: Optional[str]):
+        """Persist the synthesis report to report.md (best-effort)."""
+        if report and self._shared_state and self._shared_state.chat_logger:
+            self._shared_state.chat_logger.write_report(report)
+
+    def _write_summary(
+        self,
+        progress: dict,
+        status: str = "completed",
+        error: Optional[str] = None,
+        issues: Optional[list[dict]] = None,
+    ):
         """Write summary.json to the log directory for monitoring."""
         if not self._shared_state or not self._shared_state.chat_logger:
             return
@@ -602,6 +957,7 @@ class FlowExplorationOrchestrator:
         summary = {
             "exploration_id": progress.get("exploration_id", ""),
             "url": progress.get("target_url", ""),
+            "goal": self._shared_state.goal or "",
             "started": self._shared_state.start_time.isoformat(),
             "duration_seconds": round(progress.get("elapsed_seconds", 0), 1),
             "model": self._shared_state.model,
@@ -612,6 +968,7 @@ class FlowExplorationOrchestrator:
                 "total": progress.get("flows", {}).get("total", 0),
             },
             "issues_found": progress.get("issues_found", 0),
+            "issues": issues if issues is not None else [],
             "total_actions": progress.get("total_actions", 0),
             "status": status,
         }

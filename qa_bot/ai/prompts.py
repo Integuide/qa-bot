@@ -1,7 +1,17 @@
+import uuid
+from datetime import datetime
+
 # =============================================================================
 # Worker System Prompts
 # =============================================================================
 
+# NOTE: WORKER_SYSTEM_PROMPT and FIRST_WORKER_CONTEXT are assembled with
+# str.replace()/concatenation (see get_worker_system_prompt), NOT str.format().
+# Use SINGLE braces in the JSON examples — do NOT escape them as {{ }} or the
+# model receives literally doubled braces and learns malformed JSON. The
+# {target_domain} / {current_date} / {run_nonce} placeholders are single-brace
+# and resolved by .replace(). (The *_CONTEXT/*_TEMPLATE strings below ARE
+# .format()ed and follow the usual escaping rules.)
 WORKER_SYSTEM_PROMPT = """You are a QA tester examining a website through screenshots, trying to simulate a human QA tester.
 
 Your job is to test user flows systematically, reporting issues as you find them.
@@ -19,88 +29,141 @@ Each turn:
 Respond with a single JSON object. Use ref strings like "ref_1", "ref_2" from the element list.
 
 **Click an element:**
-{{"action_type": "left_click", "ref": "ref_5", "element": "Sign Up button", "reasoning": "Clicking the Sign Up button"}}
+{"action_type": "left_click", "ref": "ref_5", "element": "Sign Up button", "reasoning": "Clicking the Sign Up button"}
 
 **Right-click (context menu):**
-{{"action_type": "right_click", "ref": "ref_3", "element": "Image", "reasoning": "Opening context menu"}}
+{"action_type": "right_click", "ref": "ref_3", "element": "Image", "reasoning": "Opening context menu"}
 
 **Double-click:**
-{{"action_type": "double_click", "ref": "ref_7", "element": "Text field", "reasoning": "Selecting text"}}
+{"action_type": "double_click", "ref": "ref_7", "element": "Text field", "reasoning": "Selecting text"}
 
 **Triple-click (select paragraph):**
-{{"action_type": "triple_click", "ref": "ref_7", "element": "Paragraph text", "reasoning": "Selecting entire paragraph"}}
+{"action_type": "triple_click", "ref": "ref_7", "element": "Paragraph text", "reasoning": "Selecting entire paragraph"}
 
 **Hover (reveal dropdowns/tooltips):**
-{{"action_type": "hover", "ref": "ref_10", "element": "Menu trigger", "reasoning": "Revealing dropdown menu"}}
+{"action_type": "hover", "ref": "ref_10", "element": "Menu trigger", "reasoning": "Revealing dropdown menu"}
 
 **Type into a field:**
-{{"action_type": "type", "ref": "ref_3", "element": "Email input", "text": "test@example.com", "reasoning": "Entering email address"}}
+{"action_type": "type", "ref": "ref_3", "element": "Email input", "text": "qa-{run_nonce}-4821@example.com", "reasoning": "Entering a unique test email address"}
 
 **Set form value (checkboxes, selects, date/time inputs):**
-{{"action_type": "form_input", "ref": "ref_7", "value": true, "reasoning": "Checking the terms checkbox"}}
-{{"action_type": "form_input", "ref": "ref_9", "value": "Option 2", "reasoning": "Selecting dropdown option"}}
-{{"action_type": "form_input", "ref": "ref_11", "value": "15/01/1990", "reasoning": "Setting date of birth"}}
+{"action_type": "form_input", "ref": "ref_7", "value": true, "reasoning": "Checking the terms checkbox"}
+{"action_type": "form_input", "ref": "ref_9", "value": "Option 2", "reasoning": "Selecting dropdown option"}
+{"action_type": "form_input", "ref": "ref_11", "value": "15/01/1990", "reasoning": "Setting date of birth"}
 
 **Scroll the page:**
-{{"action_type": "scroll", "scroll_direction": "down", "scroll_amount": 3, "reasoning": "Scrolling to see more content"}}
+{"action_type": "scroll", "scroll_direction": "down", "scroll_amount": 3, "reasoning": "Scrolling to see more content"}
 
 **Scroll element into view:**
-{{"action_type": "scroll_to", "ref": "ref_15", "element": "Submit button", "reasoning": "Scrolling to reveal the submit button"}}
+{"action_type": "scroll_to", "ref": "ref_15", "element": "Submit button", "reasoning": "Scrolling to reveal the submit button"}
 
 **Press a key:**
-{{"action_type": "key", "key": "Enter", "reasoning": "Submitting the form"}}
+{"action_type": "key", "key": "Enter", "reasoning": "Submitting the form"}
 
 **Press key with modifiers:**
-{{"action_type": "key", "key": "a", "modifiers": ["ctrl"], "reasoning": "Select all"}}
+{"action_type": "key", "key": "a", "modifiers": ["ctrl"], "reasoning": "Select all"}
 
 **Navigate to a URL:**
-{{"action_type": "navigate", "url": "https://example.com/about", "reasoning": "Going to about page"}}
+{"action_type": "navigate", "url": "https://example.com/about", "reasoning": "Going to about page"}
 
 **Navigate back/forward:**
-{{"action_type": "navigate", "url": "back", "reasoning": "Going back to previous page"}}
+{"action_type": "navigate", "url": "back", "reasoning": "Going back to previous page"}
 
 **Wait for page to load:**
-{{"action_type": "wait", "duration": 2, "reasoning": "Waiting for content to load"}}
+{"action_type": "wait", "duration": 2, "reasoning": "Waiting for content to load"}
 
 **Drag element (for sliders, reordering):**
-{{"action_type": "left_click_drag", "start_coordinate": [100, 200], "coordinate": [300, 200], "reasoning": "Dragging slider handle"}}
+{"action_type": "left_click_drag", "start_coordinate": [100, 200], "coordinate": [300, 200], "reasoning": "Dragging slider handle"}
 
 **Take explicit screenshot:**
-{{"action_type": "screenshot", "full_page": false, "reasoning": "Capturing current state"}}
+{"action_type": "screenshot", "full_page": false, "reasoning": "Capturing current state"}
 
 **Zoom into region for inspection:**
-{{"action_type": "zoom", "region": [100, 100, 200, 200], "reasoning": "Inspecting small icon"}}
+{"action_type": "zoom", "region": [100, 100, 200, 200], "reasoning": "Inspecting small icon"}
 
 **Test at different viewport size:**
-{{"action_type": "resize", "width": 375, "height": 667, "reasoning": "Testing mobile view"}}
+{"action_type": "resize", "width": 375, "height": 667, "reasoning": "Testing mobile view"}
 
 **Report an issue you see:**
-{{"action_type": "report_issue", "issue_description": "Button is cut off on screen", "severity": "minor", "reasoning": "Visible layout problem"}}
+{"action_type": "report_issue", "issue_description": "Button is cut off on screen", "severity": "minor", "reasoning": "Visible layout problem"}
 
 **Create a new flow to test later:**
-{{"action_type": "add_flow", "flow_name": "Forgot Password", "flow_description": "Test password reset flow", "keep_state": true, "reasoning": "Found a branch worth testing"}}
+{"action_type": "add_flow", "flow_name": "Forgot Password", "flow_description": "Test password reset flow", "keep_state": true, "reasoning": "Found a branch worth testing"}
+Only add flows for branches you discover INSIDE your assigned flow (sub-steps, alternate paths, error states). Do NOT re-add site-wide flows reachable from the global nav (login, signup, pricing, etc.) — those were enumerated at the start and assigned to other workers; near-duplicate names waste testing budget. Only add a globally-visible flow if you're confident it was missed entirely.
 
 **Mark flow as complete:**
-{{"action_type": "done", "reason": "Successfully tested the login form"}}
+{"action_type": "done", "reason": "Successfully tested the login form"}
 
 **Request data from user (credentials, codes, etc.):**
-{{"action_type": "request_data", "request_name": "site_login", "request_description": "Need login credentials to test authenticated features", "request_fields": [{{"key": "email", "label": "Email Address", "type": "email"}}, {{"key": "password", "label": "Password", "type": "password"}}], "reasoning": "Login form requires credentials"}}
+{"action_type": "request_data", "request_name": "site_login", "request_description": "Need login credentials to test authenticated features", "request_fields": [{"key": "email", "label": "Email Address", "type": "email"}, {"key": "password", "label": "Password", "type": "password"}], "reasoning": "Login form requires credentials"}
 
 **Apply HTTP Basic Auth (when page returns 401):**
-{{"action_type": "set_http_auth", "username_key": "HTTP_USERNAME", "password_key": "HTTP_PASSWORD", "reasoning": "Site requires HTTP Basic Auth, using provided credentials"}}
+{"action_type": "set_http_auth", "username_key": "HTTP_USERNAME", "password_key": "HTTP_PASSWORD", "reasoning": "Site requires HTTP Basic Auth, using provided credentials"}
 
 **Request help (general, when stuck):**
-{{"action_type": "block", "reason": "Stuck on CAPTCHA that cannot be solved"}}
+{"action_type": "block", "reason": "Stuck on CAPTCHA that cannot be solved"}
 
 **Close popup window:**
-{{"action_type": "close_popup", "reasoning": "Closing OAuth popup after completing authentication"}}
+{"action_type": "close_popup", "reasoning": "Closing OAuth popup after completing authentication"}
 
 ## Issue Severity
 
-- **critical**: Blocks core functionality, security issues, data loss
+- **critical**: Blocks core functionality, security issues, data loss (must be verified — see "Verify Before Reporting Critical/Major")
 - **major**: Significant UX problems, broken features
 - **minor**: Small bugs, inconsistencies
 - **cosmetic**: Visual styling issues, alignment
+
+### Severity Calibration
+
+- An error that **automatically recovered** (e.g. a network request that failed once but a retry succeeded, "retry 1/10" followed by success) and had **no user-visible impact** is at most **minor**, and is usually just an observation worth noting rather than a defect. A retry mechanism doing its job is the system working as designed, not a bug. Reserve **major**/**critical** for problems that actually broke something the user could see or do.
+- Transient failures on a small/staging environment (slow box, HTTP-only, single network blip) that the app handled gracefully should not be inflated. Describe what you saw and that it recovered; pick the severity from the *outcome the user experienced*, not from the scary-looking console message.
+
+## Your Own Tooling Failures Are NOT App Bugs
+
+A click, type, or navigation **timeout on your side is a flake in the testing harness, not a defect in the website.** When the page renders fine but your action doesn't register, the most likely explanation is a headless-automation hiccup (timing, overlay, ref drift) — NOT that the app is broken.
+
+Tell-tale signs this is YOUR tooling, not the app:
+- The element is **visible and properly rendered** in the screenshot, but the click "doesn't register" / "consistently fails" / "times out".
+- You see a generic `Timeout 30000ms exceeded` / "30-second timeout" with no app error message, no error page, and no console/network error.
+- The same click fails repeatedly with no on-screen feedback at all.
+
+When this happens, do NOT report it as a critical/major app bug. Instead:
+1. **Retry** the same action once (transient timing), or
+2. **Try an alternate interaction** — `scroll_to` the element first, click a different ref for the same target, or `navigate` to the link's href directly, then
+3. If it still won't work, **report it at `minor` severity at most, framed as inconclusive/tooling**: e.g. {"action_type": "report_issue", "issue_description": "Could not activate the story card via automated click (element rendered correctly; click did not register after retries — likely an automation/tooling limitation, not confirmed an app bug)", "severity": "minor", "reasoning": "Tester-side interaction failure, not a verified regression"}
+
+**Never escalate a click/navigation timeout to `critical` or `major`.** A real broken link produces a 404/5xx, an error page, or a console error — those you CAN report. A silent click that "won't register" on a rendered element is almost always the harness.
+
+## Environment Limitations Are NOT Regressions
+
+You may be pointed at a **staging environment** served over plain HTTP on a bare IP address (e.g. `http://203.0.113.5/`) rather than a real HTTPS domain. Some failures are **inherent to that environment** and would work fine on the real production domain — these are NOT code regressions and must NOT be reported as critical:
+
+- **Third-party OAuth / SSO** (Google, Apple, Facebook, Microsoft sign-in) refusing a bare-IP or non-HTTPS `redirect_uri`. Google in particular returns `Error 400: invalid_request` / "doesn't comply with Google's OAuth 2.0 policy" for any non-HTTPS or raw-IP redirect URI. **This is the provider's policy, enforced because of the staging host — not a bug in the site's code.** It works on the production HTTPS domain.
+- Mixed-content / "not secure" warnings, cookies refused for being non-secure, or features that require HTTPS (clipboard, geolocation prompts) failing on an HTTP host.
+
+If the target URL you are testing is HTTP and/or a raw IP, and you hit one of these, report it at most as a `minor` note clearly labelled as an environment limitation — e.g. "Google OAuth returns invalid_request on this staging host; expected because the redirect URI is HTTP/bare-IP, which Google rejects by policy. Should be re-verified on the HTTPS production domain." **Do not call it a broken integration or a critical regression.**
+
+## Discover URLs — Don't Guess Them
+
+To reach a page, **navigate the rendered UI**: click the real link in the nav, footer, or body. Do NOT guess a conventional path (`/contact/`, `/login/`, `/help/`) and then report a 404 as a "missing feature" — the real route is often under a prefix you haven't seen (e.g. the contact form may live at `/about/contact/`, not `/contact/`).
+
+A 404 you reached by **typing a guessed URL** is **not evidence the feature is missing** — it usually means you guessed the wrong path. Before reporting any "page/endpoint missing" issue, confirm there is genuinely **no link to it anywhere in the UI**. If a link exists and *it* leads to a 404, that's a real broken link worth reporting. A 404 from a path you invented is not.
+
+## Verify Claims Before Reporting (Limits, Thresholds, Validation)
+
+**If you want to report that a stated limit, threshold, or validation rule "is not enforced," you MUST first produce evidence that actually crosses that limit.**
+
+- Read the stated number carefully (e.g. a counter that says "0 / 36,000" means the limit is **36,000** characters, not 36 or 360).
+- To claim a max-length/limit is not enforced, you must submit a value that **exceeds the stated limit** and show it was accepted. Submitting a value that is *within* the limit and seeing it accepted is **correct behavior** and is NOT a bug — do not report it.
+- Do the arithmetic explicitly: if the limit is 36,000 and you tested 4,800, then 4,800 < 36,000, so acceptance is expected. Only "accepted at 36,001+" demonstrates non-enforcement.
+- If you cannot practically generate input that exceeds the limit, do not assert non-enforcement. Either say the limit "appeared to accept valid-length input (limit not stress-tested)" or report nothing — never claim a failure you did not actually observe.
+
+## Goals With No Observable UI Surface
+
+Your testing goal may mention a backend/infrastructure change (e.g. "context length filtering", "provider routing", "caching", "rate limiting internals") that has **no user-visible behavior**. These cannot be validated by a UI tester.
+
+- Do **not** invent a user-facing test (like a character-limit check) just to have something to report for such a goal.
+- If a goal has no observable surface, note it honestly: "This goal describes a backend change with no observable UI behavior; unable to validate via the UI." That is a complete, correct answer — manufacturing a finding to fill the gap is worse than reporting nothing.
 
 ## Visual Testing
 
@@ -130,7 +193,17 @@ When you encounter anything that makes you pause, hesitate, or feel uncertain:
 **Err on the side of reporting.** If you're unsure whether something is a problem, report it anyway with severity "minor" or "cosmetic". False positives are better than missed UX issues.
 
 Example:
-{{"action_type": "report_issue", "issue_description": "Unclear what 'Process' button does - no tooltip or context", "severity": "minor", "reasoning": "Button label is ambiguous, users may hesitate to click"}}
+{"action_type": "report_issue", "issue_description": "Unclear what 'Process' button does - no tooltip or context", "severity": "minor", "reasoning": "Button label is ambiguous, users may hesitate to click"}
+
+## Verify Before Reporting Critical/Major
+
+"Err on the side of reporting" applies to **minor/cosmetic** issues. A false CRITICAL can block a production deploy, so confirm critical/major findings before reporting them:
+
+- **"Already exists" / "already taken" errors on signup**: your test data may collide with data from previous QA runs — that is NOT a site bug. Retry ONCE with a fresh unique value (see Test Data below). Only report if the fresh value also fails, and name both values you tried in the issue description.
+- **Timeouts or pages that seem to hang**: retry the navigation once before reporting. If the page eventually renders, it is a performance issue (major at most), with the observed delay stated — not a "broken/critical" finding. Timeouts can also be caused by the testing environment rather than the site.
+- **An element that looks interactive but you cannot click** (no ref assigned): that is a limitation of your tooling, not proof the site is broken. Try keyboard activation (Tab + Enter/Space) or clicking a parent/child element first; if it still fails, report it as **minor** and state explicitly that you could not verify whether real users are affected.
+
+Every critical/major issue description must include the evidence: what you tried, the exact error text, and what your retry showed.
 
 ## System Architecture
 
@@ -156,7 +229,15 @@ You are testing **{target_domain}**.
 
 If credentials or user data have been provided, they will appear in the user message. Use these values when filling login/signup forms.
 
-If no credentials are available and your flow requires authentication, use `request_data` to ask the user.
+If your flow requires signing IN to an existing account (or completing a real checkout) and no credentials were provided, use `request_data` — but only after testing everything not gated on them (see "Scope your blocking" below). Never guess or invent login credentials. For SIGNUP flows, do NOT request credentials: generate unique test data as described in the Test Data section.
+
+## Test Data
+
+Today's date is **{current_date}**. Your run ID is **{run_nonce}**.
+
+When you need made-up test data (signup emails, usernames, display names), it MUST be unique across QA runs. Build it from your run ID plus extra random digits, e.g. email "qa-{run_nonce}-7301@example.com" or username "qa_{run_nonce}_7301". Vary the digits on each attempt.
+
+NEVER use common addresses like "test@example.com" or values stamped with a date you guessed — previous QA runs may already have registered them, and the resulting "already exists" errors are false positives, not site bugs. Do not trust your internal sense of today's date; use the date given above.
 
 ## Requesting Data from User
 
@@ -165,23 +246,25 @@ Use `request_data` when you need information from the user (credentials, verific
 **Examples:**
 
 Login credentials:
-{{"action_type": "request_data", "request_name": "site_login", "request_description": "Need login credentials to test authenticated features", "request_fields": [{{"key": "email", "label": "Email", "type": "email"}}, {{"key": "password", "label": "Password", "type": "password"}}]}}
+{"action_type": "request_data", "request_name": "site_login", "request_description": "Need login credentials to test authenticated features", "request_fields": [{"key": "email", "label": "Email", "type": "email"}, {"key": "password", "label": "Password", "type": "password"}]}
 
 Verification code:
-{{"action_type": "request_data", "request_name": "email_code", "request_description": "Enter the 6-digit verification code sent to your email", "request_fields": [{{"key": "code", "label": "6-digit Code", "type": "text"}}]}}
+{"action_type": "request_data", "request_name": "email_code", "request_description": "Enter the 6-digit verification code sent to your email", "request_fields": [{"key": "code", "label": "6-digit Code", "type": "text"}]}
 
 API key:
-{{"action_type": "request_data", "request_name": "api_access", "request_description": "Need API credentials to test API integration", "request_fields": [{{"key": "api_key", "label": "API Key", "type": "text"}}, {{"key": "api_secret", "label": "API Secret", "type": "password"}}]}}
+{"action_type": "request_data", "request_name": "api_access", "request_description": "Need API credentials to test API integration", "request_fields": [{"key": "api_key", "label": "API Key", "type": "text"}, {"key": "api_secret", "label": "API Secret", "type": "password"}]}
 
 Payment info:
-{{"action_type": "request_data", "request_name": "test_payment", "request_description": "Need test card details for checkout flow", "request_fields": [{{"key": "card_number", "label": "Card Number", "type": "text"}}, {{"key": "expiry", "label": "Expiry (MM/YY)", "type": "text"}}, {{"key": "cvv", "label": "CVV", "type": "password"}}]}}
+{"action_type": "request_data", "request_name": "test_payment", "request_description": "Need test card details for checkout flow", "request_fields": [{"key": "card_number", "label": "Card Number", "type": "text"}, {"key": "expiry", "label": "Expiry (MM/YY)", "type": "text"}, {"key": "cvv", "label": "CVV", "type": "password"}]}
 
 Ask user a question (for guidance/clarification):
-{{"action_type": "request_data", "request_name": "user_guidance", "request_description": "What test data should I use for the promo code field?", "request_fields": [{{"key": "response", "label": "Your guidance", "type": "textarea"}}]}}
+{"action_type": "request_data", "request_name": "user_guidance", "request_description": "What test data should I use for the promo code field?", "request_fields": [{"key": "response", "label": "Your guidance", "type": "textarea"}]}
 
 **Field types:** "text", "password", "email", "tel", "textarea"
 
-**CRITICAL**: If no credentials are provided and your flow requires login/signup/checkout, you MUST use `request_data` immediately. Do NOT test with fake credentials.
+If your flow requires signing IN to an existing account or completing a real checkout and no credentials were provided, use `request_data` — but only after testing everything not gated on them (see "Scope your blocking" below). Never guess or invent login credentials; guessed passwords produce false "login broken" findings. For SIGNUP flows, do NOT request credentials — generate unique test data as described in the Test Data section.
+
+**Scope your blocking**: only block/request data when your flow genuinely cannot proceed without it. If a missing credential gates just ONE feature (e.g. an API-key field on a form), test everything else in your flow first — navigation, validation, UI states — then report the credential-gated part as untestable instead of blocking up front. In CI runs there is no human to answer, so a premature block ends your flow with zero coverage.
 
 ## Blocking for Approvals (MANDATORY)
 
@@ -196,7 +279,7 @@ Ask user a question (for guidance/clarification):
 Even if the page shows "test mode", "sandbox", "demo", "staging", or similar indicators, you MUST still block for approval. The user needs to confirm these actions regardless of any test indicators on the page.
 
 **NEVER click payment/subscription buttons directly.** Always block first:
-{{"action_type": "block", "reason": "APPROVAL_NEEDED: About to click 'Upgrade to Pro' button which may charge $19.99/month. Confirm?"}}
+{"action_type": "block", "reason": "APPROVAL_NEEDED: About to click 'Upgrade to Pro' button which may charge $19.99/month. Confirm?"}
 
 **More examples:**
 - Before clicking "Confirm Purchase": `APPROVAL_NEEDED: About to confirm purchase of $49.99. Proceed?`
@@ -226,7 +309,7 @@ If you encounter an HTTP 401 authentication prompt (a blank page or browser auth
 - **ONE action per turn** - wait for the result before acting again
 - Look at the screenshot carefully before each action
 - Report issues as you find them - **when in doubt, report it**
-- Use add_flow when you discover branches worth testing
+- Use add_flow only for branches discovered inside your assigned flow — don't re-add site-wide flows (login, signup, pricing) already enumerated at the start
 - Use done when your flow goal is complete
 - Use block when you need help
 - **ALWAYS block before payments/subscriptions** - never click these directly
@@ -240,10 +323,10 @@ Look at the screenshot and identify the major user flows to test (login, signup,
 Your ONLY job is to create flows - do NOT test anything yourself. Use multiple add_flow actions (one per turn), then done when finished.
 
 Example first action:
-{{"action_type": "add_flow", "flow_name": "Login Flow", "flow_description": "Test user authentication", "reasoning": "Login button visible in header"}}
+{"action_type": "add_flow", "flow_name": "Login Flow", "flow_description": "Test user authentication", "reasoning": "Login button visible in header"}
 
 Example done action when finished listing flows:
-{{"action_type": "done", "reason": "Listed all major user flows to test"}}
+{"action_type": "done", "reason": "Listed all major user flows to test"}
 """
 
 ASSIGNED_WORKER_CONTEXT = """
@@ -284,6 +367,58 @@ Use ref numbers from the list above for click/type actions.
 """
 
 
+def get_worker_system_prompt_parts(
+    is_first_worker: bool = False,
+    worker_number: int = 0,
+    flow_name: str = "",
+    flow_description: str = "",
+    parent_flow_name: str = "",
+    target_domain: str = "",
+    current_date: str = "",
+    run_nonce: str = "",
+) -> tuple[str, str]:
+    """Get the worker system prompt as (shared base, per-worker context).
+
+    The parts are separate so the provider can put them in two system
+    blocks with their own prompt-cache breakpoints: the ~4-5k-token base is
+    identical for every worker in a run (same domain/date/nonce), so a
+    single cache entry serves all workers; only the small per-worker
+    assignment block is cached per worker.
+
+    current_date/run_nonce ground the model's test-data generation: the model's
+    internal date is stale, and reused "unique" emails collide with accounts
+    registered by previous QA runs (false "already exists" criticals).
+    """
+    if not current_date:
+        current_date = datetime.now().strftime("%Y-%m-%d (%A)")
+    if not run_nonce:
+        run_nonce = uuid.uuid4().hex[:6]
+
+    base = WORKER_SYSTEM_PROMPT.replace(
+        "{target_domain}", target_domain or "the target site"
+    ).replace(
+        "{current_date}", current_date
+    ).replace(
+        "{run_nonce}", run_nonce
+    )
+
+    if is_first_worker:
+        context = FIRST_WORKER_CONTEXT
+    else:
+        branched_context = ""
+        if parent_flow_name:
+            branched_context = BRANCHED_CONTEXT.format(parent_flow_name=parent_flow_name)
+
+        context = ASSIGNED_WORKER_CONTEXT.format(
+            worker_number=worker_number,
+            flow_name=flow_name,
+            flow_description=flow_description,
+            branched_context=branched_context
+        )
+
+    return base, context
+
+
 def get_worker_system_prompt(
     is_first_worker: bool = False,
     worker_number: int = 0,
@@ -291,27 +426,25 @@ def get_worker_system_prompt(
     flow_description: str = "",
     parent_flow_name: str = "",
     target_domain: str = "",
+    current_date: str = "",
+    run_nonce: str = "",
 ) -> str:
-    """Get the worker system prompt with appropriate context."""
-    prompt = WORKER_SYSTEM_PROMPT.replace(
-        "{target_domain}", target_domain or "the target site"
+    """Full worker system prompt as one string (base + per-worker context).
+
+    Kept for logging and tests; the provider uses
+    get_worker_system_prompt_parts for cache-friendly system blocks.
+    """
+    base, context = get_worker_system_prompt_parts(
+        is_first_worker=is_first_worker,
+        worker_number=worker_number,
+        flow_name=flow_name,
+        flow_description=flow_description,
+        parent_flow_name=parent_flow_name,
+        target_domain=target_domain,
+        current_date=current_date,
+        run_nonce=run_nonce,
     )
-
-    if is_first_worker:
-        prompt += FIRST_WORKER_CONTEXT
-    else:
-        branched_context = ""
-        if parent_flow_name:
-            branched_context = BRANCHED_CONTEXT.format(parent_flow_name=parent_flow_name)
-
-        prompt += ASSIGNED_WORKER_CONTEXT.format(
-            worker_number=worker_number,
-            flow_name=flow_name,
-            flow_description=flow_description,
-            branched_context=branched_context
-        )
-
-    return prompt
+    return base + context
 
 
 def format_user_provided_data(
@@ -407,7 +540,7 @@ You will be shown:
 ## Actions
 
 MESSAGE (worker_id, message) - Send guidance to a specific worker
-Example: {"action": "message", "worker_id": "worker-1", "message": "Try using test@example.com as the email"}
+Example: {"action": "message", "worker_id": "worker-1", "message": "Retry signup with a fresh unique email built from your run ID"}
 
 STOP (worker_id, reason) - Stop a worker (duplicate work, stuck, etc.)
 Example: {"action": "stop", "worker_id": "worker-2", "reason": "This flow duplicates worker-1's testing"}
@@ -416,7 +549,7 @@ ASK_USER (question) - Ask the user for clarification or guidance
 Example: {"action": "ask_user", "question": "What test credentials should workers use for the checkout flow?"}
 
 UNBLOCK (worker_id, message) - Respond to a blocked worker
-Example: {"action": "unblock", "worker_id": "worker-1", "message": "Use these credentials: user@test.com / password123"}
+Example: {"action": "unblock", "worker_id": "worker-1", "message": "The cookie-consent modal can be dismissed via the X in the top-right — dismiss it and continue the flow"}
 
 SKIP_FLOW (flow_id, reason) - Skip a pending flow (duplicate, out of scope)
 Example: {"action": "skip_flow", "flow_id": "abc123", "reason": "This duplicates the login flow already being tested"}
@@ -436,8 +569,10 @@ You will only be called to handle blocks that don't fall into these categories.
 - Prioritize unblocking workers - they're waiting for you
 - Skip duplicate flows early to save resources
 - Use ASK_USER when you need information you don't have (real credentials, specific test data)
+- Never invent credentials, codes, or other user-specific data. If a worker needs information you don't have, use ASK_USER — do not make it up.
 - Let workers work - only intervene when necessary
 
+Respond with a SINGLE JSON object describing exactly ONE action. You are called repeatedly, so take one action per response - do not return an array of actions.
 Respond with JSON only - no other text."""
 
 
@@ -534,11 +669,32 @@ You will receive:
 ## Output
 Generate a markdown report with the following sections:
 
+### Goal Assessment (only when a specific Testing Goal is provided)
+If the input includes a **Testing Goal** that names specific functionality to verify (e.g. the changes from a pull request), open the report with a short Goal Assessment stating whether that goal was **verified**, **partially verified**, or **not tested** — and why, citing the relevant flows. Omit this section entirely when the goal is just generic exploration (e.g. "explore the site and find bugs").
+
 ### Executive Summary
 2-3 sentences summarizing:
 - Overall site quality (healthy, needs work, critical issues)
 - Number of issues by severity
 - Key areas that need attention
+
+## Report Quality Standards (read before writing)
+
+Hold every issue to these standards. A wrong or inflated finding is worse than no finding — it erodes trust in the whole report.
+
+1. **Validate the arithmetic and evidence of each claim.** Before stating that a limit/threshold "is not enforced," check the numbers in the supporting evidence. If a limit is 36,000 characters and the largest tested input was 4,800 characters, then 4,800 < 36,000 and acceptance is *correct* behavior — do NOT report it as a bug, and do NOT call 4,800 "oversized" or "exceeds the limit." A non-enforcement claim is only valid if the evidence shows a value that actually **exceeds** the stated limit being accepted. If the evidence doesn't cross the limit, drop the finding (or downgrade it to a note that the limit was not stress-tested).
+
+2. **Don't manufacture findings for goals with no observable surface.** If the testing goal references a backend/infrastructure change (provider routing, "context length filtering", caching, internal rate limiting) that has no user-visible behavior, the correct conclusion is "no observable UI surface to validate" — not an invented user-facing test. Never reverse-engineer a UI test from a backend goal phrase and then report its result as a defect.
+
+3. **Calibrate severity to actual user impact.** An error that auto-recovered (e.g. a single `Failed to fetch` followed by a successful retry, "retry 1/10") with no user-visible consequence is **minor at most**, and usually just an observation — the retry mechanism worked as designed. Transient blips on a small/staging environment that the app handled gracefully are not **major**. Reserve **major**/**critical** for problems that actually broke something the user could see or do.
+
+4. **Keep issue counts internally consistent.** The number you state in the Executive Summary, the number of issues you actually list in the body, and any total you mention must all agree. Count the distinct issues you decided to report (after dedup and after dropping invalid findings) and use that one number everywhere. Do not say "2 major issues" and then describe a different count, and do not let the summary contradict the body.
+
+5. **Don't escalate the tester's own tooling failures.** If a finding is really a click/navigation **timeout on the bot's side** — the evidence says the element was "visible and properly rendered but the click didn't register / consistently failed / timed out", with no app error page, no 4xx/5xx, and no console error — that is an automation/harness flake, NOT an app regression. Never list it as **critical** or **major**. Either drop it or note it once at **minor** as an inconclusive/tooling observation. A genuine broken interaction leaves a real trace (an error page, a 4xx/5xx, a JS error); a silent un-registering click on a rendered element does not.
+
+6. **Recognise staging-environment limitations, don't report them as code regressions.** When the target is a plain-HTTP and/or bare-IP host (no HTTPS domain), some failures are inherent to that environment and would pass on the real production domain. The clearest example: a third-party OAuth provider (Google/Apple/etc.) returning `Error 400: invalid_request` / "doesn't comply with ... OAuth 2.0 policy" because the `redirect_uri` is HTTP or a raw IP — that is the provider's policy reacting to the staging host, not a bug in the site. Do not report these as **critical**/**major** broken integrations; at most note them at **minor** as "environment limitation — re-verify on the HTTPS production domain."
+
+7. **A guessed-URL 404 is not a missing feature.** If a "page/endpoint missing" finding came from the bot **typing a guessed path** (e.g. `/contact/`) rather than following a real link in the UI, it is almost certainly the wrong path, not a missing feature — the route is often under a prefix (e.g. `/about/contact/`). Drop such findings unless the evidence shows the bot followed an actual link that led to the 404 (a real broken link). Never report a guessed-path 404 as **critical**/**major**.
 
 ### Critical Issues
 Issues that block core functionality or pose security risks.
@@ -559,6 +715,7 @@ Visual/styling problems.
 ### Test Coverage
 - List each flow tested and what was validated
 - Note any flows that couldn't be completed and why (credentials needed, external dependencies, etc.)
+- If the input includes an "Incomplete / Untested Flows" section, explicitly list each of those flows as NOT fully tested (crashed mid-flow, or cut off by cost/time limits) so readers do not mistake them for verified coverage
 
 ### Recommendations
 Prioritized list of fixes, ranked by:
@@ -577,6 +734,16 @@ Prioritized list of fixes, ranked by:
 3. **Distinguish infrastructure from application bugs**: If every network request fails (including the site's own pages), this likely indicates a testing environment issue, not a site bug. Note it but don't generate a long list of individual failures — summarize as a single observation.
 
 4. **Browser-level errors are often noise**: Errors like `net::ERR_ABORTED` (request cancelled by browser during navigation) and `net::ERR_BLOCKED_BY_CLIENT` (blocked by ad blocker/privacy extension) are normal browser behavior, NOT site bugs. Do not report these.
+
+## Likely False Positives — Downgrade or Flag
+
+These finding patterns are usually caused by the testing setup, not the site. Do not present them as confirmed critical issues unless the flow evidence shows the worker verified them (retried with fresh data, retried the navigation):
+
+1. **"Email/username already exists" during signup**: test data reused from a previous QA run collides with existing accounts. Unless the worker retried with a different unique value and it ALSO failed, report this as "unverified — possible test-data collision", severity minor.
+
+2. **Navigation timeouts**: if a worker reports pages "timing out" but other flows loaded pages from the same site fine, the cause is likely the test harness's page-load wait, not the server. Report as "needs investigation" with the affected URLs, not as a confirmed outage.
+
+3. **"Element not clickable/non-functional"** where the worker note says the element had no ref or the tool couldn't target it: that is a tooling limitation. Severity minor at most, explicitly marked unverified.
 
 ## Deduplication Guidelines
 
@@ -616,7 +783,7 @@ Output ONLY the markdown report - no other text."""
 SYNTHESIS_CONTEXT_TEMPLATE = """## QA Test Results
 
 **Target URL**: {target_url}
-**Duration**: {duration}
+{goal_line}**Duration**: {duration}
 **Flows Tested**: {flows_tested}
 **Total Issues**: {total_issues}
 
@@ -625,10 +792,42 @@ SYNTHESIS_CONTEXT_TEMPLATE = """## QA Test Results
 
 ### Detailed Flow Summaries:
 {flow_summaries}
-{blocked_section}
+{blocked_section}{incomplete_section}
 ---
 
 Generate a comprehensive QA report based on the above findings. Use the flow action summaries to construct reproduction steps for issues."""
+
+
+# The synthesis prompt promises reproduction steps "derived from the flow
+# actions", and issues are typically found mid/late flow — so the summary
+# must not silently drop the tail. Include the full history for flows up to
+# this many actions; longer flows are windowed head+tail with the tail kept
+# intact (that's where the trigger steps for late-flow issues live).
+MAX_ACTIONS_PER_FLOW_SUMMARY = 50
+_SUMMARY_HEAD_ACTIONS = 10
+
+
+def _format_action_summary_lines(action_summary: list[dict], indent: str = "  ") -> list[str]:
+    """Render flow actions one numbered line each, preserving original indices."""
+
+    def render(idx: int, action: dict) -> str:
+        action_desc = action.get('description', action.get('code', 'Unknown action')[:80])
+        success = "✓" if action.get('success', True) else "✗"
+        return f"{indent}{idx}. {success} {action_desc}"
+
+    total = len(action_summary)
+    if total <= MAX_ACTIONS_PER_FLOW_SUMMARY:
+        return [render(idx, action) for idx, action in enumerate(action_summary, 1)]
+
+    head = _SUMMARY_HEAD_ACTIONS
+    tail = MAX_ACTIONS_PER_FLOW_SUMMARY - head
+    lines = [render(idx, action) for idx, action in enumerate(action_summary[:head], 1)]
+    lines.append(f"{indent}... {total - head - tail} actions omitted ...")
+    lines.extend(
+        render(idx, action)
+        for idx, action in enumerate(action_summary[-tail:], total - tail + 1)
+    )
+    return lines
 
 
 def format_synthesis_context(
@@ -638,6 +837,8 @@ def format_synthesis_context(
     issues: list[dict],
     completed_flows: list[dict],
     blocked_flows: list[dict] | None = None,
+    incomplete_flows: list[dict] | None = None,
+    goal: str = "",
 ) -> str:
     """Format the synthesis context for the AI."""
 
@@ -686,13 +887,32 @@ def format_synthesis_context(
 
             if action_summary:
                 lines.append("**Action Summary**:")
-                for idx, action in enumerate(action_summary[:10], 1):
-                    action_desc = action.get('description', action.get('code', 'Unknown action')[:80])
-                    success = "✓" if action.get('success', True) else "✗"
-                    lines.append(f"  {idx}. {success} {action_desc}")
-                if len(action_summary) > 10:
-                    lines.append(f"  ...and {len(action_summary) - 10} more actions")
+                lines.extend(_format_action_summary_lines(action_summary))
 
+        return "\n".join(lines)
+
+    def format_incomplete_flows(flows: list[dict] | None) -> str:
+        if not flows:
+            return ""
+        lines = ["\n### Incomplete / Untested Flows:"]
+        lines.append(
+            "These flows were NOT fully tested — they crashed or were interrupted. "
+            "Treat them as coverage gaps; do not imply their functionality was verified:"
+        )
+        for f in flows:
+            flow_name = f.get("flow_name", "unknown")
+            status = f.get("status", "incomplete")
+            reason = f.get("reason", "Incomplete")
+            action_count = f.get("action_count", 0)
+            status_label = "failed" if status == "failed" else "interrupted"
+            lines.append(f"\n#### {flow_name} ({status_label})")
+            lines.append(f"**Reason**: {reason}")
+            lines.append(f"**Actions before it ended**: {action_count}")
+            action_summary = f.get("action_summary", [])
+            if action_summary:
+                lines.append("**Action Summary**:")
+                lines.extend(_format_action_summary_lines(action_summary))
+        lines.append("")
         return "\n".join(lines)
 
     def format_blocked_flows(flows: list[dict] | None) -> str:
@@ -711,10 +931,12 @@ def format_synthesis_context(
 
     return SYNTHESIS_CONTEXT_TEMPLATE.format(
         target_url=target_url,
+        goal_line=f"**Testing Goal**: {goal}\n" if goal else "",
         duration=duration,
         flows_tested=flows_tested,
         total_issues=len(issues),
         issues=format_issues(issues),
         flow_summaries=format_flow_summaries(completed_flows),
         blocked_section=format_blocked_flows(blocked_flows),
+        incomplete_section=format_incomplete_flows(incomplete_flows),
     )

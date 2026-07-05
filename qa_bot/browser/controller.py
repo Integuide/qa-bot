@@ -5,14 +5,63 @@ import logging
 from typing import Optional, Any
 import re
 import time
+from urllib.parse import urlparse
 
-from playwright.async_api import Page, ConsoleMessage, Request, Response, Dialog
+from playwright.async_api import Page, Frame, ConsoleMessage, Request, Response, Dialog, Error as PlaywrightError
 
 
 logger = logging.getLogger(__name__)
 
+# page.evaluate() has no timeout of its own, so a blocked JS main thread or a
+# navigation tearing down the execution context mid-call would hang the caller
+# indefinitely. Bound ref injection and let it retry once.
+REF_INJECTION_TIMEOUT_S = 15.0
+
+# Subframe ref injection is best-effort: a wedged third-party iframe (ads,
+# analytics) must not stall the whole turn, so subframes are injected
+# concurrently, each with a short budget, and failures are skipped rather
+# than retried. Worst-case added latency is one timeout, not one per frame.
+SUBFRAME_REF_INJECTION_TIMEOUT_S = 5.0
+MAX_REF_SUBFRAMES = 20
+
+# Concurrent subframes can't share a live counter, so each gets a disjoint
+# numbering range: frame i starts at the next multiple of the stride after
+# the main frame's refs, plus i * stride. Ref numbers stay unique but are
+# no longer contiguous across frames (refs are opaque to the AI anyway).
+SUBFRAME_REF_STRIDE = 1000
+
+# Cap on main-frame refs. Every ref line costs prompt tokens on every turn,
+# so an uncapped list on a link-farm page (portals, mega-footers, admin
+# tables) can dwarf the rest of the prompt. Elements beyond the cap are
+# reported as a count in get_ref_list() so partial coverage stays visible.
+MAIN_FRAME_MAX_REFS = 500
+
 
 DUPLICATE_REF_PREFIX = "[duplicate-ref] "
+
+# _pending_requests pruning: entries whose response/failure event never fired
+# (page closed mid-flight) are dropped once the dict grows past the prune
+# size and they are older than the max age.
+_PENDING_REQUESTS_PRUNE_SIZE = 512
+_PENDING_REQUESTS_MAX_AGE_S = 120.0
+
+
+class StaleRefError(Exception):
+    """Raised when a ref matches zero DOM elements (ref map is stale).
+
+    Refs are injected once per turn; if the page re-rendered since the last
+    screenshot the attribute is gone and Playwright's auto-wait would burn
+    the full default timeout on a locator that can never match. Failing
+    fast lets the AI re-observe the page on its next turn instead.
+    """
+
+    def __init__(self, ref: str):
+        self.ref = ref
+        super().__init__(
+            f"Element {ref} no longer exists — the page changed since the "
+            f"last screenshot. Observe the new page state and pick a fresh "
+            f"ref from the updated element list."
+        )
 
 
 class DuplicateRefError(Exception):
@@ -109,6 +158,20 @@ class CapturedPopup:
     is_closed: bool = False
 
 
+@dataclass
+class CapturedDownload:
+    """A captured file download (clicked link or direct download URL).
+
+    Downloads are otherwise invisible to the AI: the screenshot doesn't
+    change, so a working export/PDF link looks like a dead button.
+    """
+
+    url: str  # URL the file was downloaded from
+    suggested_filename: str  # Filename suggested by the server/browser
+    page_url: str  # URL of the page that triggered the download
+    timestamp: str
+
+
 class BrowserController:
     """
     Wrapper around Playwright Page for flow exploration workers.
@@ -126,23 +189,41 @@ class BrowserController:
         self._page = page
         self._console_messages: list[CapturedConsoleMessage] = []
         self._network_requests: list[CapturedNetworkRequest] = []
-        self._pending_requests: dict[str, dict] = {}  # url -> start info
+        # Keyed by the Request object, not URL: two concurrent requests to
+        # the same URL (polling, retried fetches, popup pages sharing these
+        # listeners) must not clobber each other's start info.
+        self._pending_requests: dict[Request, dict] = {}
         self._dialogs: list[CapturedDialog] = []
         self._dialog_handler: str = "auto"  # "auto", "accept", "dismiss"
         self._http_auth_challenges: list[CapturedHttpAuthChallenge] = []
         self._popups: list[CapturedPopup] = []
         self._popup_pages: list[Page] = []  # Track actual popup Page objects
         self._active_popup: Page | None = None  # Currently active popup (if any)
+        self._pinned_page: Page | None = None  # Turn pin (see pin_active_page)
+        self._downloads: list[CapturedDownload] = []
+        # Refs injected into subframes (iframes) can't be found via
+        # page.locator(), which never crosses frame boundaries — remember
+        # which frame each subframe ref lives in. Main-frame refs are not
+        # recorded here (absence means "look on the page itself").
+        self._ref_frames: dict[str, Frame] = {}
+        # Coverage gaps from the last injection, surfaced in get_ref_list()
+        # so the AI knows the list is partial instead of reading it as "the
+        # whole page": subframes that couldn't be scanned (over the frame
+        # cap, or evaluation failed/timed out) and elements beyond a frame's
+        # ref cap.
+        self._unscanned_subframes = 0
+        self._unlisted_elements = 0
         self._setup_listeners()
 
     def _setup_listeners(self):
-        """Set up event listeners for console, network, dialogs, and popups."""
+        """Set up event listeners for console, network, dialogs, downloads, and popups."""
         if not self._page:
             return  # No page, no listeners to set up
         self._setup_console_listener(self._page)
         self._setup_network_listeners(self._page)
         self._setup_dialog_listener(self._page)
-        self._setup_popup_listener()
+        self._setup_download_listener(self._page)
+        self._setup_popup_listener(self._page)
 
     def _setup_console_listener(self, page: Page):
         """Set up console message listener on a page."""
@@ -169,7 +250,18 @@ class BrowserController:
         """Set up network request/response listeners on a page."""
 
         def on_request(request: Request):
-            self._pending_requests[request.url] = {
+            # Requests that never get a response/failure event (page closed
+            # mid-flight) would accumulate forever now that keys are unique
+            # per request — prune stale entries once the dict grows.
+            if len(self._pending_requests) > _PENDING_REQUESTS_PRUNE_SIZE:
+                cutoff = time.time() - _PENDING_REQUESTS_MAX_AGE_S
+                for req in [
+                    r for r, info in self._pending_requests.items()
+                    if info["start_time"] < cutoff
+                ]:
+                    del self._pending_requests[req]
+
+            self._pending_requests[request] = {
                 "method": request.method,
                 "resource_type": request.resource_type,
                 "start_time": time.time(),
@@ -177,8 +269,8 @@ class BrowserController:
 
         def on_response(response: Response):
             url = response.url
-            if url in self._pending_requests:
-                start_info = self._pending_requests.pop(url)
+            start_info = self._pending_requests.pop(response.request, None)
+            if start_info is not None:
                 duration = (time.time() - start_info["start_time"]) * 1000
 
                 self._network_requests.append(
@@ -237,8 +329,8 @@ class BrowserController:
 
         def on_request_failed(request: Request):
             url = request.url
-            if url in self._pending_requests:
-                start_info = self._pending_requests.pop(url)
+            start_info = self._pending_requests.pop(request, None)
+            if start_info is not None:
                 duration = (time.time() - start_info["start_time"]) * 1000
 
                 failure_text = ""
@@ -286,7 +378,13 @@ class BrowserController:
             )
 
             if self._dialog_handler == "auto":
-                # Auto behavior: accept most dialogs, dismiss beforeunload
+                # Auto behavior: accept all dialogs, including beforeunload.
+                # Accepting beforeunload means "leave the page" — dismissing
+                # would cancel every navigation away from a page with an
+                # unsaved-changes guard, trapping the bot there for the rest
+                # of the flow. Exploration contexts are throwaway, and the
+                # dialog is still recorded so the report can mention the
+                # unsaved-changes prompt.
                 if dialog.type == "alert":
                     await dialog.accept()
                     captured.was_accepted = True
@@ -299,8 +397,8 @@ class BrowserController:
                     captured.was_accepted = True
                     captured.response_value = response_val
                 elif dialog.type == "beforeunload":
-                    await dialog.dismiss()
-                    captured.was_accepted = False
+                    await dialog.accept()
+                    captured.was_accepted = True
             elif self._dialog_handler == "accept":
                 await dialog.accept()
                 captured.was_accepted = True
@@ -312,15 +410,41 @@ class BrowserController:
 
         page.on("dialog", on_dialog)
 
-    def _setup_popup_listener(self):
-        """Set up popup window listener."""
+    def _setup_download_listener(self, page: Page):
+        """Set up file-download recording on a page.
+
+        Downloads are auto-accepted by Playwright (saved to a temp dir);
+        this listener only records that they happened so the AI learns the
+        click/navigation worked instead of treating it as a dead button.
+        """
+
+        def on_download(download):
+            self._downloads.append(
+                CapturedDownload(
+                    url=download.url,
+                    suggested_filename=download.suggested_filename or "",
+                    page_url=page.url if page else "",
+                    timestamp=datetime.now().isoformat(),
+                )
+            )
+
+        page.on("download", on_download)
+
+    def _setup_popup_listener(self, page: Page):
+        """Set up popup window listener on a page.
+
+        Registered on the main page and on every popup page, so
+        popup-from-popup chains are tracked too.
+        """
 
         def on_popup(popup: Page):
             """Handle new popup windows opened via window.open()."""
             popup_url = popup.url or "about:blank"
             popup_record = CapturedPopup(
                 url=popup_url,
-                opener_url=self._page.url if self._page else "",
+                # The opener is the page this listener was registered on
+                # (which may itself be a popup), not necessarily the main page.
+                opener_url=page.url if page else "",
                 timestamp=datetime.now().isoformat(),
                 is_closed=False,
             )
@@ -350,16 +474,19 @@ class BrowserController:
 
             popup.on("close", on_popup_close)
 
-        self._page.on("popup", on_popup)
+        page.on("popup", on_popup)
 
     def _setup_popup_monitoring(self, popup: Page):
-        """Set up console/network/dialog monitoring on a popup page.
+        """Set up console/network/dialog/download/popup monitoring on a popup page.
 
-        Reuses the same listener setup methods as the main page.
+        Reuses the same listener setup methods as the main page. The popup
+        listener is included so popup-from-popup chains stay visible.
         """
         self._setup_console_listener(popup)
         self._setup_network_listeners(popup)
         self._setup_dialog_listener(popup)
+        self._setup_download_listener(popup)
+        self._setup_popup_listener(popup)
 
     @classmethod
     def from_page(cls, page: Page) -> "BrowserController":
@@ -499,13 +626,39 @@ class BrowserController:
         """
         Get the currently active page (popup or main).
 
-        Returns the active popup if one is open, otherwise returns the main page.
-        All screenshot and action methods should use this property to interact
-        with the correct page.
+        Returns the pinned page while a worker turn is in progress (see
+        pin_active_page), else the active popup if one is open, else the
+        main page. All screenshot and action methods use this property to
+        interact with the correct page.
         """
+        if self._pinned_page is not None and not self._pinned_page.is_closed():
+            return self._pinned_page
         if self._active_popup is not None and not self._active_popup.is_closed():
             return self._active_popup
         return self._page
+
+    def pin_active_page(self) -> Page:
+        """
+        Freeze active_page at its current value for the duration of a
+        worker turn.
+
+        The popup listener flips the active page the instant a popup opens.
+        Without pinning, a popup arriving mid-turn can split the AI's view:
+        screenshot of one page, ref list of another, and the chosen action
+        executed on a third. Pinning makes the whole turn (observe → decide
+        → act) target one page; the popup becomes active on the next turn's
+        pin. A pinned page that closes mid-turn falls back to the normal
+        popup/main resolution.
+
+        Returns the page that was pinned.
+        """
+        self._pinned_page = None  # Resolve from live popup/main state
+        self._pinned_page = self.active_page
+        return self._pinned_page
+
+    def unpin_active_page(self) -> None:
+        """Release the turn pin; active_page follows popups again."""
+        self._pinned_page = None
 
     @property
     def has_active_popup(self) -> bool:
@@ -559,6 +712,11 @@ class BrowserController:
         target the main page.
         """
         self._active_popup = None
+        # A deliberate switch (AI action) takes effect immediately, even
+        # inside a pinned turn — only the popup listener's auto-switch is
+        # deferred by the pin.
+        if self._pinned_page is not None:
+            self._pinned_page = self._page
 
     def switch_to_popup(self, index: int = -1) -> bool:
         """
@@ -577,6 +735,9 @@ class BrowserController:
             popup = self._popup_pages[index]
             if not popup.is_closed():
                 self._active_popup = popup
+                # Deliberate switch (AI action) overrides the turn pin
+                if self._pinned_page is not None:
+                    self._pinned_page = popup
                 return True
         except IndexError:
             pass
@@ -586,12 +747,35 @@ class BrowserController:
         """Clear captured popup records (does not close them)."""
         self._popups.clear()
 
-    async def screenshot(self, full_page: bool = False) -> bytes:
+    # ===== Download Handling =====
+
+    def get_downloads(self, clear: bool = False) -> list[CapturedDownload]:
+        """
+        Get captured file downloads.
+
+        Args:
+            clear: If True, clear downloads after returning
+
+        Returns:
+            List of captured downloads
+        """
+        downloads = list(self._downloads)
+        if clear:
+            self._downloads.clear()
+        return downloads
+
+    def clear_downloads(self):
+        """Clear captured download records."""
+        self._downloads.clear()
+
+    async def screenshot(self, full_page: bool = False, timeout_ms: int | None = None) -> bytes:
         """
         Take a screenshot of the current viewport (popup or main page).
 
         Args:
             full_page: If True, capture the entire scrollable page
+            timeout_ms: Explicit Playwright timeout in milliseconds. When
+                None, the context's default action timeout applies.
 
         Returns:
             PNG image bytes
@@ -600,6 +784,8 @@ class BrowserController:
         if not page:
             raise RuntimeError("No page available")
 
+        if timeout_ms is not None:
+            return await page.screenshot(type="png", full_page=full_page, timeout=timeout_ms)
         return await page.screenshot(type="png", full_page=full_page)
 
     @property
@@ -659,45 +845,53 @@ class BrowserController:
             return ref[4:]  # Remove "ref_" prefix
         return ref
 
-    async def inject_refs(self) -> dict[str, str]:
-        """
-        Inject data-qabot-ref attributes into interactive elements (on active page).
+    # Runs inside each frame. Walks the document plus every open shadow
+    # root (closed shadow roots are unreachable by design), numbering
+    # elements from startCounter so refs stay unique across frames.
+    # maxRefs bounds the count so a frame can't overflow its numbering range
+    # (and caps prompt-token cost); the skipped count keeps the truncation
+    # visible to the caller.
+    _INJECT_REFS_SCRIPT = """
+    ({startCounter, maxRefs}) => {
+        // Select interactive elements
+        const selectors = [
+            'a', 'button', 'input', 'select', 'textarea', 'summary',
+            '[role="button"]', '[role="link"]', '[role="menuitem"]',
+            '[role="tab"]', '[role="checkbox"]', '[role="radio"]',
+            '[role="option"]', '[role="switch"]', '[role="textbox"]',
+            '[onclick]', '[tabindex]:not([tabindex="-1"])'
+        ].join(',');
 
-        Returns:
-            Dictionary mapping ref strings ("ref_1", "ref_2", ...) to element descriptions.
-            Format aligned with Claude for Chrome MCP.
-        """
-        page = self.active_page
-        if not page:
-            raise RuntimeError("No page available")
-
-        script = """
-        () => {
-            // Clean up refs from previous injection to avoid duplicates
-            document.querySelectorAll('[data-qabot-ref]').forEach(el => {
+        // Clean up refs from previous injection to avoid duplicates,
+        // in the document and in every open shadow root
+        const removeOldRefs = (root) => {
+            root.querySelectorAll('[data-qabot-ref]').forEach(el => {
                 el.removeAttribute('data-qabot-ref');
             });
+            root.querySelectorAll('*').forEach(el => {
+                if (el.shadowRoot) removeOldRefs(el.shadowRoot);
+            });
+        };
+        removeOldRefs(document);
 
-            const refMap = {};
-            let refCounter = 1;
+        const refMap = {};
+        let refCounter = startCounter;
+        let skipped = 0;
 
-            // Select interactive elements
-            const selectors = [
-                'a', 'button', 'input', 'select', 'textarea',
-                '[role="button"]', '[role="link"]', '[role="menuitem"]',
-                '[role="tab"]', '[role="checkbox"]', '[role="radio"]',
-                '[role="option"]', '[role="switch"]', '[role="textbox"]',
-                '[onclick]', '[tabindex]:not([tabindex="-1"])'
-            ];
-
-            const elements = document.querySelectorAll(selectors.join(','));
-
-            elements.forEach(el => {
-                // Skip hidden elements
+        const visit = (root) => {
+            root.querySelectorAll(selectors).forEach(el => {
+                // Skip hidden elements. Either dimension being zero means
+                // Playwright has no clickable point — a zero-width-but-tall
+                // element would burn the full click timeout.
                 const rect = el.getBoundingClientRect();
-                if (rect.width === 0 && rect.height === 0) return;
+                if (rect.width === 0 || rect.height === 0) return;
                 if (getComputedStyle(el).display === 'none') return;
                 if (getComputedStyle(el).visibility === 'hidden') return;
+
+                if (refCounter - startCounter >= maxRefs) {
+                    skipped++;
+                    return;
+                }
 
                 const ref = refCounter++;
                 el.setAttribute('data-qabot-ref', ref.toString());
@@ -712,11 +906,136 @@ class BrowserController:
                 // Use string key format: "ref_1", "ref_2", etc.
                 refMap['ref_' + ref] = role + ': ' + name.replace(/\\s+/g, ' ');
             });
+            root.querySelectorAll('*').forEach(el => {
+                if (el.shadowRoot) visit(el.shadowRoot);
+            });
+        };
+        visit(document);
 
-            return refMap;
-        }
+        return {refMap, skipped};
+    }
+    """
+
+    async def inject_refs(self) -> dict[str, str]:
         """
-        return await page.evaluate(script)
+        Inject data-qabot-ref attributes into interactive elements (on active page).
+
+        Covers the main frame, open shadow roots, and iframe subframes
+        (including cross-origin ones such as Stripe/PayPal card fields —
+        Playwright can evaluate in any frame regardless of origin).
+
+        Returns:
+            Dictionary mapping ref strings ("ref_1", "ref_2", ...) to element
+            descriptions. Subframe refs are prefixed with "[iframe: <host>]".
+            Format aligned with Claude for Chrome MCP.
+        """
+        page = self.active_page
+        if not page:
+            raise RuntimeError("No page available")
+
+        self._ref_frames = {}
+        self._unscanned_subframes = 0
+        self._unlisted_elements = 0
+
+        # Main frame keeps the retry semantics: a destroyed execution context
+        # almost always means a navigation just committed; a short
+        # domcontentloaded wait lets the new document settle before the retry.
+        ref_map: dict[str, str] = {}
+        for attempt in range(2):
+            try:
+                result = await asyncio.wait_for(
+                    page.evaluate(
+                        self._INJECT_REFS_SCRIPT,
+                        {"startCounter": 1, "maxRefs": MAIN_FRAME_MAX_REFS},
+                    ),
+                    timeout=REF_INJECTION_TIMEOUT_S,
+                )
+                ref_map = result["refMap"]
+                self._unlisted_elements += result["skipped"]
+                break
+            except (asyncio.TimeoutError, PlaywrightError) as e:
+                if attempt == 0:
+                    logger.warning(
+                        f"Ref injection failed ({type(e).__name__}); waiting for "
+                        f"the page to settle and retrying once"
+                    )
+                    try:
+                        await page.wait_for_load_state(
+                            "domcontentloaded",
+                            timeout=REF_INJECTION_TIMEOUT_S * 1000,
+                        )
+                    except Exception:
+                        pass  # Best-effort settle; the retry may still succeed
+                    continue
+                raise RuntimeError(
+                    f"Ref injection failed after retry: {e}"
+                ) from e
+
+        subframes = [
+            f for f in page.frames
+            if f is not page.main_frame and not f.is_detached()
+        ]
+        if len(subframes) > MAX_REF_SUBFRAMES:
+            self._unscanned_subframes += len(subframes) - MAX_REF_SUBFRAMES
+            logger.warning(
+                "Page has %d subframes; only injecting refs into the first %d",
+                len(subframes),
+                MAX_REF_SUBFRAMES,
+            )
+            subframes = subframes[:MAX_REF_SUBFRAMES]
+
+        if not subframes:
+            return ref_map
+
+        # Inject into all subframes concurrently so one wedged iframe costs
+        # a single timeout, not one per frame, and healthy frames still get
+        # refs. Each frame numbers from its own disjoint range (see
+        # SUBFRAME_REF_STRIDE); base starts past the main frame's refs.
+        base = (len(ref_map) // SUBFRAME_REF_STRIDE + 1) * SUBFRAME_REF_STRIDE
+
+        async def inject_into(frame: Frame, start: int) -> dict | None:
+            try:
+                return await asyncio.wait_for(
+                    frame.evaluate(
+                        self._INJECT_REFS_SCRIPT,
+                        {"startCounter": start,
+                         "maxRefs": SUBFRAME_REF_STRIDE - 1},
+                    ),
+                    timeout=SUBFRAME_REF_INJECTION_TIMEOUT_S,
+                )
+            except (asyncio.TimeoutError, PlaywrightError) as e:
+                # Best-effort: a wedged/mid-navigation iframe must not
+                # stall the turn or hide the rest of the page.
+                logger.debug(
+                    "Skipping ref injection in subframe %s: %s", frame.url, e
+                )
+                return None
+
+        results = await asyncio.gather(
+            *(inject_into(f, base + i * SUBFRAME_REF_STRIDE)
+              for i, f in enumerate(subframes))
+        )
+
+        for frame, result in zip(subframes, results):
+            if result is None:
+                self._unscanned_subframes += 1
+                continue
+            self._unlisted_elements += result["skipped"]
+            label = self._frame_label(frame)
+            for ref, desc in result["refMap"].items():
+                ref_map[ref] = f"[iframe: {label}] {desc}" if label else desc
+                self._ref_frames[self._extract_ref_number(ref)] = frame
+
+        return ref_map
+
+    @staticmethod
+    def _frame_label(frame: Frame) -> str:
+        """Short human-readable identifier for a subframe (host, else name)."""
+        try:
+            host = urlparse(frame.url).netloc
+        except (ValueError, AttributeError):
+            host = ""
+        return host or frame.name or ""
 
     async def accessibility_snapshot_with_refs(self) -> tuple[str, dict[str, str]]:
         """
@@ -757,6 +1076,9 @@ class BrowserController:
             Playwright Locator for the element
 
         Raises:
+            StaleRefError: When no element matches (page changed since the
+                ref map was injected). Raised immediately instead of letting
+                Playwright auto-wait its full timeout on a hopeless locator.
             DuplicateRefError: When multiple elements match and can't be
                 auto-resolved to a single visible one.
         """
@@ -765,7 +1087,19 @@ class BrowserController:
             raise RuntimeError("No page available")
 
         ref_num = self._extract_ref_number(ref)
-        locator = page.locator(f'[data-qabot-ref="{ref_num}"]')
+
+        # Subframe refs must be looked up in their own frame — page.locator()
+        # pierces open shadow roots but never crosses iframe boundaries.
+        frame = self._ref_frames.get(ref_num)
+        if frame is not None:
+            if frame.is_detached():
+                logger.warning(
+                    "Ref %s lives in a detached iframe — ref map is stale", ref
+                )
+                raise StaleRefError(ref)
+            locator = frame.locator(f'[data-qabot-ref="{ref_num}"]')
+        else:
+            locator = page.locator(f'[data-qabot-ref="{ref_num}"]')
 
         count = await locator.count()
         if count > 1:
@@ -784,7 +1118,8 @@ class BrowserController:
             raise DuplicateRefError(ref, descriptions)
 
         if count == 0:
-            logger.warning("Ref %s matched no elements — ref map may be stale", ref)
+            logger.warning("Ref %s matched no elements — ref map is stale", ref)
+            raise StaleRefError(ref)
 
         return locator
 
@@ -1125,8 +1460,23 @@ class BrowserController:
               ref_3: textbox "Email"
         """
         ref_map = await self.inject_refs()
+
+        # Partial coverage must be visible to the AI: without these notes, a
+        # payment widget in an unscanned iframe reads as "not on the page".
+        note = ""
+        if self._unscanned_subframes:
+            note += (
+                f"\n  (note: {self._unscanned_subframes} iframe(s) could not "
+                f"be scanned; elements inside them have no refs)"
+            )
+        if self._unlisted_elements:
+            note += (
+                f"\n  (note: {self._unlisted_elements} additional interactive "
+                f"element(s) exceeded the ref limit and are not listed)"
+            )
+
         if not ref_map:
-            return "No interactive elements found on this page."
+            return "No interactive elements found on this page." + note
 
         lines = ["Interactive elements:"]
         # Sort by numeric part of ref string
@@ -1135,4 +1485,4 @@ class BrowserController:
             # Clean up description - remove extra whitespace
             clean_desc = " ".join(desc.split())
             lines.append(f"  {ref}: {clean_desc}")
-        return "\n".join(lines)
+        return "\n".join(lines) + note

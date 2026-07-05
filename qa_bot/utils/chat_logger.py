@@ -724,6 +724,24 @@ class ChatLogger:
     # Exploration Summary
     # =========================================================================
 
+    def write_report(self, report: str):
+        """
+        Persist the final synthesis report as report.md in the log directory.
+
+        The report otherwise exists only in transient SSE events — this file
+        is what lets the server re-serve a finished run's report after the
+        client disconnects.
+
+        Credentials are masked like every other persisted log: the file is
+        re-served over HTTP by the report endpoint, so a password the AI
+        quoted in a repro step must not land on disk verbatim.
+        """
+        report_path = self.base_dir / "report.md"
+        try:
+            report_path.write_text(_mask_credentials_in_text(report), encoding="utf-8")
+        except Exception as e:
+            logging.warning(f"Failed to write report.md: {e}")
+
     def write_summary(self, data: dict):
         """
         Write a summary.json file to the exploration log directory.

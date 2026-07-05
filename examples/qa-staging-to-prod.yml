@@ -35,7 +35,7 @@ jobs:
     # 2. Comment contains @QABot on a PR from staging
     if: |
       (github.event_name == 'pull_request' && github.head_ref == 'staging') ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@QABot') &&
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && startsWith(github.event.comment.body, '@QABot') &&
        (github.event.comment.author_association == 'OWNER' ||
         github.event.comment.author_association == 'MEMBER' ||
         github.event.comment.author_association == 'COLLABORATOR'))
@@ -121,10 +121,14 @@ jobs:
           PR_TITLE=$(echo "$PR_JSON" | jq -r '.title' | tr -d '\n\r' | head -c 200)
           PR_BODY=$(echo "$PR_JSON" | jq -r '.body' | head -c 2000)
           echo "pr_title=$PR_TITLE" >> $GITHUB_OUTPUT
+          # Random heredoc delimiter (GitHub's hardening guidance): the PR
+          # body is attacker-influenced and must not be able to terminate
+          # the heredoc early and inject extra outputs.
+          DELIM="QABOT_$(dd if=/dev/urandom bs=15 count=1 status=none | base64)"
           {
-            echo "pr_body<<QABOT_EOF"
+            echo "pr_body<<$DELIM"
             echo "$PR_BODY"
-            echo "QABOT_EOF"
+            echo "$DELIM"
           } >> $GITHUB_OUTPUT
 
       - name: Generate testing goal from PR
@@ -135,21 +139,25 @@ jobs:
           PR_TITLE_RAW: ${{ steps.pr-desc.outputs.pr_title }}
           PR_BODY_RAW: ${{ steps.pr-desc.outputs.pr_body }}
         run: |
-          PR_TITLE=$(echo "$PR_TITLE_RAW" | jq -Rs '.')
-          PR_BODY=$(echo "$PR_BODY_RAW" | jq -Rs '.')
+          # Build the payload entirely with jq so PR title/body (quotes,
+          # newlines, markdown) are escaped correctly inside the JSON string.
+          PAYLOAD=$(jq -n \
+            --arg title "$PR_TITLE_RAW" \
+            --arg body "$PR_BODY_RAW" \
+            '{
+              model: "claude-haiku-4-5",
+              max_tokens: 200,
+              messages: [{
+                role: "user",
+                content: ("You are generating a QA testing goal for an AI that will explore a website. Based on this PR being deployed to production, write a concise testing goal (1-2 sentences) that focuses on testing the changed functionality. Also mention testing general critical flows (login, navigation) to check for regressions. If the PR description is empty or unclear, return a general exploration goal.\n\nPR Title: \($title)\n\nPR Body:\n\($body)")
+              }]
+            }')
 
           RESPONSE=$(curl -sf https://api.anthropic.com/v1/messages \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
-            -d "{
-              \"model\": \"claude-haiku-4-5\",
-              \"max_tokens\": 200,
-              \"messages\": [{
-                \"role\": \"user\",
-                \"content\": \"You are generating a QA testing goal for an AI that will explore a website. Based on this PR being deployed to production, write a concise testing goal (1-2 sentences) that focuses on testing the changed functionality. Also mention testing general critical flows (login, navigation) to check for regressions. If the PR description is empty or unclear, return a general exploration goal.\n\nPR Title: ${PR_TITLE}\n\nPR Body:\n${PR_BODY}\"
-              }]
-            }") || true
+            -d "$PAYLOAD") || echo "::warning::Goal generation API call failed (non-2xx response)"
 
           GOAL=""
           if [ -n "$RESPONSE" ]; then
@@ -161,10 +169,13 @@ jobs:
             echo "::warning::Goal generation failed, using default goal"
           fi
 
+          # Random heredoc delimiter (GitHub's hardening guidance): the goal
+          # is LLM output derived from attacker-influenced PR text.
+          DELIM="QABOT_$(dd if=/dev/urandom bs=15 count=1 status=none | base64)"
           {
-            echo "goal<<QABOT_EOF"
+            echo "goal<<$DELIM"
             echo "$GOAL"
-            echo "QABOT_EOF"
+            echo "$DELIM"
           } >> $GITHUB_OUTPUT
           echo "Generated goal: $GOAL"
 
@@ -180,6 +191,14 @@ jobs:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           github-token: ${{ github.token }}
           fail-on-critical: 'true'
+
+      - name: Upload issue screenshots
+        if: always() && steps.qa.outcome != 'cancelled'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-bot-screenshots
+          path: qa-bot-screenshots/
+          if-no-files-found: ignore
 
       - name: Summary
         if: always() && steps.qa.outcome != 'cancelled'

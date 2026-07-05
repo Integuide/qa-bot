@@ -4,15 +4,18 @@ import json
 import logging
 import random
 import re
+import uuid
+from datetime import datetime
 from typing import AsyncGenerator
 from urllib.parse import urlparse
 from anthropic import AsyncAnthropic, RateLimitError, APIError, APIConnectionError, APITimeoutError
+from pydantic import ValidationError
 
 from qa_bot.browser.controller import DUPLICATE_REF_PREFIX
-from qa_bot.config import DEFAULT_MODEL
+from qa_bot.config import DEFAULT_MODEL, MODEL_SONNET, MODEL_OPUS
 from .base import AIProvider, AgentAction
 from .prompts import (
-    get_worker_system_prompt,
+    get_worker_system_prompt_parts,
     get_worker_action_prompt,
     SUPERVISOR_SYSTEM_PROMPT,
     format_supervisor_context,
@@ -29,9 +32,58 @@ MAX_BACKOFF = 60.0  # seconds
 BACKOFF_MULTIPLIER = 5.0
 JITTER_FACTOR = 0.5  # Add up to 50% randomness to backoff
 
+# Corrective retries when a worker response contains no parseable JSON
+# action. One malformed reply must not kill the whole flow, so we ask the
+# model to reformat before giving up.
+MAX_PARSE_RETRIES = 2
+PARSE_CORRECTION_PROMPT = (
+    "Your last reply did not contain a valid JSON action object. "
+    "Respond again with ONLY a single JSON object describing your chosen "
+    'action (including the "action_type" field) - no prose, no markdown, '
+    "no explanation outside the JSON."
+)
+
 # Prompt caching configuration
 # Ephemeral cache has a 5-minute TTL - sufficient for multi-turn conversations
 CACHE_CONTROL_EPHEMERAL = {"type": "ephemeral"}
+
+
+# Model-id prefixes that REQUIRE adaptive thinking (they reject the legacy
+# enabled+budget_tokens form with HTTP 400). Keyed on the config constants so it
+# stays correct as they're bumped: today these are Sonnet 5 / Opus 4.8. Matched
+# as prefixes so dated snapshot ids (e.g. "claude-sonnet-5-20260514") route the
+# same way. Any other model — Haiku 4.5, or a legacy Sonnet/Opus passed via
+# --model / AI_MODEL — takes the fixed-budget form, which those models accept.
+# NOTE: add any future adaptive-only model here when its constant is introduced.
+_ADAPTIVE_THINKING_MODEL_PREFIXES = (MODEL_SONNET, MODEL_OPUS)
+
+
+def _requires_adaptive_thinking(model: str) -> bool:
+    """True for models that reject the legacy enabled+budget_tokens thinking form
+    and require {"type": "adaptive"}. Single source of truth for the model-family
+    split so the worker/supervisor call sites and the synthesis path can't drift.
+    """
+    return model.startswith(_ADAPTIVE_THINKING_MODEL_PREFIXES)
+
+
+def _thinking_config(model: str, budget_tokens: int, *, stream_to_ui: bool = False) -> dict:
+    """Return the thinking parameter appropriate for the model.
+
+    The two forms are mutually exclusive and each 400s on the wrong model:
+    - Adaptive-only models (Sonnet 5 / Opus 4.8) require {"type": "adaptive"}.
+    - Everything else (Haiku 4.5, legacy Sonnet/Opus) takes the fixed-budget form
+      {"type": "enabled", "budget_tokens": N}.
+
+    ``stream_to_ui`` adds display="summarized" so adaptive thinking actually streams
+    readable text — without it, Sonnet 5 / Opus 4.8 stream thinking blocks with empty
+    text (display defaults to "omitted"), leaving the live "AI Thinking" pane blank.
+    """
+    if _requires_adaptive_thinking(model):
+        config = {"type": "adaptive"}
+        if stream_to_ui:
+            config["display"] = "summarized"
+        return config
+    return {"type": "enabled", "budget_tokens": budget_tokens}
 
 
 def _calculate_wait_time(backoff: float) -> float:
@@ -91,6 +143,14 @@ class ClaudeProvider(AIProvider):
         # Semaphore to limit concurrent API calls and avoid rate limiting
         self._api_semaphore = asyncio.Semaphore(max_concurrent_calls)
         self._max_concurrent_calls = max_concurrent_calls
+        # Per-run nonce + date workers use to build test data (signup emails
+        # etc.) that can't collide with data registered by previous QA runs.
+        # Both are stamped once and reused for the whole run: prompt caching
+        # depends on a stable system prompt, and recomputing the date per
+        # worker call would shift "today" mid-run (and break the cache) when
+        # a long run crosses midnight.
+        self.run_nonce = uuid.uuid4().hex[:6]
+        self.run_date = datetime.now().strftime("%Y-%m-%d (%A)")
 
     @staticmethod
     def _build_messages_from_history(
@@ -249,15 +309,22 @@ class ClaudeProvider(AIProvider):
         # Format action history
         history_text = self._format_history(action_history)
 
-        # Build the worker system prompt (no credentials - those go in user message)
-        system_prompt = get_worker_system_prompt(
+        # Build the worker system prompt (no credentials - those go in user
+        # message). Two parts: the base is identical for every worker in a
+        # run, the context is per-worker. They go in separate system blocks
+        # with their own cache breakpoints so all workers share one cache
+        # entry for the ~4-5k-token base instead of each writing their own.
+        system_base, system_worker_context = get_worker_system_prompt_parts(
             is_first_worker=is_first_worker,
             worker_number=worker_number,
             flow_name=flow_name,
             flow_description=flow_description,
             parent_flow_name=parent_flow_name,
             target_domain=target_domain,
+            run_nonce=self.run_nonce,
+            current_date=self.run_date,
         )
+        system_prompt = system_base + system_worker_context  # for logging
 
         # Build user prompt with ref list and credentials
         # Credentials/user_data are in user message (not system prompt) to prevent
@@ -307,156 +374,200 @@ class ClaudeProvider(AIProvider):
         full_response = ""
         thinking_signature = ""
         in_thinking_block = False
-        input_tokens = 0
-        output_tokens = 0
-        cache_creation_tokens = 0
-        cache_read_tokens = 0
 
-        # Retry logic for stream creation and processing
-        # Use semaphore to limit concurrent API calls across all workers
-        # Semaphore is released during retry sleep to avoid blocking other workers
-        last_exception = None
-        backoff = INITIAL_BACKOFF
-        stream_completed = False
+        # Outer corrective-retry loop: when a completed response contains no
+        # parseable JSON action, re-ask the model to reformat (up to
+        # MAX_PARSE_RETRIES times) instead of failing the whole flow.
+        action = None
+        cumulative_usage = _extract_token_usage(None)
 
-        for attempt in range(MAX_RETRIES):
-            # Reset state for each attempt
-            full_thinking = ""
-            full_response = ""
-            thinking_signature = ""
-            in_thinking_block = False
-            wait_time = None
+        for parse_attempt in range(MAX_PARSE_RETRIES + 1):
+            # Retry logic for stream creation and processing
+            # Use semaphore to limit concurrent API calls across all workers
+            # Semaphore is released during retry sleep to avoid blocking other workers
+            last_exception = None
+            backoff = INITIAL_BACKOFF
+            stream_completed = False
+            token_usage = _extract_token_usage(None)
 
-            # Acquire semaphore only for the API call, not during sleep
-            async with self._api_semaphore:
-                try:
-                    async with self.client.messages.stream(
-                        model=self.model,
-                        max_tokens=16000,
-                        system=[{
-                            "type": "text",
-                            "text": system_prompt,
-                            "cache_control": CACHE_CONTROL_EPHEMERAL
-                        }],
-                        messages=messages,
-                        thinking={
-                            "type": "enabled",
-                            "budget_tokens": 10000
-                        }
-                    ) as stream:
-                        async for event in stream:
-                            if event.type == "content_block_start":
-                                if hasattr(event.content_block, 'type'):
-                                    if event.content_block.type == "thinking":
-                                        in_thinking_block = True
-                                        yield {"type": "thinking_start"}
-                                    elif event.content_block.type == "text":
+            for attempt in range(MAX_RETRIES):
+                # Reset state for each attempt
+                full_thinking = ""
+                full_response = ""
+                thinking_signature = ""
+                in_thinking_block = False
+                wait_time = None
+
+                # Acquire semaphore only for the API call, not during sleep
+                async with self._api_semaphore:
+                    try:
+                        async with self.client.messages.stream(
+                            model=self.model,
+                            max_tokens=16000,
+                            system=[
+                                {
+                                    # Shared base — one cache entry serves
+                                    # every worker in the run
+                                    "type": "text",
+                                    "text": system_base,
+                                    "cache_control": CACHE_CONTROL_EPHEMERAL
+                                },
+                                {
+                                    # Per-worker assignment — cached per
+                                    # worker across its own turns
+                                    "type": "text",
+                                    "text": system_worker_context,
+                                    "cache_control": CACHE_CONTROL_EPHEMERAL
+                                },
+                            ],
+                            messages=messages,
+                            thinking=_thinking_config(
+                                self.model, 10000, stream_to_ui=True
+                            )
+                        ) as stream:
+                            async for event in stream:
+                                if event.type == "content_block_start":
+                                    if hasattr(event.content_block, 'type'):
+                                        if event.content_block.type == "thinking":
+                                            in_thinking_block = True
+                                            yield {"type": "thinking_start"}
+                                        elif event.content_block.type == "text":
+                                            in_thinking_block = False
+
+                                elif event.type == "content_block_delta":
+                                    if hasattr(event.delta, 'type'):
+                                        if event.delta.type == "thinking_delta":
+                                            thinking_text = event.delta.thinking
+                                            full_thinking += thinking_text
+                                            yield {"type": "thinking_delta", "text": thinking_text}
+                                        elif event.delta.type == "text_delta":
+                                            full_response += event.delta.text
+                                        elif event.delta.type == "signature_delta":
+                                            thinking_signature = event.delta.signature
+
+                                elif event.type == "content_block_stop":
+                                    if in_thinking_block:
+                                        yield {"type": "thinking_complete", "text": full_thinking}
                                         in_thinking_block = False
 
-                            elif event.type == "content_block_delta":
-                                if hasattr(event.delta, 'type'):
-                                    if event.delta.type == "thinking_delta":
-                                        thinking_text = event.delta.thinking
-                                        full_thinking += thinking_text
-                                        yield {"type": "thinking_delta", "text": thinking_text}
-                                    elif event.delta.type == "text_delta":
-                                        full_response += event.delta.text
-                                    elif event.delta.type == "signature_delta":
-                                        thinking_signature = event.delta.signature
+                            # Get final message for token usage
+                            final_message = await stream.get_final_message()
+                            token_usage = _extract_token_usage(final_message.usage)
 
-                            elif event.type == "content_block_stop":
-                                if in_thinking_block:
-                                    yield {"type": "thinking_complete", "text": full_thinking}
-                                    in_thinking_block = False
+                        # Stream completed successfully
+                        stream_completed = True
+                        break
 
-                        # Get final message for token usage
-                        final_message = await stream.get_final_message()
-                        token_usage = _extract_token_usage(final_message.usage)
+                    except RateLimitError as e:
+                        last_exception = e
+                        wait_time = _calculate_wait_time(backoff)
+                        # Use retry-after header if provided (exact value, no jitter)
+                        if hasattr(e, 'response') and e.response:
+                            retry_after = e.response.headers.get('retry-after')
+                            if retry_after:
+                                try:
+                                    wait_time = min(float(retry_after), MAX_BACKOFF)
+                                except ValueError:
+                                    pass
+                        logger.warning(
+                            f"Worker stream: Rate limited (attempt {attempt + 1}/{MAX_RETRIES}), "
+                            f"retrying in {wait_time:.1f}s..."
+                        )
 
-                    # Stream completed successfully
-                    stream_completed = True
-                    break
-
-                except RateLimitError as e:
-                    last_exception = e
-                    wait_time = _calculate_wait_time(backoff)
-                    # Use retry-after header if provided (exact value, no jitter)
-                    if hasattr(e, 'response') and e.response:
-                        retry_after = e.response.headers.get('retry-after')
-                        if retry_after:
-                            try:
-                                wait_time = min(float(retry_after), MAX_BACKOFF)
-                            except ValueError:
-                                pass
-                    logger.warning(
-                        f"Worker stream: Rate limited (attempt {attempt + 1}/{MAX_RETRIES}), "
-                        f"retrying in {wait_time:.1f}s..."
-                    )
-
-                except (APIConnectionError, APITimeoutError) as e:
-                    last_exception = e
-                    wait_time = _calculate_wait_time(backoff)
-                    logger.warning(
-                        f"Worker stream: Connection error (attempt {attempt + 1}/{MAX_RETRIES}), "
-                        f"retrying in {wait_time:.1f}s: {e}"
-                    )
-
-                except APIError as e:
-                    if hasattr(e, 'status_code') and e.status_code in (529, 500, 502, 503, 504):
+                    except (APIConnectionError, APITimeoutError) as e:
                         last_exception = e
                         wait_time = _calculate_wait_time(backoff)
                         logger.warning(
-                            f"Worker stream: Server error {e.status_code} (attempt {attempt + 1}/{MAX_RETRIES}), "
-                            f"retrying in {wait_time:.1f}s..."
+                            f"Worker stream: Connection error (attempt {attempt + 1}/{MAX_RETRIES}), "
+                            f"retrying in {wait_time:.1f}s: {e}"
                         )
-                    else:
-                        # Non-retryable API error (e.g., 400, 401, 403)
-                        raise
 
-            # Sleep outside the semaphore context to allow other workers to proceed
-            if wait_time is not None:
-                await asyncio.sleep(wait_time)
-                backoff *= BACKOFF_MULTIPLIER
+                    except APIError as e:
+                        if hasattr(e, 'status_code') and e.status_code in (529, 500, 502, 503, 504):
+                            last_exception = e
+                            wait_time = _calculate_wait_time(backoff)
+                            logger.warning(
+                                f"Worker stream: Server error {e.status_code} (attempt {attempt + 1}/{MAX_RETRIES}), "
+                                f"retrying in {wait_time:.1f}s..."
+                            )
+                        else:
+                            # Non-retryable API error (e.g., 400, 401, 403)
+                            raise
 
-        if not stream_completed:
-            # All retries exhausted
-            logger.error(f"Worker stream: All {MAX_RETRIES} retries exhausted")
-            yield {
-                "type": "error",
-                "error": f"API error after {MAX_RETRIES} retries: {last_exception}",
-                "thinking": "",
-                "raw_response": "",
-                **_extract_token_usage(None),
-            }
-            return
+                # Sleep outside the semaphore context to allow other workers to proceed
+                if wait_time is not None:
+                    await asyncio.sleep(wait_time)
+                    backoff *= BACKOFF_MULTIPLIER
 
-        # Parse the final response - extract action JSON
-        if not full_response:
-            yield {
-                "type": "error",
-                "error": "No text response from AI",
-                "thinking": full_thinking,
-                "raw_response": "",
-                **token_usage,
-            }
-            return
+            # Accumulate usage across parse attempts. The totals ride on the
+            # terminal event either way — "complete" or "error" — and the
+            # worker bills both, so cost tracking sees every API call made
+            # for this turn even when parse retries are exhausted.
+            for usage_key, usage_value in token_usage.items():
+                cumulative_usage[usage_key] = cumulative_usage.get(usage_key, 0) + usage_value
 
-        try:
-            action = self._extract_action_from_response(full_response)
-        except ValueError as e:
-            # Yield error event with raw response for debugging
-            yield {
-                "type": "error",
-                "error": str(e),
-                "thinking": full_thinking,
-                "raw_response": full_response,
-                **token_usage,
-            }
-            return
+            if not stream_completed:
+                # All retries exhausted
+                logger.error(f"Worker stream: All {MAX_RETRIES} retries exhausted")
+                yield {
+                    "type": "error",
+                    "error": f"API error after {MAX_RETRIES} retries: {last_exception}",
+                    "thinking": "",
+                    "raw_response": "",
+                    **cumulative_usage,
+                }
+                return
+
+            # Parse the final response - extract action JSON
+            if not full_response:
+                yield {
+                    "type": "error",
+                    "error": "No text response from AI",
+                    "thinking": full_thinking,
+                    "raw_response": "",
+                    **cumulative_usage,
+                }
+                return
+
+            try:
+                action = self._extract_action_from_response(full_response)
+                break
+            except ValueError as e:
+                if parse_attempt < MAX_PARSE_RETRIES:
+                    logger.warning(
+                        f"Worker stream: response was not a valid JSON action "
+                        f"(attempt {parse_attempt + 1}/{MAX_PARSE_RETRIES + 1}), "
+                        f"asking model to reformat"
+                    )
+                    # Echo the malformed reply and ask for JSON only. These
+                    # corrective messages stay local to this turn — the worker
+                    # only stores the final successful exchange in history.
+                    messages.append({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": full_response}]
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": [{"type": "text", "text": PARSE_CORRECTION_PROMPT}]
+                    })
+                    continue
+                # Yield error event with raw response for debugging
+                yield {
+                    "type": "error",
+                    "error": str(e),
+                    "thinking": full_thinking,
+                    "raw_response": full_response,
+                    **cumulative_usage,
+                }
+                return
 
         # Build the full assistant content for storage
         assistant_content = []
-        if full_thinking:
+        # Preserve the thinking block whenever the turn produced one, even if its
+        # text is empty (Sonnet 5 / Opus 4.8 return summarized thinking; a
+        # signature with empty text still represents a real block that must be
+        # echoed back unchanged on the next turn).
+        if full_thinking or thinking_signature:
             thinking_block = {"type": "thinking", "thinking": full_thinking}
             if thinking_signature:
                 thinking_block["signature"] = thinking_signature
@@ -469,7 +580,7 @@ class ClaudeProvider(AIProvider):
             "thinking": full_thinking,
             "assistant_content": assistant_content,
             "user_content": current_message["content"],
-            **token_usage,
+            **cumulative_usage,
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
         }
@@ -514,6 +625,11 @@ class ClaudeProvider(AIProvider):
                 # Allow longer error text for duplicate-ref disambiguation
                 max_err = 300 if error.startswith(DUPLICATE_REF_PREFIX) else 100
                 line += f"\n   Error: {error[:max_err]}"
+            note = action.get("note", "")
+            if note:
+                # e.g. "Triggered file download: report.pdf" — without this
+                # the AI never learns why the screenshot didn't change
+                line += f"\n   Note: {note[:150]}"
 
             lines.append(line)
 
@@ -534,11 +650,14 @@ class ClaudeProvider(AIProvider):
         """
         text = text.strip()
 
-        # Try to parse as direct JSON
+        # Try to parse as direct JSON. AgentAction(**data) raises pydantic
+        # ValidationError (a ValueError) on schema mismatch and TypeError when
+        # data isn't a mapping — both mean "this candidate isn't the action",
+        # so fall through to the next extraction layer rather than aborting.
         try:
             data = json.loads(text)
             return AgentAction(**data)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, ValidationError):
             pass
 
         # Try to extract JSON from markdown code block
@@ -547,40 +666,35 @@ class ClaudeProvider(AIProvider):
             try:
                 data = json.loads(match.group(1).strip())
                 return AgentAction(**data)
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError, ValidationError):
                 pass
 
-        # Try to find JSON object in text (supports nested objects/arrays)
-        match = re.search(r'\{(?:[^{}]|\{[^{}]*\}|\[[^\[\]]*\])*"action_type"(?:[^{}]|\{[^{}]*\}|\[[^\[\]]*\])*\}', text, re.DOTALL)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-                return AgentAction(**data)
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        # Last resort: find each { before "action_type" and try brace-matching
-        idx = text.find('"action_type"')
-        if idx >= 0:
-            # Try each opening brace before "action_type", from closest to farthest
-            search_end = idx
+        # Fall back to scanning for a JSON object containing "action_type".
+        # raw_decode is string-aware, so braces inside string values (e.g.
+        # code/CSS snippets quoted in issue descriptions like "missing {
+        # before color:red") cannot derail it the way regex matching or
+        # naive brace counting could.
+        decoder = json.JSONDecoder()
+        for key_match in re.finditer(r'"action_type"', text):
+            # Try each opening brace before this occurrence, nearest first
+            search_end = key_match.start()
             while search_end > 0:
                 start = text.rfind('{', 0, search_end)
                 if start < 0:
                     break
-                # Walk forward to find matching closing brace
-                depth = 0
-                for i in range(start, len(text)):
-                    if text[i] == '{':
-                        depth += 1
-                    elif text[i] == '}':
-                        depth -= 1
-                        if depth == 0:
-                            try:
-                                data = json.loads(text[start:i + 1])
-                                return AgentAction(**data)
-                            except (json.JSONDecodeError, TypeError):
-                                break
+                try:
+                    data, _ = decoder.raw_decode(text, start)
+                except json.JSONDecodeError:
+                    data = None
+                if isinstance(data, dict) and "action_type" in data:
+                    try:
+                        return AgentAction(**data)
+                    except ValidationError:
+                        # Schema-invalid candidate (e.g. a quoted example or
+                        # truncated object) — keep scanning; a valid action
+                        # may still appear later in the response. JSON keys
+                        # are always strings, so TypeError cannot occur here.
+                        pass
                 search_end = start
 
         # Show context in error
@@ -614,7 +728,10 @@ class ClaudeProvider(AIProvider):
         async def _make_supervisor_request():
             return await self.client.messages.create(
                 model=self.model,
-                max_tokens=8000,  # Must be > budget_tokens
+                # Headroom for adaptive thinking: on Sonnet 5 / Opus 4.8 thinking
+                # tokens count against max_tokens with no fixed budget, and the
+                # newer tokenizer runs ~30% heavier, so give the decision room.
+                max_tokens=12000,
                 system=[{
                     "type": "text",
                     "text": SUPERVISOR_SYSTEM_PROMPT,
@@ -626,10 +743,8 @@ class ClaudeProvider(AIProvider):
                         "content": context
                     }
                 ],
-                thinking={
-                    "type": "enabled",
-                    "budget_tokens": 5000
-                }
+                # Supervisor thinking is never displayed, so no summarized display.
+                thinking=_thinking_config(self.model, 5000)
             )
 
         response = await self._retry_with_backoff("Supervisor", _make_supervisor_request)
@@ -655,6 +770,29 @@ class ClaudeProvider(AIProvider):
         result.update(token_usage)
         return result
 
+    @staticmethod
+    def _coerce_supervisor_action(parsed) -> dict | None:
+        """Coerce a parsed JSON value into a single action dict.
+
+        The prompt asks for one JSON object, but a more agentic model may emit a
+        JSON array of actions (e.g. several skip_flow decisions). The caller does
+        ``result.update(...)`` on this, so a bare list would raise AttributeError
+        and kill the supervisor cycle. Take the first dict from a list; reject
+        anything that isn't a usable action dict.
+        """
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            if len(parsed) > 1:
+                # The prompt asks for one action per response, so this is rare —
+                # but make the drop visible rather than silently losing the tail.
+                logger.warning(
+                    f"Supervisor returned {len(parsed)} actions in one response; "
+                    f"taking the first and dropping {len(parsed) - 1}"
+                )
+            return parsed[0]
+        return None
+
     def _parse_supervisor_response(self, text: str) -> dict:
         """Parse supervisor response text into action dict."""
         if not text:
@@ -662,7 +800,9 @@ class ClaudeProvider(AIProvider):
 
         # Try to parse as JSON
         try:
-            return json.loads(text)
+            action = self._coerce_supervisor_action(json.loads(text))
+            if action is not None:
+                return action
         except json.JSONDecodeError:
             pass
 
@@ -670,7 +810,9 @@ class ClaudeProvider(AIProvider):
         match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group(1).strip())
+                action = self._coerce_supervisor_action(json.loads(match.group(1).strip()))
+                if action is not None:
+                    return action
             except json.JSONDecodeError:
                 pass
 
@@ -703,6 +845,8 @@ class ClaudeProvider(AIProvider):
         issues: list[dict],
         completed_flows: list[dict],
         blocked_flows: list[dict] | None = None,
+        incomplete_flows: list[dict] | None = None,
+        goal: str = "",
     ) -> dict:
         """
         Generate final QA synthesis report.
@@ -720,12 +864,27 @@ class ClaudeProvider(AIProvider):
             issues=issues,
             completed_flows=completed_flows,
             blocked_flows=blocked_flows,
+            incomplete_flows=incomplete_flows,
+            goal=goal,
         )
 
         async def _make_synthesis_request():
+            # 16000 matches the worker-stream budget: the synthesis report is
+            # the product's primary deliverable and large multi-agent runs
+            # routinely need more than the old 4000-token cap. max_tokens is a
+            # ceiling, not pre-spent — typical reports cost the same as before.
+            # Synthesis doesn't need thinking, and it protects the 10% synthesis
+            # cost reserve. On adaptive-only models (Sonnet 5 / Opus 4.8), omitting
+            # the param would silently enable adaptive thinking (extra cost + a
+            # thinking block ahead of the report), so disable it explicitly. Haiku
+            # and legacy models default to no thinking when the param is omitted.
+            # Same family check as _thinking_config so the two can't drift.
+            synthesis_kwargs = {}
+            if _requires_adaptive_thinking(self.model):
+                synthesis_kwargs["thinking"] = {"type": "disabled"}
             return await self.client.messages.create(
                 model=self.model,
-                max_tokens=4000,
+                max_tokens=16000,
                 system=[{
                     "type": "text",
                     "text": SYNTHESIS_SYSTEM_PROMPT,
@@ -736,7 +895,8 @@ class ClaudeProvider(AIProvider):
                         "role": "user",
                         "content": context
                     }
-                ]
+                ],
+                **synthesis_kwargs,
             )
 
         response = await self._retry_with_backoff("Synthesis", _make_synthesis_request)
@@ -744,7 +904,28 @@ class ClaudeProvider(AIProvider):
         # Extract token usage
         token_usage = _extract_token_usage(response.usage)
 
+        # Scan for the text block rather than assuming content[0]: with adaptive
+        # thinking the response can lead with a thinking block, and content[0]
+        # would then be a ThinkingBlock (no .text) — losing the whole report.
+        report = next((b.text for b in response.content if b.type == "text"), "")
+        if response.stop_reason == "max_tokens":
+            # Surface truncation instead of silently delivering a report that
+            # ends mid-sentence with its tail sections missing.
+            logger.warning(
+                "Synthesis report hit the max_tokens output limit and was truncated"
+            )
+            if report.count("```") % 2 == 1:
+                # Truncation landed inside a code fence (the prompt asks for
+                # fenced repro steps) — close it so the warning renders as a
+                # blockquote instead of disappearing into the code block.
+                report += "\n```"
+            report += (
+                "\n\n> **Warning:** This report was truncated at the model's "
+                "output token limit — later sections (e.g. Test Coverage, "
+                "Recommendations) may be missing."
+            )
+
         return {
-            "report": response.content[0].text,
+            "report": report,
             **token_usage,
         }

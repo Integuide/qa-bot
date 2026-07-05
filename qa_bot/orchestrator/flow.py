@@ -160,6 +160,10 @@ class FlowTask:
     priority: int = 0               # Higher = more important
     created_at: datetime = field(default_factory=datetime.now)
 
+    # Which attempt this is (1 = first). fail_flow re-queues a failed flow
+    # once with attempt bumped; a second failure is terminal.
+    attempt: int = 1
+
     # First worker flag - the first worker only discovers flows, doesn't explore them
     # This flag is propagated through resume flows so the first worker retains its behavior
     is_first_worker: bool = False
@@ -178,6 +182,7 @@ class FlowTask:
             "priority": self.priority,
             "created_at": self.created_at.isoformat(),
             "is_first_worker": self.is_first_worker,
+            "attempt": self.attempt,
         }
 
     @classmethod
@@ -195,6 +200,7 @@ class FlowTask:
             priority=data.get("priority", 0),
             created_at=datetime.fromisoformat(data["created_at"]),
             is_first_worker=data.get("is_first_worker", False),
+            attempt=data.get("attempt", 1),
         )
 
     @classmethod
@@ -270,6 +276,10 @@ class FlowExplorationData:
     # Skip reason (if status == SKIPPED)
     skip_reason: Optional[str] = None
 
+    # Errors from failed attempts (a flow that failed, was retried, and
+    # completed keeps its first error here — signal for the report)
+    failure_history: list[str] = field(default_factory=list)
+
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
         return {
@@ -290,4 +300,5 @@ class FlowExplorationData:
             "urls_visited": self.urls_visited,
             "child_flow_ids": self.child_flow_ids,
             "skip_reason": self.skip_reason,
+            "failure_history": self.failure_history,
         }

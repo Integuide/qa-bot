@@ -1,6 +1,7 @@
 """Shared state for coordinating flow-based parallel exploration."""
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -11,6 +12,9 @@ import uuid
 from qa_bot.agent.state import Issue
 from qa_bot.config import calculate_cost, DEFAULT_MODEL
 from qa_bot.orchestrator.flow import FlowTask, FlowCheckpoint, FlowPath, FlowStatus, FlowExplorationData
+from qa_bot.orchestrator.severity_guard import cap_severity
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -205,6 +209,14 @@ class SharedFlowState:
     _user_data: dict = field(default_factory=dict)  # request_name -> {key: value, ...}
     _pending_data_requests: list = field(default_factory=list)  # list[UserDataRequest]
 
+    # Resume flows created before the blocked worker finished saving its
+    # checkpoint (the user answered the credentials/data/approval request
+    # first). Keyed by ("data", request_name) / ("credential", flow_id) /
+    # ("approval", flow_id); when the worker's set_*_request_checkpoint call
+    # arrives, the queued task is patched in place so the resume restores
+    # from the checkpoint instead of restarting from scratch.
+    _resume_tasks_awaiting_checkpoint: dict = field(default_factory=dict)  # key -> list[FlowTask]
+
     # Approval management for irreversible actions
     _pending_approval_requests: dict = field(default_factory=dict)  # flow_id -> {reason, action_description, worker_id, checkpoint_id}
     _approval_responses: dict = field(default_factory=dict)  # flow_id -> {approved: bool, always: bool}
@@ -304,6 +316,7 @@ class SharedFlowState:
             self._skip_reasons.clear()
             self._pending_credential_requests.clear()
             self._pending_data_requests.clear()
+            self._resume_tasks_awaiting_checkpoint.clear()
             self._user_data.clear()
             self._credentials.clear()
             # Drain the task queue
@@ -516,13 +529,22 @@ class SharedFlowState:
         self,
         flow_task: FlowTask,
         worker_id: str
-    ) -> FlowExplorationData:
+    ) -> Optional[FlowExplorationData]:
         """
         Mark a flow as being explored and return its data.
 
         Called by worker when it starts exploring a flow.
+
+        Returns None if the supervisor marked the flow as skip. Checking
+        under the same lock that mark_flow_skip uses makes the claim atomic:
+        a flow can never emit flow_skipped and still be explored, no matter
+        where the skip lands between the coordinator's re-checks and the
+        worker actually starting.
         """
         async with self._lock:
+            if flow_task.flow_id in self._skip_set:
+                return None
+
             if flow_task.flow_id not in self._flow_registry:
                 # Create if not exists (shouldn't happen normally)
                 self._flow_registry[flow_task.flow_id] = FlowExplorationData(
@@ -567,15 +589,74 @@ class SharedFlowState:
                 flow_data.completion_reason = completion_reason
                 self._prune_checkpoint_data(flow_data.checkpoint_id)
 
-    async def fail_flow(self, flow_id: str, error: str = ""):
-        """Mark a flow as failed."""
+    # A flow gets one automatic retry after a failure (transient browser
+    # crashes and API hiccups shouldn't permanently burn a flow's coverage);
+    # the second failure is terminal.
+    MAX_FLOW_ATTEMPTS = 2
+
+    async def fail_flow(
+        self,
+        flow_id: str,
+        error: str = "",
+        task: Optional[FlowTask] = None,
+        allow_retry: bool = True,
+    ) -> bool:
+        """Mark a flow as failed, or re-queue it for one automatic retry.
+
+        The flow is retried (same flow_id, attempt bumped) when the caller
+        provides its FlowTask, retries aren't exhausted, the failure wasn't
+        deliberate (allow_retry=False for supervisor stops), and the run
+        still has budget. Otherwise the flow is terminally FAILED.
+
+        The checkpoint payload is only pruned on terminal failure — a retry
+        of a continuation flow needs it to restore browser state and
+        conversation history.
+
+        Returns:
+            True if the flow was re-queued for retry, False if terminally failed.
+        """
         async with self._lock:
-            if flow_id in self._flow_registry:
-                flow_data = self._flow_registry[flow_id]
-                flow_data.status = FlowStatus.FAILED
-                flow_data.completed_at = datetime.now()
+            flow_data = self._flow_registry.get(flow_id)
+            if flow_data is None:
+                return False
+
+            flow_data.failure_history.append(error)
+
+            can_retry = (
+                allow_retry
+                and task is not None
+                and task.attempt < self.MAX_FLOW_ATTEMPTS
+                and flow_id not in self._skip_set
+                # Only retry a flow the worker actively owned. The worker's
+                # catch-all can route here after the flow already reached a
+                # terminal/blocked status (e.g. an exception during
+                # post-completion cleanup) — re-queueing finished work would
+                # burn budget re-exploring it.
+                and flow_data.status in (FlowStatus.EXPLORING, FlowStatus.PENDING)
+                and not self.should_stop()
+            )
+            if can_retry:
+                task.attempt += 1
+                flow_data.status = FlowStatus.PENDING
+                flow_data.worker_id = None
+                flow_data.completion_reason = (
+                    f"Retrying after failure (attempt {task.attempt} of "
+                    f"{self.MAX_FLOW_ATTEMPTS}): {error}"
+                )
+                await self._task_queue.put(task)
+                return True
+
+            flow_data.status = FlowStatus.FAILED
+            flow_data.completed_at = datetime.now()
+            attempts = task.attempt if task is not None else 1
+            if attempts > 1:
+                flow_data.completion_reason = (
+                    f"Failed after {attempts} attempts: {error}"
+                )
+            else:
                 flow_data.completion_reason = f"Failed: {error}"
-                self._prune_checkpoint_data(flow_data.checkpoint_id)
+            self._prune_checkpoint_data(flow_data.checkpoint_id)
+            return False
 
     # -------------------------------------------------------------------------
     # Recording Events
@@ -614,7 +695,29 @@ class SharedFlowState:
             return idx
 
     async def add_issue(self, issue: Issue) -> bool:
-        """Add an issue (with deduplication)."""
+        """Add an issue (with deduplication).
+
+        Before storing, the issue's severity is passed through the deterministic
+        severity guard (``cap_severity``). The GitHub Action fails a deploy on
+        any raw worker-reported ``critical`` issue (it does not wait for the
+        synthesis agent's curation), so a single over-escalated observation can
+        turn a clean deploy red. The guard caps well-understood non-regressions
+        (the bot's own click-tooling timeouts, third-party OAuth refusing a
+        bare-IP/HTTP staging host, and guessed-URL 404s) so they can never, on
+        their own, fail a deploy. It only ever lowers severity. Mutating the
+        Issue in place means the downstream ``issue`` SSE event, the synthesis
+        input, and the deploy gate all see the same corrected severity.
+        """
+        capped, reason = cap_severity(
+            issue.severity, issue.description, issue.action_context
+        )
+        if reason and capped != issue.severity:
+            logger.info(
+                "Severity guard capped issue from '%s' to '%s' (%s): %s",
+                issue.severity, capped, reason, issue.description[:120],
+            )
+            issue.severity = capped
+
         async with self._lock:
             for existing in self._all_issues:
                 if (existing.description == issue.description and
@@ -636,16 +739,27 @@ class SharedFlowState:
         """
         Mark a flow as skipped (duplicate) by supervisor.
 
-        Returns True if successful.
+        Only PENDING flows can be skipped, and the check happens under the
+        same lock that sets the status: the supervisor's AI review takes
+        seconds, so a worker may have claimed the flow in the meantime.
+        Marking a live flow SKIPPED would mislabel it in the report and
+        leave its name in _skip_set, where is_flow_skipped_by_name would
+        suppress every legitimate future flow with that name.
+
+        Returns True if the flow was marked skip, False if it doesn't exist
+        or is no longer pending.
         """
         async with self._lock:
             if flow_id not in self._flow_registry:
                 return False
 
+            flow_data = self._flow_registry[flow_id]
+            if flow_data.status != FlowStatus.PENDING:
+                return False
+
             self._skip_set.add(flow_id)
             self._skip_reasons[flow_id] = reason
 
-            flow_data = self._flow_registry[flow_id]
             flow_data.status = FlowStatus.SKIPPED
             flow_data.skip_reason = reason
 
@@ -1273,6 +1387,43 @@ class SharedFlowState:
         async with self._lock:
             self._pending_credential_requests.clear()
 
+    def _register_resume_awaiting_checkpoint(self, key: tuple, task: FlowTask):
+        """Remember a resume task created from a request that had no
+        checkpoint linked yet. Must be called while holding self._lock."""
+        self._resume_tasks_awaiting_checkpoint.setdefault(key, []).append(task)
+
+    def _patch_resume_checkpoint(self, key: tuple, checkpoint_id: str) -> bool:
+        """Late-link a checkpoint to a resume task created before the worker
+        finished saving it.
+
+        The user answered the request before the blocked worker's
+        set_*_request_checkpoint call landed, so the resume flow was created
+        with checkpoint_id=None (fresh restart). The task is still a mutable
+        object on the queue: patching it (and its registry entry) before a
+        worker claims it upgrades the resume to a real checkpoint restore.
+        If a worker already claimed it and read checkpoint_id=None, the
+        patch is a no-op for that run — same fresh restart as before.
+
+        Must be called while holding self._lock. Returns True if a task was
+        patched.
+        """
+        tasks = self._resume_tasks_awaiting_checkpoint.get(key)
+        if not tasks:
+            return False
+        task = tasks.pop(0)
+        if not tasks:
+            del self._resume_tasks_awaiting_checkpoint[key]
+
+        task.checkpoint_id = checkpoint_id
+        flow_data = self._flow_registry.get(task.flow_id)
+        if flow_data is not None and flow_data.status == FlowStatus.PENDING:
+            flow_data.checkpoint_id = checkpoint_id
+        logger.info(
+            "Late-linked checkpoint %s to resume flow %s (%s)",
+            checkpoint_id, task.flow_id, key[0],
+        )
+        return True
+
     async def provide_credentials(self, credentials: dict[str, str]) -> Optional[dict]:
         """
         User provides credentials via UI/API.
@@ -1342,6 +1493,14 @@ class SharedFlowState:
                         original_flow.completion_reason = f"Resumed via {flow_name} after credentials provided"
                         original_flow.completed_at = datetime.now()
 
+                # The user may have answered before the blocked worker
+                # finished saving its checkpoint — let the worker's
+                # set_credential_request_checkpoint call patch this task
+                if checkpoint_id is None and original_flow_id:
+                    self._register_resume_awaiting_checkpoint(
+                        ("credential", original_flow_id), flow_task
+                    )
+
                 # Queue the task
                 await self._task_queue.put(flow_task)
 
@@ -1375,6 +1534,13 @@ class SharedFlowState:
                 if request.get("flow_id") == flow_id:
                     request["checkpoint_id"] = checkpoint_id
                     break
+            else:
+                # Request already consumed: the user provided credentials
+                # before this checkpoint was saved. Patch the queued resume
+                # task so it restores from the checkpoint.
+                self._patch_resume_checkpoint(
+                    ("credential", flow_id), checkpoint_id
+                )
 
     async def block_flow_for_credentials(self, flow_id: str, reason: str):
         """
@@ -1509,6 +1675,14 @@ class SharedFlowState:
                         original_flow.completion_reason = f"Resumed via {flow_name} after data provided"
                         original_flow.completed_at = datetime.now()
 
+                # The user may have answered before the blocked worker
+                # finished saving its checkpoint — let the worker's
+                # set_data_request_checkpoint call patch this task
+                if request.checkpoint_id is None:
+                    self._register_resume_awaiting_checkpoint(
+                        ("data", request_name), flow_task
+                    )
+
                 # Queue the task
                 await self._task_queue.put(flow_task)
 
@@ -1547,6 +1721,11 @@ class SharedFlowState:
                 if request.request_name == request_name:
                     request.checkpoint_id = checkpoint_id
                     break
+            else:
+                # Request already consumed: the user provided the data before
+                # this checkpoint was saved. Patch the queued resume task so
+                # it restores from the checkpoint.
+                self._patch_resume_checkpoint(("data", request_name), checkpoint_id)
 
     # -------------------------------------------------------------------------
     # Approval Management (for irreversible actions)
@@ -1631,6 +1810,11 @@ class SharedFlowState:
         async with self._lock:
             if flow_id in self._pending_approval_requests:
                 self._pending_approval_requests[flow_id]["checkpoint_id"] = checkpoint_id
+            else:
+                # Request already consumed: the user approved/denied before
+                # this checkpoint was saved. Patch the queued resume task so
+                # it restores from the checkpoint.
+                self._patch_resume_checkpoint(("approval", flow_id), checkpoint_id)
 
     async def get_pending_approval_requests(self) -> list[dict]:
         """Get all pending approval requests."""
@@ -1725,6 +1909,14 @@ class SharedFlowState:
                     original_flow.status = FlowStatus.RESUMED
                     original_flow.completion_reason = f"Resumed via {flow_name} after user {approval_status}"
                     original_flow.completed_at = datetime.now()
+
+            # The user may have responded before the blocked worker finished
+            # saving its checkpoint — let the worker's
+            # set_approval_request_checkpoint call patch this task
+            if checkpoint_id is None:
+                self._register_resume_awaiting_checkpoint(
+                    ("approval", original_flow_id), flow_task
+                )
 
             # Queue the task
             await self._task_queue.put(flow_task)

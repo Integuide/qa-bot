@@ -42,6 +42,20 @@ def classify_network_failure(
     if failure in BENIGN_FAILURE_REASONS:
         return None
 
+    # Skip 4xx on the page the AI itself navigated to: the AI is looking at
+    # the error page in its screenshot and can report it with real context.
+    # Auto-filing these turned 9 deliberate /admin-variant probes into 9
+    # separate "404 Not Found" issues on mono PR #356. Sub-resource and
+    # background-request failures (invisible to the AI) are still auto-filed,
+    # as are 5xx everywhere.
+    if (
+        req_resource_type == "document"
+        and 400 <= req_status < 500
+        and _normalize_url_for_comparison(req_url)
+        == _normalize_url_for_comparison(page_url)
+    ):
+        return None
+
     # Determine if the failed request is same-origin.
     # Only strips "www." — subdomains like api.example.com are treated as
     # third-party. This is intentional: most cross-subdomain failures are
@@ -91,24 +105,114 @@ def _strip_old_screenshots(history: list[dict]) -> None:
                     content[j] = {"type": "text", "text": "[Screenshot of page]"}
 
 
-async def _safe_goto(page, url: str, timeout: int = 30000) -> None:
-    """Navigate to a URL with graceful timeout handling.
+# Explicit budget for the per-turn screenshot. The browser context's default
+# action timeout is deliberately short (fail fast on stale refs), but the
+# main-loop screenshot is not a ref-based action: a heavy animation or busy
+# main thread can transiently exceed the context default, and that must cost
+# a retry, not the whole flow.
+TURN_SCREENSHOT_TIMEOUT_MS = 15000
 
-    If page.goto() times out but the page actually loaded (URL changed from
-    about:blank), continues instead of raising. This handles sites where
-    domcontentloaded never fires due to slow/hanging CDN resources.
+# Max individually auto-filed network issues per (status, origin) per flow.
+# Past this, a single rollup issue is filed and further repeats are dropped —
+# one broken asset pattern should be one finding, not one issue per URL.
+MAX_NETWORK_ISSUES_PER_PATTERN = 3
+
+
+def _normalize_url_for_comparison(url: str) -> str:
+    """Normalize a URL for reload/commit equality checks.
+
+    Strips the fragment and trailing slash: Playwright's page.url is
+    normalized and servers append/remove slashes or fragments on redirect,
+    so 'https://x.com/page', 'https://x.com/page/' and
+    'https://x.com/page#top' are the same page for navigation-commit
+    purposes. Exact string equality would misclassify a reload of such a
+    page as a failed navigation, or a cosmetic redirect as a real one.
     """
+    base, _, _ = url.partition("#")
+    return base.rstrip("/")
+
+
+# How long the document gets to reach DOMContentLoaded after the server has
+# started responding. A hanging third-party script can hold the parser open
+# far longer — that's a page-weight problem, not a failed navigation.
+NAVIGATION_SETTLE_TIMEOUT_MS = 10_000
+
+
+async def _safe_goto(page, url: str, timeout: int = 30000) -> None:
+    """Navigate to a URL, failing only when the server never responds.
+
+    Two-phase wait:
+
+    1. ``wait_until="commit"`` with the full timeout — fails only if the
+       server never starts responding (hanging server, or a beforeunload
+       guard cancelled the navigation). This is the only case worth telling
+       the AI "navigation failed".
+    2. A bounded ``domcontentloaded`` wait afterwards. If the document
+       doesn't settle in time (e.g. a hung third-party script holding the
+       parser open), log and continue — the server answered, so reporting
+       "timed out" would be a false positive. onlinestoryservices PR #742
+       had exactly this: nginx answered story URLs instantly with 200/301,
+       yet the bot reported 30s timeouts and a critical "story links broken".
+
+    If the commit wait itself times out but the page URL still changed (the
+    navigation raced the timeout), continue too. A goto targeting the URL the
+    page is already on is a reload — its URL cannot change, so the
+    URL-unchanged signal carries no information there and re-raising would
+    fail every reload of a slow page; treat it as committed.
+
+    All URL comparisons are fragment- and trailing-slash-insensitive (see
+    _normalize_url_for_comparison) so cosmetic differences between the AI's
+    target URL and Playwright's normalized page.url don't misclassify.
+    """
+    url_before = page.url
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        await page.goto(url, wait_until="commit", timeout=timeout)
     except (TimeoutError, PlaywrightTimeoutError):
-        if page.url and page.url != "about:blank":
-            logger.warning(
-                f"Navigation to {url} timed out waiting for domcontentloaded, "
-                f"but page loaded ({page.url}). Continuing."
-            )
-            await asyncio.sleep(2)
-        else:
+        norm_before = _normalize_url_for_comparison(url_before)
+        is_reload = _normalize_url_for_comparison(url) == norm_before
+        committed = _normalize_url_for_comparison(page.url) != norm_before
+        if not (page.url and page.url != "about:blank" and (is_reload or committed)):
             raise
+        logger.warning(
+            f"Navigation to {url} timed out waiting for commit, "
+            f"but page is on {page.url}. Continuing."
+        )
+    try:
+        await page.wait_for_load_state(
+            "domcontentloaded", timeout=NAVIGATION_SETTLE_TIMEOUT_MS
+        )
+    except (TimeoutError, PlaywrightTimeoutError):
+        logger.warning(
+            f"Page {page.url} committed but domcontentloaded didn't fire "
+            f"within {NAVIGATION_SETTLE_TIMEOUT_MS}ms. Continuing with "
+            f"whatever has rendered."
+        )
+        await asyncio.sleep(2)
+
+
+async def _settle_after_interaction(browser, sleep_s: float = 0.5) -> None:
+    """Pause after an interaction; if it triggered a navigation, wait
+    (bounded) for the new document so the next screenshot isn't a blank
+    mid-load frame the AI misreads as a hang or broken page.
+
+    wait_for_load_state returns immediately when the current document is
+    already past domcontentloaded, so this only costs time mid-navigation.
+    """
+    await asyncio.sleep(sleep_s)
+    page = browser.active_page
+    if not page:
+        return
+    try:
+        await page.wait_for_load_state(
+            "domcontentloaded", timeout=NAVIGATION_SETTLE_TIMEOUT_MS
+        )
+    except (TimeoutError, PlaywrightTimeoutError):
+        logger.warning(
+            f"Document on {page.url} not settled after interaction; continuing."
+        )
+    except Exception:
+        # Page may have closed (popup flows) — never fail the turn here.
+        pass
 
 
 def _target_url_for_auth(page_url: str, fallback_url: str) -> str:
@@ -214,6 +318,10 @@ class FlowExplorationWorker:
         self.flow_task = flow_task
         self.is_first_worker = is_first_worker
         self._blocked = False
+        # (status, origin) -> count of auto-filed network issues this flow;
+        # used to cap repeat spam (one broken asset pattern = one finding,
+        # not one issue per URL variant)
+        self._network_issue_counts: dict[tuple[int, str], int] = {}
 
     async def run(self) -> AsyncGenerator[dict, None]:
         """Execute the assigned flow task."""
@@ -235,14 +343,17 @@ class FlowExplorationWorker:
         except asyncio.CancelledError:
             raise  # Let cancellation propagate after _execute_flow handled checkpoint
         except Exception as e:
-            await self.state.fail_flow(self.flow_task.flow_id, str(e))
+            retried = await self.state.fail_flow(
+                self.flow_task.flow_id, str(e), task=self.flow_task
+            )
             yield {
-                "type": "flow_failed",
+                "type": "flow_retrying" if retried else "flow_failed",
                 "data": {
                     "worker_id": self.worker_id,
                     "flow_id": self.flow_task.flow_id,
                     "flow_name": self.flow_task.flow_name,
-                    "error": str(e)
+                    "error": str(e),
+                    **({"attempt": self.flow_task.attempt} if retried else {}),
                 }
             }
 
@@ -251,6 +362,16 @@ class FlowExplorationWorker:
         task = self.flow_task
 
         flow_data = await self.state.start_flow_exploration(task, self.worker_id)
+        if flow_data is None:
+            # The supervisor marked this flow skip after the coordinator's
+            # re-checks but before we claimed it. Honor the skip: the run
+            # already emitted flow_skipped for it, so exploring it anyway
+            # would spend budget on a flow the report says was deduplicated.
+            logger.info(
+                f"{self.worker_id}: flow {task.flow_name} ({task.flow_id}) "
+                f"was marked skip before exploration started; discarding"
+            )
+            return
 
         yield {
             "type": "flow_started",
@@ -266,6 +387,7 @@ class FlowExplorationWorker:
 
         context = None
         page = None
+        browser = None
         conversation_history = []
         parent_flow_name = ""
 
@@ -369,6 +491,12 @@ class FlowExplorationWorker:
             action_history = []
             flow_completed = False
             last_error = ""
+            # Why the exploration loop broke, for accurate flow accounting after
+            # the loop. None means the loop ended by its own condition
+            # (flow done, or should_stop() cost/time cutoff). Abnormal breaks set
+            # this so the flow is recorded as failed/interrupted, not completed.
+            exit_reason = None
+            supervisor_stop_reason = ""
 
             # Main exploration loop - runs until AI returns done/block action, or global limits hit
             while not flow_completed and not self.state.should_stop():
@@ -376,12 +504,15 @@ class FlowExplorationWorker:
                 if self._blocked:
                     response = await self.state.wait_for_unblock(self.worker_id, timeout=300)
                     if response is None:
+                        exit_reason = "block_timeout"
                         yield {
                             "type": "block_timeout",
                             "data": {"worker_id": self.worker_id, "flow_id": task.flow_id}
                         }
                         break
                     elif response.get("action") == "stop":
+                        exit_reason = "supervisor_stop"
+                        supervisor_stop_reason = response.get("reason", "")
                         break
                     elif response.get("action") == "checkpoint_and_exit":
                         # Save checkpoint and exit - flow will resume when credentials arrive
@@ -391,7 +522,11 @@ class FlowExplorationWorker:
                         checkpoint = FlowCheckpoint(
                             parent_flow_id=task.flow_id,
                             browser_storage_state=storage_state,
-                            current_url=page.url,
+                            # Resume on the page the AI was actually looking at
+                            # (active popup when one is open) — page.url would
+                            # silently point at the opener while the inherited
+                            # history references the popup.
+                            current_url=browser.current_url,
                             conversation_history=conversation_history.copy(),
                             flow_path=task.flow_path,
                             branch_name=f"credential_resume:{task.flow_name}",
@@ -434,7 +569,8 @@ class FlowExplorationWorker:
                         checkpoint = FlowCheckpoint(
                             parent_flow_id=task.flow_id,
                             browser_storage_state=storage_state,
-                            current_url=page.url,
+                            # Active page (popup-aware), matching the history
+                            current_url=browser.current_url,
                             conversation_history=conversation_history.copy(),
                             flow_path=task.flow_path,
                             branch_name=f"approval_resume:{task.flow_name}",
@@ -478,7 +614,8 @@ class FlowExplorationWorker:
                         checkpoint = FlowCheckpoint(
                             parent_flow_id=task.flow_id,
                             browser_storage_state=storage_state,
-                            current_url=page.url,
+                            # Active page (popup-aware), matching the history
+                            current_url=browser.current_url,
                             conversation_history=conversation_history.copy(),
                             flow_path=task.flow_path,
                             branch_name=f"data_resume:{task.flow_name}",
@@ -519,8 +656,15 @@ class FlowExplorationWorker:
                         prior_context = f"Supervisor response: {supervisor_message}\n\n{prior_context}"
                         self._blocked = False
 
-                # Take screenshot
-                screenshot = await browser.screenshot()
+                # Pin the active page for the whole turn: a popup opening
+                # mid-turn would otherwise flip active_page between the
+                # screenshot and the ref list (AI sees one page, refs point
+                # at another) or between observation and the action. The
+                # popup becomes active on the next turn's pin.
+                browser.pin_active_page()
+
+                # Take screenshot (isolated: one slow render must not kill the flow)
+                screenshot = await self._take_turn_screenshot(browser)
 
                 # Get ref list and viewport size
                 ref_list = await browser.get_ref_list()
@@ -542,7 +686,9 @@ class FlowExplorationWorker:
                     "data": {
                         "flow_id": task.flow_id,
                         "index": action_count,
-                        "url": page.url
+                        # The screenshot shows the active page (popup when one
+                        # is open), so report that page's URL, not the opener's
+                        "url": browser.current_url
                     }
                 }
 
@@ -558,7 +704,9 @@ class FlowExplorationWorker:
                     async for ai_event in self.ai.analyze_for_worker_stream(
                         screenshot_bytes=screenshot,
                         ref_list=ref_list,
-                        current_url=page.url,
+                        # Must match the screenshot: the URL of the active
+                        # page (popup when one is open), not the main page
+                        current_url=browser.current_url,
                         flow_name=task.flow_name,
                         flow_goal=task.goal,
                         action_history=action_history,
@@ -621,6 +769,7 @@ class FlowExplorationWorker:
 
                 except Exception as e:
                     last_error = str(e)
+                    exit_reason = "ai_exception"
                     yield {
                         "type": "ai_error",
                         "worker_id": self.worker_id,
@@ -629,25 +778,110 @@ class FlowExplorationWorker:
                     }
                     break
 
-            # Mark done if not already (loop exited due to global stop condition)
+            # The loop exited without the AI marking the flow done. Record the
+            # flow honestly by exit reason instead of always calling it
+            # COMPLETED — a crashed or cut-off flow reported as completed
+            # silently inflates the coverage the QA report claims.
             if not flow_completed and flow_data.status == FlowStatus.EXPLORING:
-                completion_reason = self.state.get_stop_reason()
-                # If get_stop_reason returns "Unknown", the loop exited due to
-                # an exception rather than a planned stop.  Surface the error
-                # so the report and PR comment make the failure obvious.
-                if completion_reason == "Unknown" and last_error:
-                    completion_reason = f"AI error: {last_error[:200]}"
-                await self.state.complete_flow(task.flow_id, completion_reason)
-                yield {
-                    "type": "flow_completed",
-                    "worker_id": self.worker_id,
-                    "data": {
-                        "flow_id": task.flow_id,
-                        "flow_name": task.flow_name,
-                        "completion_reason": completion_reason,
-                        "action_count": action_count
+                if exit_reason in ("ai_exception", "block_timeout"):
+                    # The worker could not finish testing — a mid-flow failure.
+                    # Route to FAILED so synthesis lists it as a coverage gap,
+                    # matching the retries-exhausted path (fail_flow, above).
+                    reason = (
+                        f"AI error: {last_error[:200]}" if last_error
+                        else "Worker blocked with no response from supervisor"
+                    )
+                    retried = await self.state.fail_flow(
+                        task.flow_id, reason, task=task
+                    )
+                    yield {
+                        "type": "flow_retrying" if retried else "flow_failed",
+                        "worker_id": self.worker_id,
+                        "data": {
+                            "flow_id": task.flow_id,
+                            "flow_name": task.flow_name,
+                            "error": reason,
+                            "action_count": action_count,
+                            **({"attempt": task.attempt} if retried else {}),
+                        }
                     }
-                }
+                elif exit_reason == "supervisor_stop":
+                    # Deliberate stop — never retry what the supervisor killed
+                    reason = supervisor_stop_reason or "Stopped by supervisor"
+                    await self.state.fail_flow(
+                        task.flow_id, reason, task=task, allow_retry=False
+                    )
+                    yield {
+                        "type": "flow_failed",
+                        "worker_id": self.worker_id,
+                        "data": {
+                            "flow_id": task.flow_id,
+                            "flow_name": task.flow_name,
+                            "error": reason,
+                            "action_count": action_count,
+                        }
+                    }
+                elif self.state.should_stop():
+                    # Cost/time cutoff mid-exploration. How to record it depends
+                    # on the run mode, because BLOCKED_FOR_PAUSE is a
+                    # resume-pending status that is_complete() blocks on:
+                    reason = self.state.get_stop_reason()
+                    if self.state.interactive:
+                        # Interactive (web UI): the run pauses for possible
+                        # resume, and the coordinator's cancellation path owns
+                        # checkpoint creation. If the worker self-exits on
+                        # should_stop() before that cancellation lands, marking
+                        # the flow BLOCKED_FOR_PAUSE here (with no checkpoint)
+                        # would wedge is_complete() forever — nothing can resume a
+                        # checkpoint-less flow, so the run would never synthesize.
+                        # Complete it instead (the pre-existing behavior); the
+                        # coordinator still drives the pause/resume UX.
+                        await self.state.complete_flow(task.flow_id, reason)
+                        yield {
+                            "type": "flow_completed",
+                            "worker_id": self.worker_id,
+                            "data": {
+                                "flow_id": task.flow_id,
+                                "flow_name": task.flow_name,
+                                "completion_reason": reason,
+                                "action_count": action_count,
+                            }
+                        }
+                    else:
+                        # Non-interactive (CI): a terminal cutoff, no resume. Mark
+                        # it BLOCKED_FOR_PAUSE so synthesis reports it as untested
+                        # rather than verified coverage (started_at is set, so it
+                        # routes into incomplete flows). The coordinator breaks
+                        # straight to synthesis on should_stop() here, bypassing
+                        # is_complete(), so this can't hang.
+                        await self.state.block_flow_for_pause(task.flow_id, reason)
+                        yield {
+                            "type": "flow_interrupted",
+                            "worker_id": self.worker_id,
+                            "data": {
+                                "flow_id": task.flow_id,
+                                "flow_name": task.flow_name,
+                                "completion_reason": reason,
+                                "action_count": action_count,
+                            }
+                        }
+                else:
+                    # Genuinely ambiguous exit with no error and no stop signal —
+                    # treat as completed but keep whatever reason we can surface.
+                    completion_reason = self.state.get_stop_reason()
+                    if completion_reason == "Unknown" and last_error:
+                        completion_reason = f"AI error: {last_error[:200]}"
+                    await self.state.complete_flow(task.flow_id, completion_reason)
+                    yield {
+                        "type": "flow_completed",
+                        "worker_id": self.worker_id,
+                        "data": {
+                            "flow_id": task.flow_id,
+                            "flow_name": task.flow_name,
+                            "completion_reason": completion_reason,
+                            "action_count": action_count
+                        }
+                    }
 
         except asyncio.CancelledError:
             # Check if pause (should checkpoint) vs user stop (no checkpoint)
@@ -666,7 +900,11 @@ class FlowExplorationWorker:
                         checkpoint = FlowCheckpoint(
                             parent_flow_id=task.flow_id,
                             browser_storage_state=storage_state,
-                            current_url=page.url,
+                            # Active page (popup-aware). browser may be unbound
+                            # here: cancellation can land before the controller
+                            # is created (during the initial _safe_goto), so
+                            # fall back to the main page's URL.
+                            current_url=browser.current_url if browser else page.url,
                             conversation_history=conversation_history.copy(),
                             flow_path=task.flow_path,
                             branch_name=f"pause_resume:{task.flow_name}",
@@ -679,11 +917,55 @@ class FlowExplorationWorker:
             raise  # Re-raise CancelledError
 
         finally:
+            if browser:
+                browser.unpin_active_page()
             if context:
                 try:
                     await asyncio.wait_for(context.close(), timeout=5.0)
                 except Exception:
                     pass  # Ignore errors/timeouts when closing context
+
+    def _cap_network_issue(
+        self, status: int, origin: str, severity: str, desc: str
+    ) -> tuple[str, str] | None:
+        """Apply the per-flow cap on auto-filed network issues.
+
+        The first MAX_NETWORK_ISSUES_PER_PATTERN failures per (status, origin)
+        file individually, the next one becomes a single rollup issue, the
+        rest are dropped. One broken asset pattern = one finding, not one
+        issue per URL variant.
+
+        Returns (severity, desc) to file, or None to skip.
+        """
+        key = (status, origin)
+        seen = self._network_issue_counts.get(key, 0)
+        self._network_issue_counts[key] = seen + 1
+        if seen < MAX_NETWORK_ISSUES_PER_PATTERN:
+            return severity, desc
+        if seen == MAX_NETWORK_ISSUES_PER_PATTERN:
+            return "minor", (
+                f"Multiple additional HTTP {status} failures on {origin} — "
+                f"further occurrences not individually reported"
+            )
+        return None
+
+    async def _take_turn_screenshot(self, browser: BrowserController) -> bytes:
+        """Take the per-turn screenshot with an explicit timeout and one retry.
+
+        page.screenshot inherits the context's short default action timeout,
+        so a single >timeout stall (heavy animation, busy main thread) would
+        otherwise fail the entire flow from the main loop, outside any
+        per-action error handling. A persistent failure still propagates —
+        the AI cannot act without seeing the page.
+        """
+        try:
+            return await browser.screenshot(timeout_ms=TURN_SCREENSHOT_TIMEOUT_MS)
+        except Exception as e:
+            logger.warning(
+                f"{self.worker_id}: per-turn screenshot failed ({e}); retrying once"
+            )
+            await asyncio.sleep(1.0)
+            return await browser.screenshot(timeout_ms=TURN_SCREENSHOT_TIMEOUT_MS)
 
     def _build_flow_context(self, task: FlowTask, conversation_history: list[dict]) -> str:
         """Build context string from flow path and history."""
@@ -761,18 +1043,36 @@ class FlowExplorationWorker:
         elif ai_event["type"] == "error":
             error_msg = ai_event.get("error", "Unknown AI error")
 
+            # Terminal error events still carry the cumulative usage of every
+            # API call made this turn (up to 3 full vision calls when parse
+            # retries are exhausted). Bill them so the cost tracker, cost cap
+            # and estimated_cost_usd account for failed turns too.
+            input_tokens = ai_event.get("input_tokens", 0)
+            output_tokens = ai_event.get("output_tokens", 0)
+            cache_creation_tokens = ai_event.get("cache_creation_tokens", 0)
+            cache_read_tokens = ai_event.get("cache_read_tokens", 0)
+            if input_tokens or output_tokens or cache_creation_tokens or cache_read_tokens:
+                await self.state.add_token_usage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_creation_tokens=cache_creation_tokens,
+                )
+
             if self.state.chat_logger:
                 self.state.chat_logger.log_worker_ai_error(
                     worker_id=self.worker_id,
                     flow_id=task.flow_id,
                     turn_number=action_count,
-                    current_url=page.url,
+                    current_url=browser.current_url,
                     error=error_msg,
                     raw_response=ai_event.get("raw_response"),
                     thinking=ai_event.get("thinking")
                 )
 
-            await self.state.fail_flow(task.flow_id, f"AI error: {error_msg}")
+            retried = await self.state.fail_flow(
+                task.flow_id, f"AI error: {error_msg}", task=task
+            )
 
             events.append({
                 "type": "ai_error",
@@ -780,6 +1080,17 @@ class FlowExplorationWorker:
                 "flow_id": task.flow_id,
                 "data": {"error": error_msg}
             })
+            if retried:
+                events.append({
+                    "type": "flow_retrying",
+                    "worker_id": self.worker_id,
+                    "data": {
+                        "flow_id": task.flow_id,
+                        "flow_name": task.flow_name,
+                        "error": f"AI error: {error_msg}",
+                        "attempt": task.attempt,
+                    }
+                })
 
             result["flow_completed"] = True
             result["should_break"] = True
@@ -816,7 +1127,7 @@ class FlowExplorationWorker:
                     worker_id=self.worker_id,
                     flow_id=task.flow_id,
                     turn_number=action_count,
-                    current_url=page.url,
+                    current_url=browser.current_url,
                     user_prompt=ai_event.get("user_prompt", ""),
                     thinking=thinking,
                     response=action.model_dump(),
@@ -865,6 +1176,17 @@ class FlowExplorationWorker:
                         browser = BrowserController.from_page(page)
                     except Exception as e:
                         logger.error(f"Context rebuild failed after set_http_auth: {e}")
+                        # Close the just-created context before bailing so a
+                        # failed apply_http_auth / new_page / goto doesn't leak
+                        # it — on success the new context is handed back to the
+                        # caller via result["new_context"], but on this error
+                        # path nothing else owns it. (If create_isolated_context
+                        # itself failed, `context` is the already-closed old one;
+                        # the double close is caught and harmless.)
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
                         # Re-raise so the worker exits cleanly via the outer try/except
                         # rather than continuing with stale page/context references
                         raise
@@ -873,11 +1195,30 @@ class FlowExplorationWorker:
                     result["new_context"] = context
                     result["new_browser"] = browser
 
+            # Detect file downloads triggered by the action. Without this,
+            # clicking an export/PDF link looks like a dead button: the
+            # screenshot doesn't change and nothing records the download.
+            downloads = browser.get_downloads(clear=True)
+            for download in downloads:
+                events.append({
+                    "type": "download",
+                    "worker_id": self.worker_id,
+                    "flow_id": task.flow_id,
+                    "data": {
+                        "url": download.url,
+                        "suggested_filename": download.suggested_filename,
+                        "page_url": download.page_url,
+                        "timestamp": download.timestamp,
+                    }
+                })
+
             # Build action record for history
             action_dict = {
                 "action_type": action.action_type,
                 "reasoning": action.reasoning,
-                "page_url": page.url,  # URL where action was executed
+                # URL where the action was executed — the active page (popup
+                # when one is open), matching where ref actions are routed
+                "page_url": browser.current_url,
                 "timestamp": datetime.now().isoformat(),
                 "success": exec_result.success,
             }
@@ -890,6 +1231,13 @@ class FlowExplorationWorker:
                 action_dict["target_url"] = action.url  # Target URL for navigate action
             if action.reason:
                 action_dict["reason"] = action.reason
+            if downloads:
+                # Surface the download in action history so the next AI turn
+                # knows the action worked (the screenshot won't show it).
+                filenames = ", ".join(
+                    d.suggested_filename or d.url for d in downloads
+                )
+                action_dict["note"] = f"Triggered file download: {filenames}"
 
             if exec_result.error:
                 action_dict["error"] = exec_result.error
@@ -983,13 +1331,18 @@ class FlowExplorationWorker:
             for pending_flow in exec_result.pending_flows:
                 if not await self.state.is_flow_skipped_by_name(pending_flow.name):
                     flow_created = False
+                    # Fork from the page the AI is actually looking at
+                    # (active popup when one is open, main page otherwise) so
+                    # the child worker starts where the branch point really
+                    # was — page.url would silently point at the opener.
+                    branch_url = strip_url_credentials(browser.current_url)
                     if pending_flow.keep_state:
                         storage_state = await context.storage_state()
                         _strip_old_screenshots(conversation_history)
                         checkpoint = FlowCheckpoint(
                             parent_flow_id=task.flow_id,
                             browser_storage_state=storage_state,
-                            current_url=strip_url_credentials(page.url),
+                            current_url=branch_url,
                             conversation_history=conversation_history.copy(),
                             flow_path=task.flow_path.extend(pending_flow.name),
                             branch_name=pending_flow.name,
@@ -1000,7 +1353,7 @@ class FlowExplorationWorker:
                     else:
                         new_flow_task = await self.state.add_flow_task(
                             flow_name=pending_flow.name,
-                            start_url=strip_url_credentials(page.url),
+                            start_url=branch_url,
                             goal=pending_flow.description,
                             parent_flow_id=task.flow_id
                         )
@@ -1046,7 +1399,9 @@ class FlowExplorationWorker:
                 issue = Issue(
                     description=reported_issue.description,
                     severity=reported_issue.severity,
-                    url=page.url,
+                    # Attribute the issue to the page the AI was looking at
+                    # (popup when one is open), not the opener page
+                    url=browser.current_url,
                     action_context=f"{action.action_type}: {action.reasoning[:100]}",
                     screenshot_path=issue_screenshot_path
                 )
@@ -1082,7 +1437,7 @@ class FlowExplorationWorker:
                     issue = Issue(
                         description=f"JavaScript error: {error.text[:200]}",
                         severity="major",
-                        url=error.url or page.url,
+                        url=error.url or browser.current_url,
                         action_context=f"Console error at {error.location}" if error.location else "Console error",
                         screenshot_path=console_screenshot_path
                     )
@@ -1109,17 +1464,26 @@ class FlowExplorationWorker:
             network_screenshot_path = None
 
             for req in failed_requests:
-                result = classify_network_failure(
+                # NOTE: must not be named `result` — that would shadow the
+                # function's return dict and crash at `result["thinking"]`.
+                classification = classify_network_failure(
                     req_url=req.url,
                     req_method=req.method,
                     req_status=req.status,
                     req_resource_type=req.resource_type,
                     req_failure_reason=req.failure_reason,
-                    page_url=page.url,
+                    page_url=browser.current_url,
                 )
-                if result is None:
+                if classification is None:
                     continue
-                severity, desc = result
+                severity, desc = classification
+
+                capped = self._cap_network_issue(
+                    req.status, urlparse(req.url).netloc, severity, desc
+                )
+                if capped is None:
+                    continue
+                severity, desc = capped
 
                 if network_screenshot_path is None:
                     network_screenshot = await browser.screenshot()
@@ -1133,7 +1497,7 @@ class FlowExplorationWorker:
                 issue = Issue(
                     description=desc,
                     severity=severity,
-                    url=page.url,
+                    url=browser.current_url,
                     action_context=f"Network request to {req.url[:50]}",
                     screenshot_path=network_screenshot_path
                 )
@@ -1217,7 +1581,7 @@ class FlowExplorationWorker:
                     issue = Issue(
                         description=f"Alert dialog with error: {dialog.message[:100]}",
                         severity="minor",
-                        url=dialog.url or page.url,
+                        url=dialog.url or browser.current_url,
                         action_context="Dialog appeared during testing",
                         screenshot_path=dialog_screenshot_path
                     )
@@ -1276,7 +1640,7 @@ class FlowExplorationWorker:
                         error="No ref provided"
                     )
                 await browser.click_ref(action.ref)
-                await asyncio.sleep(0.5)
+                await _settle_after_interaction(browser)
                 return ActionResult(success=True, message=f"Clicked {action.ref}")
 
             elif action.action_type == "right_click":
@@ -1350,7 +1714,9 @@ class FlowExplorationWorker:
                 amount = scroll_ticks * 100
                 delta_y = amount if direction == "down" else -amount if direction == "up" else 0
                 delta_x = amount if direction == "right" else -amount if direction == "left" else 0
-                await page.mouse.wheel(delta_x, delta_y)
+                # Route through active_page: the AI is looking at the popup
+                # screenshot when one is open, so scrolling must target it too
+                await browser.active_page.mouse.wheel(delta_x, delta_y)
                 return ActionResult(success=True, message=f"Scrolled {direction}")
 
             elif action.action_type == "scroll_to":
@@ -1376,10 +1742,19 @@ class FlowExplorationWorker:
                     }
                     modifiers = [modifier_map.get(m.lower(), m) for m in action.modifiers]
                     key_combo = "+".join(modifiers + [key])
-                    await page.keyboard.press(key_combo)
+                    # Key presses must go to the page the AI is looking at
+                    # (the popup when one is open), e.g. Enter to submit a form
+                    await browser.active_page.keyboard.press(key_combo)
+                    if key == "Enter":
+                        # Ctrl/Cmd+Enter submits forms in plenty of apps →
+                        # may trigger a full navigation, same as bare Enter
+                        await _settle_after_interaction(browser, sleep_s=0.2)
                     return ActionResult(success=True, message=f"Pressed {key_combo}")
                 else:
-                    await page.keyboard.press(key)
+                    await browser.active_page.keyboard.press(key)
+                    if key == "Enter":
+                        # Enter commonly submits a form → full navigation
+                        await _settle_after_interaction(browser, sleep_s=0.2)
                     return ActionResult(success=True, message=f"Pressed {key}")
 
             elif action.action_type == "left_click_drag":
@@ -1427,12 +1802,15 @@ class FlowExplorationWorker:
                         message="Navigate action requires URL",
                         error="No URL provided for navigate action"
                     )
+                # Navigate the page the AI is currently looking at (the popup
+                # when one is open, otherwise the main page)
+                target_page = browser.active_page
                 # Handle special navigation commands (Chrome MCP style)
                 if url.lower() == "back":
-                    await page.go_back()
+                    await target_page.go_back()
                     return ActionResult(success=True, message="Navigated back")
                 elif url.lower() == "forward":
-                    await page.go_forward()
+                    await target_page.go_forward()
                     return ActionResult(success=True, message="Navigated forward")
                 # Validate URL scheme - block dangerous schemes
                 parsed = urlparse(url)
@@ -1446,7 +1824,48 @@ class FlowExplorationWorker:
                 if not parsed.scheme:
                     url = f"https://{url}"
 
-                await _safe_goto(page, url)
+                try:
+                    await _safe_goto(target_page, url)
+                except (TimeoutError, PlaywrightTimeoutError):
+                    # Navigation never committed (hanging server, or a
+                    # beforeunload guard cancelled it). Tell the AI where it
+                    # actually is so its world model stays correct.
+                    return ActionResult(
+                        success=False,
+                        message=f"No server response for {url} within 30s",
+                        error=(
+                            f"No server response for {url}; still on "
+                            f"{target_page.url}. Retry once before reporting."
+                        ),
+                    )
+                except Exception as e:
+                    # A URL that serves a file aborts the navigation: Chromium
+                    # raises "Download is starting" (net::ERR_ABORTED on other
+                    # engines/versions). Report it as a download, not as a raw
+                    # low-level navigation error.
+                    msg = str(e)
+                    if "Download is starting" in msg or "net::ERR_ABORTED" in msg:
+                        # Give the download event a moment to be captured.
+                        # Peek without clearing — _handle_ai_event drains the
+                        # downloads afterwards and emits the download event.
+                        await asyncio.sleep(0.5)
+                        downloads = browser.get_downloads()
+                        if downloads:
+                            names = ", ".join(
+                                d.suggested_filename or d.url for d in downloads
+                            )
+                            return ActionResult(
+                                success=True,
+                                message=f"URL triggered a file download ({names}) "
+                                        f"instead of a page navigation",
+                            )
+                        if "Download is starting" in msg:
+                            return ActionResult(
+                                success=True,
+                                message="URL triggered a file download instead "
+                                        "of a page navigation",
+                            )
+                    raise
                 return ActionResult(success=True, message=f"Navigated to {url}")
 
             elif action.action_type == "wait":
@@ -1458,7 +1877,9 @@ class FlowExplorationWorker:
             elif action.action_type == "resize":
                 width = action.width or 1280
                 height = action.height or 720
-                await page.set_viewport_size({"width": width, "height": height})
+                # Resize the page the AI is looking at (screenshots and
+                # viewport size already come from active_page)
+                await browser.active_page.set_viewport_size({"width": width, "height": height})
                 return ActionResult(success=True, message=f"Resized to {width}x{height}")
 
             elif action.action_type == "report_issue":

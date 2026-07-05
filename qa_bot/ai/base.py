@@ -173,6 +173,8 @@ class AIProvider(ABC):
         issues: list[dict],
         completed_flows: list[dict],
         blocked_flows: list[dict] | None = None,
+        incomplete_flows: list[dict] | None = None,
+        goal: str = "",
     ) -> dict:
         """
         Generate final QA synthesis report.

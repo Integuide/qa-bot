@@ -258,14 +258,19 @@ class SynthesisAgent:
                     for action in flow.actions
                 ]
 
-                completed_flows.append({
+                flow_summary = {
                     "flow_name": flow.flow_name,
                     "completion_reason": flow.completion_reason or "Completed",
                     "action_count": len(flow.actions),
                     "issue_count": len(flow.issues),
                     "urls_visited": flow.urls_visited,
                     "action_summary": action_summary
-                })
+                }
+                # A flow that failed and only succeeded on the automatic
+                # retry is flakiness signal the report should see.
+                if flow.failure_history:
+                    flow_summary["earlier_failed_attempts"] = flow.failure_history
+                completed_flows.append(flow_summary)
 
         # Get blocked flows (credentials/approval) so synthesis can report on them
         blocked_flows = []
@@ -277,6 +282,78 @@ class SynthesisAgent:
                     "reason": flow.completion_reason or "Blocked",
                 })
 
+        # Get flows that never finished: failed (worker/AI errors), interrupted
+        # by the cost/time limit (BLOCKED_FOR_PAUSE in non-interactive runs), or
+        # still exploring when the run ended. Without these the report silently
+        # overstates coverage — a flow that crashed at step 5 simply vanishes
+        # and reads as if it was never attempted.
+        incomplete_flows = []
+        for flow in all_flows:
+            if flow.status == FlowStatus.FAILED:
+                reason = flow.completion_reason or "Failed"
+            elif flow.status == FlowStatus.BLOCKED_FOR_PAUSE:
+                # Skip the placeholder resume clones created by
+                # add_pause_checkpoint: they mirror an original paused flow
+                # (which has its own registry entry) and never ran an action.
+                if flow.started_at is None:
+                    continue
+                reason = flow.completion_reason or "Interrupted by pause/limit"
+            elif flow.status == FlowStatus.EXPLORING:
+                reason = flow.completion_reason or "Interrupted while still exploring"
+            elif flow.status == FlowStatus.PENDING:
+                if flow.failure_history:
+                    # Failed, was re-queued for its automatic retry, but the
+                    # run ended before a worker claimed the retry. "Never
+                    # started" would contradict the recorded actions and drop
+                    # the real crash reason.
+                    reason = (
+                        f"Failed once ({flow.failure_history[-1]}); automatic "
+                        f"retry was queued but the run ended before it started"
+                    )
+                else:
+                    # Discovered but never picked up: the run ended (cost/time
+                    # limit, user stop) while this flow was still queued.
+                    # Without this the report silently understates
+                    # discovered-but-untested coverage.
+                    reason = "Never started — run ended before this flow was explored"
+            else:
+                continue
+
+            incomplete_flows.append({
+                "flow_name": flow.flow_name,
+                "status": flow.status.value,
+                "reason": reason,
+                "action_count": len(flow.actions),
+                "action_summary": [
+                    self._summarize_action(action)
+                    for action in flow.actions
+                ],
+            })
+
+        # Nothing ran and nothing was found: skip the AI call entirely.
+        # Burning synthesis tokens to wrap "0 flows tested" in prose helped
+        # nobody on mono PR #356 — a deterministic report that names the
+        # blockers and how to clear them is faster, free, and more actionable.
+        if not completed_flows and not issues:
+            report = self.generate_not_tested_report(
+                target_url=shared_state.target_url,
+                duration=duration,
+                blocked_flows=blocked_flows,
+                incomplete_flows=incomplete_flows,
+                goal=shared_state.goal or "",
+            )
+            if shared_state.chat_logger:
+                shared_state.chat_logger.log_synthesis_call(
+                    context=(
+                        "0 flows completed, 0 issues — deterministic "
+                        "NOT TESTED report, no AI synthesis call made"
+                    ),
+                    report=report,
+                    input_tokens=0,
+                    output_tokens=0,
+                )
+            return report
+
         # Call AI to generate report
         try:
             result = await self.ai.generate_synthesis_report(
@@ -286,6 +363,8 @@ class SynthesisAgent:
                 issues=issues,
                 completed_flows=completed_flows,
                 blocked_flows=blocked_flows,
+                incomplete_flows=incomplete_flows,
+                goal=shared_state.goal or "",
             )
 
             # Track token usage by type
@@ -328,8 +407,74 @@ class SynthesisAgent:
                 issues,
                 completed_flows,
                 blocked_flows,
+                incomplete_flows=incomplete_flows,
+                goal=shared_state.goal or "",
                 error=str(e),
             )
+
+    def generate_not_tested_report(
+        self,
+        target_url: str,
+        duration: str,
+        blocked_flows: list[dict] | None = None,
+        incomplete_flows: list[dict] | None = None,
+        goal: str = "",
+        reason: str | None = None,
+    ) -> str:
+        """Deterministic report for runs where nothing was tested.
+
+        No AI involved: there are no findings to synthesize, only blockers to
+        surface. Keeps the PR comment short and actionable instead of a long
+        AI-written report that reads like a test happened.
+        """
+        lines = [
+            "# QA Test Report",
+            "",
+            "## Goal Assessment",
+            "",
+            "**Status: NOT TESTED** — no flows were executed and no issues "
+            "were recorded. This deploy has NOT been verified.",
+            "",
+        ]
+        if reason:
+            lines.extend([f"**Reason**: {reason}", ""])
+        lines.append(f"**Target URL:** {target_url}")
+        if goal:
+            lines.append(f"**Testing Goal:** {goal}")
+        lines.extend([f"**Duration:** {duration}", ""])
+
+        if blocked_flows:
+            lines.append("## Blockers")
+            for flow in blocked_flows:
+                status_label = (
+                    "missing credentials"
+                    if "credentials" in flow["status"]
+                    else "pending approval"
+                )
+                lines.append(
+                    f"- **{flow['flow_name']}**: {flow['reason']} ({status_label})"
+                )
+            lines.append("")
+
+        if incomplete_flows:
+            lines.append("## Flows That Never Finished")
+            for flow in incomplete_flows:
+                lines.append(
+                    f"- **{flow['flow_name']}**: {flow.get('reason', 'Incomplete')}"
+                )
+            lines.append("")
+
+        lines.extend([
+            "## How to Fix",
+            "",
+            "- **Missing credentials**: add the named keys to the QA "
+            "workflow's `credentials` secret (one `KEY=value` per line; "
+            "HTTP Basic Auth uses `HTTP_USERNAME` / `HTTP_PASSWORD`).",
+            "- **Unreachable target or wrong URL**: verify the deployment is "
+            "up and the workflow's `url` input points at it.",
+            "- Then re-run the QA workflow.",
+        ])
+        return "\n".join(lines)
 
     def _generate_fallback_report(
         self,
@@ -338,6 +483,8 @@ class SynthesisAgent:
         issues: list[dict],
         completed_flows: list[dict],
         blocked_flows: list[dict] | None = None,
+        incomplete_flows: list[dict] | None = None,
+        goal: str = "",
         error: str | None = None,
     ) -> str:
         """Generate a simple report without AI."""
@@ -357,6 +504,10 @@ class SynthesisAgent:
 
         lines.extend([
             f"**Target URL:** {target_url}",
+        ])
+        if goal:
+            lines.append(f"**Testing Goal:** {goal}")
+        lines.extend([
             f"**Duration:** {duration}",
             f"**Flows Tested:** {len(completed_flows)}",
             f"**Issues Found:** {len(issues)}",
@@ -402,6 +553,17 @@ class SynthesisAgent:
             for flow in blocked_flows:
                 status_label = "missing credentials" if "credentials" in flow["status"] else "pending approval"
                 lines.append(f"- {flow['flow_name']}: {flow['reason']} ({status_label})")
+            lines.append("")
+
+        if incomplete_flows:
+            lines.append("## Incomplete / Untested Flows")
+            lines.append("These flows were NOT fully tested:")
+            for flow in incomplete_flows:
+                status_label = "failed" if flow.get("status") == "failed" else "interrupted"
+                lines.append(
+                    f"- {flow['flow_name']}: {flow.get('reason', 'Incomplete')} "
+                    f"({status_label} after {flow.get('action_count', 0)} actions)"
+                )
             lines.append("")
 
         lines.append("## Flows Tested")

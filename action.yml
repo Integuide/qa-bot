@@ -36,9 +36,9 @@ inputs:
     required: true
 
   model:
-    description: 'Claude model to use (claude-haiku-4-5, claude-sonnet-4-6, claude-opus-4-6)'
+    description: 'Claude model to use (claude-sonnet-5, claude-haiku-4-5, claude-opus-4-8)'
     required: false
-    default: 'claude-haiku-4-5'
+    default: 'claude-sonnet-5'
 
   post-comment:
     description: 'Post results as a PR comment (true/false)'
@@ -50,17 +50,22 @@ inputs:
     required: false
     default: 'true'
 
+  fail-on-zero-flows:
+    description: 'Fail the workflow when no flows were tested at all (missing credentials, unreachable target). A run that tested nothing should not read as a green check. (true/false)'
+    required: false
+    default: 'true'
+
   credentials:
     description: 'Test credentials in env format (KEY=value per line). Use secrets for sensitive values.'
     required: false
     default: ''
 
   testmail-api-key:
-    description: 'Testmail.app API key for testing email verification flows (signup, password reset, etc.)'
+    description: 'Testmail.app API key for email verification flows (experimental - not yet active; the bot currently reports verification steps as untestable)'
     required: false
 
   testmail-namespace:
-    description: 'Testmail.app namespace for email testing'
+    description: 'Testmail.app namespace for email testing (experimental - not yet active)'
     required: false
 
   dangerously-skip-permissions:
@@ -86,6 +91,9 @@ outputs:
   flows-explored:
     description: 'Number of user flows explored'
 
+  cost-usd:
+    description: 'Estimated Claude API cost of the run in USD'
+
 runs:
   using: 'docker'
   image: 'Dockerfile'
@@ -99,6 +107,7 @@ runs:
     INPUT_MODEL: ${{ inputs.model }}
     INPUT_POST_COMMENT: ${{ inputs.post-comment }}
     INPUT_FAIL_ON_CRITICAL: ${{ inputs.fail-on-critical }}
+    INPUT_FAIL_ON_ZERO_FLOWS: ${{ inputs.fail-on-zero-flows }}
     INPUT_CREDENTIALS: ${{ inputs.credentials }}
     TESTMAIL_API_KEY: ${{ inputs.testmail-api-key }}
     TESTMAIL_NAMESPACE: ${{ inputs.testmail-namespace }}

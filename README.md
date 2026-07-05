@@ -2,8 +2,6 @@
 
 AI-powered website QA testing using Claude. Automatically explores user flows and finds bugs, broken elements, or usability problems.
 
-[![GitHub Marketplace](https://img.shields.io/badge/Marketplace-QA%20Bot-blue?logo=github)](https://github.com/marketplace/actions/qa-bot)
-
 ## How It Works
 
 QA Bot uses Claude AI to explore your website like a real user would:
@@ -16,11 +14,14 @@ QA Bot uses Claude AI to explore your website like a real user would:
 ## Quick Start
 
 ```yaml
-- uses: Integuide/qa-bot@v1
+- uses: Integuide/qa-bot@main
   with:
     url: 'https://your-staging-site.com'
     anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    github-token: ${{ github.token }}  # Required to post the report as a PR comment
 ```
+
+To post the report as a PR comment, the job also needs `permissions: pull-requests: write` (see the full example below).
 
 ## Inputs
 
@@ -32,13 +33,14 @@ QA Bot uses Claude AI to explore your website like a real user would:
 | `max-agents` | No | `3` | Parallel AI agents (1-10) |
 | `max-cost` | No | `5.0` | Maximum cost in USD |
 | `max-duration` | No | `30` | Maximum duration in minutes |
-| `model` | No | `claude-haiku-4-5` | Claude model |
+| `model` | No | `claude-sonnet-5` | Claude model |
 | `post-comment` | No | `true` | Post results as PR comment |
 | `github-token` | No | - | GitHub token for PR comments. Pass `${{ github.token }}` when `post-comment` is `true` |
 | `fail-on-critical` | No | `true` | Fail workflow on critical issues |
+| `fail-on-zero-flows` | No | `true` | Fail the workflow when no flows were tested at all (missing credentials, unreachable target) so an untested deploy can't read as a green check |
 | `credentials` | No | - | Test credentials (see below) |
-| `testmail-api-key` | No | - | Testmail.app API key for email flows |
-| `testmail-namespace` | No | - | Testmail.app namespace |
+| `testmail-api-key` | No | - | Testmail.app API key for email flows (experimental — not yet active) |
+| `testmail-namespace` | No | - | Testmail.app namespace (experimental — not yet active) |
 | `dangerously-skip-permissions` | No | `true` | Auto-approve destructive actions (enabled by default in CI) |
 
 ## Outputs
@@ -49,6 +51,21 @@ QA Bot uses Claude AI to explore your website like a real user would:
 | `issues-count` | Total number of issues found |
 | `critical-issues` | Number of critical issues |
 | `flows-explored` | Number of user flows tested |
+| `cost-usd` | Estimated Claude API cost of the run in USD |
+
+## Issue Screenshots
+
+When the bot captures visual evidence for an issue, it exports the PNGs to a
+`qa-bot-screenshots/` directory in the workspace. Add an
+`actions/upload-artifact` step after the QA Bot step (shown in the examples
+below) to publish them as a workflow artifact — the PR comment points
+reviewers at that artifact whenever screenshots were captured.
+
+> **Warning:** Issue screenshots may capture authenticated pages — anything
+> visible after the bot logs in with the credentials you provide (account
+> dashboards, profile details, etc.). Workflow artifacts are downloadable by
+> anyone with read access to the repository, so omit the upload step if that
+> audience should not see those pages.
 
 ## Examples
 
@@ -65,11 +82,22 @@ on:
 jobs:
   qa:
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write  # Allows QA Bot to post the report as a PR comment
     steps:
-      - uses: Integuide/qa-bot@v1
+      - uses: Integuide/qa-bot@main
         with:
           url: 'https://staging.example.com'
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ github.token }}
+
+      # Publish issue screenshots as an artifact (referenced by the PR comment)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa-bot-screenshots
+          path: qa-bot-screenshots/
+          if-no-files-found: ignore
 ```
 
 ### Manual Trigger with Custom URL
@@ -93,7 +121,7 @@ jobs:
   qa:
     runs-on: ubuntu-latest
     steps:
-      - uses: Integuide/qa-bot@v1
+      - uses: Integuide/qa-bot@main
         with:
           url: ${{ github.event.inputs.url }}
           goal: ${{ github.event.inputs.goal }}
@@ -106,10 +134,11 @@ jobs:
 Provide credentials for authenticated flows:
 
 ```yaml
-- uses: Integuide/qa-bot@v1
+- uses: Integuide/qa-bot@main
   with:
     url: 'https://staging.example.com'
     anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    github-token: ${{ github.token }}
     credentials: |
       TEST_USER_EMAIL=${{ secrets.TEST_USER_EMAIL }}
       TEST_USER_PASSWORD=${{ secrets.TEST_USER_PASSWORD }}
@@ -129,7 +158,7 @@ jobs:
   qa:
     runs-on: ubuntu-latest
     steps:
-      - uses: Integuide/qa-bot@v1
+      - uses: Integuide/qa-bot@main
         with:
           url: 'https://staging.example.com'
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -142,15 +171,16 @@ jobs:
       - run: echo "Deploying to production..."
 ```
 
-### Email Verification Testing
+### Email Verification Testing (experimental — not yet active)
 
-Test signup flows with email verification using [Testmail.app](https://testmail.app):
+Inputs for testing email verification flows with [Testmail.app](https://testmail.app) are accepted, but the email-reading actions are **not yet integrated** into the exploration engine. Today the bot cannot open verification emails — it reports email verification steps as untestable and continues with other flows. Once the integration lands, configuration will look like:
 
 ```yaml
-- uses: Integuide/qa-bot@v1
+- uses: Integuide/qa-bot@main
   with:
     url: 'https://staging.example.com'
     anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    github-token: ${{ github.token }}
     goal: 'Test the full signup flow including email verification'
     testmail-api-key: ${{ secrets.TESTMAIL_API_KEY }}
     testmail-namespace: ${{ secrets.TESTMAIL_NAMESPACE }}
@@ -161,8 +191,9 @@ Test signup flows with email verification using [Testmail.app](https://testmail.
 QA Bot tracks API costs in real-time and stops when limits are reached:
 
 - **Default limit:** $5.00 per run
-- **Haiku model:** ~$0.50-2.00 per typical run
-- **Sonnet model:** ~$2.00-8.00 per typical run
+- **Sonnet 5 model (default):** ~$2.00-8.00 per typical run
+- **Haiku model (budget):** ~$0.50-2.00 per typical run
+- **Opus 4.8 model (premium):** ~$4.00-15.00 per typical run
 
 Adjust with `max-cost` and `max-duration` inputs.
 
@@ -181,6 +212,8 @@ Issues are categorized by severity:
 
 - Anthropic API key ([get one here](https://console.anthropic.com/))
 - Publicly accessible URL (or use a tunnel for localhost)
+
+**Report not appearing as a PR comment?** Make sure the workflow passes `github-token: ${{ github.token }}` to the action and the job grants `permissions: pull-requests: write` — without both, the run completes but the comment is silently skipped.
 
 ## License
 

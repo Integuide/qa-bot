@@ -41,15 +41,20 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Model ID constants (single source of truth for model identifiers)
 MODEL_HAIKU = "claude-haiku-4-5"
-MODEL_SONNET = "claude-sonnet-4-6"
-MODEL_OPUS = "claude-opus-4-6"
-DEFAULT_MODEL = MODEL_HAIKU
+MODEL_SONNET = "claude-sonnet-5"
+MODEL_OPUS = "claude-opus-4-8"
+DEFAULT_MODEL = MODEL_SONNET
 
 AI_MODEL = os.getenv("AI_MODEL", DEFAULT_MODEL)
 
 # Model pricing per million tokens (USD)
 # Used for cost tracking and Max Cost -> Max Tokens conversion
-# Source: https://platform.claude.com/docs/en/about-claude/pricing (Feb 2026)
+# Source: https://platform.claude.com/docs/en/about-claude/pricing (Jul 2026)
+# Rates are sticker prices. Sonnet 5 has an introductory $2/$10 discount through
+# 2026-08-31, but we bill the cost cap at sticker rates so it stays conservative
+# (a run is estimated slightly high, never low). Note: Sonnet 5's tokenizer emits
+# ~30% more tokens for the same text than Haiku/Sonnet 4.6, so a given dollar cap
+# buys less exploration than the raw per-token rate ratio suggests.
 MODEL_PRICING: dict[str, dict[str, float]] = {
     MODEL_HAIKU: {
         "input": 1.0,           # $1/MTok for input tokens
@@ -74,14 +79,20 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     },
 }
 
-# Default pricing for unknown models (uses haiku rates)
-DEFAULT_MODEL_PRICING = MODEL_PRICING[DEFAULT_MODEL]
+# Fallback pricing for unknown models. Deliberately the most expensive known
+# rates (Opus) rather than the default model's: an unpriced model must tighten
+# the cost cap, never loosen it. If a run's model is missing from MODEL_PRICING,
+# billing it at cheaper rates would silently let the run blow past its dollar cap.
+DEFAULT_MODEL_PRICING = MODEL_PRICING[MODEL_OPUS]
 
 
 def get_model_pricing(model: str) -> dict[str, float]:
-    """Get pricing for a model, with fallback to default."""
+    """Get pricing for a model, with fallback to the most expensive known rates."""
     if model not in MODEL_PRICING:
-        logger.warning(f"Unknown model '{model}', using default (haiku) pricing for cost calculation")
+        logger.warning(
+            f"Unknown model '{model}', using most-expensive ({MODEL_OPUS}) pricing "
+            f"for cost calculation so the cost cap stays conservative"
+        )
     return MODEL_PRICING.get(model, DEFAULT_MODEL_PRICING)
 
 

@@ -30,12 +30,20 @@ RUN playwright install chromium
 # Copy application code (qa_bot package and action files)
 COPY qa_bot/ qa_bot/
 
-# Environment variables for CI mode
+# Environment variables for CI mode.
+# LOG_CHAT_HISTORY must be true for issue screenshots to be persisted (the
+# chat logger owns the log directory); LOG_SCREENSHOTS=false keeps noisy
+# per-turn screenshots disabled. LOG_DIR points at a container-private path:
+# GitHub runs Docker actions with the host-mounted runner workspace as the
+# working directory, and chat logs (which can contain page content and typed
+# credentials) must never land there. Only the screenshots/ subdirectory is
+# exported by entrypoint.sh — chat logs never leave the container.
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 ENV BROWSER_HEADLESS=true
-ENV LOG_CHAT_HISTORY=false
+ENV LOG_CHAT_HISTORY=true
 ENV LOG_SCREENSHOTS=false
+ENV LOG_DIR=/tmp/qa-bot-logs
 ENV ENVIRONMENT=ci
 
 # Make entrypoint executable

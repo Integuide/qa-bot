@@ -5,16 +5,16 @@ This provides a command-line interface to the same core exploration logic
 used by the web UI. Results can be output as markdown or JSON.
 
 Usage:
-    python cli.py https://example.com
-    python cli.py https://example.com --goal "Test checkout flow" --max-duration 10
-    python cli.py https://example.com --output json --output-file results.json
-    python cli.py https://example.com --log-level full  # Show all activity
+    python -m qa_bot.cli https://example.com
+    python -m qa_bot.cli https://example.com --goal "Test checkout flow" --max-duration 10
+    python -m qa_bot.cli https://example.com --output json --output-file results.json
+    python -m qa_bot.cli https://example.com --log-level full  # Show all activity
 
     # With credentials from file
-    python cli.py https://example.com --credentials .env.test
+    python -m qa_bot.cli https://example.com --credentials .env.test
 
     # With inline credentials
-    python cli.py https://example.com --credential "USERNAME=user" --credential "PASSWORD=pass"
+    python -m qa_bot.cli https://example.com --credential "USERNAME=user" --credential "PASSWORD=pass"
 """
 
 import argparse
@@ -119,9 +119,21 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
             flow_name = data.get("flow_name", "Unknown")
             error = data.get("error", "Unknown error")
             return f"[Flow Failed] {flow_name}: {error}"
+        elif event_type == "flow_retrying":
+            flow_name = data.get("flow_name", "Unknown")
+            error = data.get("error", "Unknown error")
+            return f"[Flow Retrying] {flow_name}: {error}"
+        elif event_type == "flow_interrupted":
+            flow_name = data.get("flow_name", "Unknown")
+            reason = data.get("completion_reason", "")
+            return f"[Flow Interrupted] {flow_name}" + (f" - {reason}" if reason else "")
         elif event_type == "issue":
             severity = data.get("severity", "unknown")
-            title = data.get("title", "Unknown issue")
+            # Issue events carry "description", not "title" — every issue
+            # used to log as "Unknown issue" at summary level. The `or` chain
+            # also covers a present-but-null/empty description (slicing None
+            # would raise inside the formatter).
+            title = data.get("title") or (data.get("description") or "Unknown issue")[:100]
             return f"[Issue] [{severity}] {title}"
         elif event_type == "exploration_complete":
             flows = data.get("flows_explored", 0)
@@ -162,6 +174,14 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
             flow_name = data.get("flow_name", "Unknown")
             error = data.get("error", "Unknown error")
             return f"[{timestamp}] [Flow] Failed: {flow_name}: {error}"
+        elif event_type == "flow_retrying":
+            flow_name = data.get("flow_name", "Unknown")
+            error = data.get("error", "Unknown error")
+            return f"[{timestamp}] [Flow] Retrying: {flow_name}: {error}"
+        elif event_type == "flow_interrupted":
+            flow_name = data.get("flow_name", "Unknown")
+            reason = data.get("completion_reason", "")
+            return f"[{timestamp}] [Flow] Interrupted: {flow_name}" + (f" - {reason}" if reason else "")
         elif event_type == "flow_skipped_by_supervisor":
             flow_name = data.get("flow_name", "Unknown")
             reason = data.get("reason", "")
@@ -246,9 +266,12 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
         # Issue events
         elif event_type == "issue":
             severity = data.get("severity", "unknown")
-            title = data.get("title", "Unknown issue")
-            description = data.get("description", "")[:100]  # Truncate
-            return f"[{timestamp}] [Issue] [{severity.upper()}] {title}" + (f"\n           {description}" if description else "")
+            description = (data.get("description") or "")[:100]  # Truncate; tolerate null
+            # Issue events carry "description", not "title" — every issue
+            # used to log a literal "Unknown issue" headline
+            title = data.get("title") or description or "Unknown issue"
+            detail = description if data.get("title") else ""
+            return f"[{timestamp}] [Issue] [{severity.upper()}] {title}" + (f"\n           {detail}" if detail else "")
 
         # Checkpoint events
         elif event_type == "checkpoint_created":
@@ -365,7 +388,10 @@ async def run_exploration(
         skip_permissions: If True, auto-approve all irreversible actions (dangerous!)
 
     Returns:
-        dict with report, issues, and metadata
+        dict with report, issues, and metadata. ``completed`` is False when the
+        run ended without an exploration_complete event (startup failure or a
+        fatal crash with nothing salvaged); ``error`` carries the fatal error
+        message when one occurred (including salvaged runs).
     """
     ai_provider = ClaudeProvider(
         api_key=api_key,
@@ -386,6 +412,10 @@ async def run_exploration(
     issues = []
     flows_explored = 0
     duration_seconds = 0
+    estimated_cost_usd = 0
+    token_breakdown = {}
+    exploration_completed = False
+    fatal_error = None
 
     if log_level != "quiet":
         print(f"Starting exploration of {url}", file=sys.stderr)
@@ -414,9 +444,20 @@ async def run_exploration(
 
         # Capture final summary
         if event_type == "exploration_complete":
+            exploration_completed = True
             data = event.get("data", {})
             flows_explored = data.get("flows_explored", 0)
             duration_seconds = data.get("duration_seconds", 0)
+            final_progress = data.get("final_progress") or {}
+            estimated_cost_usd = final_progress.get("cost_usd", 0)
+            token_breakdown = final_progress.get("token_breakdown", {})
+
+        # Capture fatal errors. The orchestrator yields these instead of
+        # raising (so SSE/CLI consumers get a structured event), which means
+        # the generator can end "normally" after a total failure — track it
+        # here so the caller can fail loudly instead of reporting success.
+        if event_type == "error" and event.get("data", {}).get("fatal"):
+            fatal_error = event.get("data", {}).get("message") or "Unknown fatal error"
 
         # Log event based on log level
         log_line = format_event_for_log(event, log_level)
@@ -432,6 +473,10 @@ async def run_exploration(
         "issues_found": len(issues),
         "flows_explored": flows_explored,
         "duration_seconds": round(duration_seconds, 2),
+        "estimated_cost_usd": round(estimated_cost_usd, 4),
+        "tokens": token_breakdown,
+        "completed": exploration_completed,
+        "error": fatal_error,
         "target_url": url,
         "goal": goal,
         "timestamp": datetime.now().isoformat()
@@ -445,28 +490,28 @@ def main():
         epilog="""
 Examples:
     # Basic usage (quiet, just outputs report)
-    python cli.py https://example.com
+    python -m qa_bot.cli https://example.com
 
     # With custom goal
-    python cli.py https://example.com --goal "Test the checkout flow"
+    python -m qa_bot.cli https://example.com --goal "Test the checkout flow"
 
     # Quick exploration with fewer agents
-    python cli.py https://example.com --max-agents 2 --max-duration 5
+    python -m qa_bot.cli https://example.com --max-agents 2 --max-duration 5
 
     # JSON output to file
-    python cli.py https://example.com --output json --output-file results.json
+    python -m qa_bot.cli https://example.com --output json --output-file results.json
 
     # Show flow-level progress (summary)
-    python cli.py https://example.com --log-level summary
+    python -m qa_bot.cli https://example.com --log-level summary
 
     # Show full activity log (like web UI)
-    python cli.py https://example.com --log-level full
+    python -m qa_bot.cli https://example.com --log-level full
 
     # Shorthand for summary logging
-    python cli.py https://example.com -v
+    python -m qa_bot.cli https://example.com -v
 
     # Shorthand for full logging
-    python cli.py https://example.com -vv
+    python -m qa_bot.cli https://example.com -vv
         """
     )
 
@@ -637,6 +682,17 @@ Examples:
     except Exception as e:
         print(f"Error during exploration: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # A run that never produced exploration_complete failed outright
+    # (Playwright launch failure, fatal crash with nothing salvaged, ...).
+    # Fail loudly and do NOT write a result file: CI consumers (e.g. the
+    # GitHub Action entrypoint) treat the result file's existence as success,
+    # so writing one here would turn a total failure into a green run with
+    # an empty report.
+    if not result.get("completed"):
+        message = result.get("error") or "exploration ended before completing"
+        print(f"Error: QA exploration failed: {message}", file=sys.stderr)
+        sys.exit(2)
 
     # Format output
     if args.output == "json":

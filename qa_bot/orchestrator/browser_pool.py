@@ -32,6 +32,26 @@ def strip_url_credentials(url: str) -> str:
 logger = logging.getLogger(__name__)
 
 
+# Default timeout for element actions (click, fill, screenshot, etc.).
+# Playwright's built-in default is 30s, which means a single stale ref or
+# permanently-covered element silently burns 30s of the exploration budget.
+# 10s is enough for slow-but-working pages while keeping failures cheap.
+DEFAULT_ACTION_TIMEOUT_MS = 10_000
+
+# Navigations legitimately take longer than element actions (full page loads
+# over slow CDNs), so keep them at Playwright's 30s default.
+DEFAULT_NAVIGATION_TIMEOUT_MS = 30_000
+
+# User-Agent applied to every browser context. The preflight probe reuses
+# this exact string so it fails iff the real browser would (a WAF that
+# blocks this UA blocks both), rather than getting through on a default
+# httpx UA and then having the browser blocked.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 QABot/1.0"
+)
+
+
 # Permissions to auto-grant to all browser contexts
 # This prevents permission prompts from blocking automation
 AUTO_GRANT_PERMISSIONS = [
@@ -71,30 +91,57 @@ class BrowserPool:
         self._started = False
 
     async def start(self):
-        """Initialize Playwright and launch browser."""
+        """Initialize Playwright and launch browser.
+
+        If browser launch fails after Playwright started, the partial state
+        is cleaned up before re-raising so the Playwright driver process
+        doesn't leak (stop() would otherwise see _started=False and bail).
+        """
         async with self._lock:
             if self._started:
                 return
 
-            self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(headless=self.headless)
+            try:
+                self._playwright = await async_playwright().start()
+                self._browser = await self._playwright.chromium.launch(headless=self.headless)
+            except Exception:
+                await self._teardown()
+                raise
             self._started = True
 
+    async def _teardown(self):
+        """Close the browser and stop Playwright, swallowing cleanup errors.
+
+        Must be called while holding self._lock.
+        """
+        if self._browser:
+            try:
+                await self._browser.close()
+            except Exception:
+                logger.warning("Error closing browser during teardown", exc_info=True)
+            self._browser = None
+
+        if self._playwright:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                logger.warning("Error stopping Playwright during teardown", exc_info=True)
+            self._playwright = None
+
+        self._started = False
+
     async def stop(self):
-        """Close browser and stop Playwright."""
+        """Close browser and stop Playwright.
+
+        Also cleans up partially-started state (e.g. Playwright running but
+        browser launch failed), so callers can always safely call stop().
+        """
         async with self._lock:
-            if not self._started:
+            if self._browser is None and self._playwright is None:
+                self._started = False
                 return
 
-            if self._browser:
-                await self._browser.close()
-                self._browser = None
-
-            if self._playwright:
-                await self._playwright.stop()
-                self._playwright = None
-
-            self._started = False
+            await self._teardown()
 
     async def create_isolated_context(
         self,
@@ -125,7 +172,7 @@ class BrowserPool:
 
         context = await self._browser.new_context(
             viewport=self.viewport,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 QABot/1.0",
+            user_agent=BROWSER_USER_AGENT,
             storage_state=storage_state,
             # Auto-grant permissions to prevent prompts from blocking automation
             permissions=AUTO_GRANT_PERMISSIONS,
@@ -137,6 +184,13 @@ class BrowserPool:
             # navigation; route interception alone misses it.
             http_credentials=http_credentials,
         )
+
+        # Bound element-action waits so a stale ref or covered element fails
+        # fast instead of eating Playwright's 30s default. Navigation keeps
+        # the 30s default (set explicitly, since set_default_timeout would
+        # otherwise also shrink go_back/go_forward/goto waits).
+        context.set_default_timeout(DEFAULT_ACTION_TIMEOUT_MS)
+        context.set_default_navigation_timeout(DEFAULT_NAVIGATION_TIMEOUT_MS)
 
         return context
 

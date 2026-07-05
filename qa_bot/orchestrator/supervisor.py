@@ -584,6 +584,12 @@ class SupervisorAgent:
                     flow_data = await self.state.get_flow_data(flow_id)
                     flow_name = flow_data.flow_name if flow_data else flow_id
 
+                    # mark_flow_skip refuses non-PENDING flows under its own
+                    # lock: the AI review takes seconds, so a worker may have
+                    # claimed the flow in the meantime, and marking a live
+                    # flow SKIPPED would mislabel it and emit a misleading
+                    # flow_skipped event. Checking the status here instead
+                    # would be a TOCTOU race against the worker's claim.
                     success = await self.state.mark_flow_skip(flow_id, reason)
                     if success:
                         yield {

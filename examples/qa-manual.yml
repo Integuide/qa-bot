@@ -41,10 +41,10 @@ on:
         required: false
         type: choice
         options:
+          - claude-sonnet-5
           - claude-haiku-4-5
-          - claude-sonnet-4-6
-          - claude-opus-4-6
-        default: 'claude-haiku-4-5'
+          - claude-opus-4-8
+        default: 'claude-sonnet-5'
 
       max-cost:
         description: 'Maximum cost in USD (default: $5.00)'
@@ -95,10 +95,13 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "$REPORT" >> $GITHUB_STEP_SUMMARY
 
-      - name: Save report as artifact
+      # Issue screenshots are exported to the workspace by the action.
+      # (The result JSON lives inside the action container and is not
+      # reachable from the runner; the report is in the step summary above.)
+      - name: Upload issue screenshots
         if: always() && steps.qa.outcome != 'cancelled'
         uses: actions/upload-artifact@v4
         with:
-          name: qa-report
-          path: |
-            /tmp/qa-result.json
+          name: qa-bot-screenshots
+          path: qa-bot-screenshots/
+          if-no-files-found: ignore
