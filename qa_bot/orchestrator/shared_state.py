@@ -11,7 +11,15 @@ import uuid
 
 from qa_bot.agent.state import Issue
 from qa_bot.config import calculate_cost, DEFAULT_MODEL
-from qa_bot.orchestrator.flow import FlowTask, FlowCheckpoint, FlowPath, FlowStatus, FlowExplorationData
+from qa_bot.orchestrator.flow import (
+    PRIORITY_RETRY,
+    PRIORITY_RETRY_GOAL,
+    FlowTask,
+    FlowCheckpoint,
+    FlowPath,
+    FlowStatus,
+    FlowExplorationData,
+)
 from qa_bot.orchestrator.severity_guard import cap_severity
 
 logger = logging.getLogger(__name__)
@@ -177,7 +185,14 @@ class SharedFlowState:
     # Flow management (protected by _lock)
     _flow_registry: dict[str, FlowExplorationData] = field(default_factory=dict)  # flow_id -> data
     _checkpoint_registry: dict[str, FlowCheckpoint] = field(default_factory=dict)  # checkpoint_id -> checkpoint
-    _task_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # Pending-flow queue: (enqueue_seq, FlowTask) entries. claim_pending_flow
+    # dequeues by highest task.priority first, FIFO within a priority band —
+    # so normal flows run in creation order but retries of failed flows
+    # (which fail_flow re-queues with elevated priority) run before flows
+    # that haven't started yet. Priority is read live from the task at
+    # dequeue time, not frozen at enqueue.
+    _task_queue: list[tuple[int, FlowTask]] = field(default_factory=list)
+    _task_queue_seq: int = 0
     _pause_checkpoints: list[FlowTask] = field(default_factory=list)  # High-priority queue for pause-resumed flows
 
     # Supervisor deduplication
@@ -290,7 +305,7 @@ class SharedFlowState:
             is_first_worker=root_flow.is_first_worker,  # Propagate from FlowTask
         )
 
-        state._task_queue.put_nowait(root_flow)
+        state._queue_put(root_flow)
 
         return state
 
@@ -320,23 +335,46 @@ class SharedFlowState:
             self._user_data.clear()
             self._credentials.clear()
             # Drain the task queue
-            while not self._task_queue.empty():
-                try:
-                    self._task_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+            self._task_queue.clear()
 
     # -------------------------------------------------------------------------
     # Flow Task Management
     # -------------------------------------------------------------------------
+
+    def _queue_put(self, task: FlowTask) -> None:
+        """Append a task to the pending-flow queue.
+
+        Sync on purpose: callers either hold self._lock already or run
+        before any concurrency exists (create()). asyncio.Lock is not
+        reentrant, so this must not acquire it.
+        """
+        self._task_queue_seq += 1
+        self._task_queue.append((self._task_queue_seq, task))
+
+    def _queue_pop_next(self) -> Optional[FlowTask]:
+        """Pop the highest-priority task (FIFO within equal priority).
+
+        Caller must hold self._lock. Priority is read live from the task so
+        a priority bumped after enqueue (fail_flow retry re-queues the same
+        FlowTask object) is honored.
+        """
+        if not self._task_queue:
+            return None
+        best_index = max(
+            range(len(self._task_queue)),
+            key=lambda i: (self._task_queue[i][1].priority, -self._task_queue[i][0]),
+        )
+        return self._task_queue.pop(best_index)[1]
 
     async def claim_pending_flow(self) -> Optional[FlowTask]:
         """
         Claim the next pending flow task (non-blocking).
 
         Used by coordinator to get flows for spawning workers.
-        Prioritizes pause checkpoints (from interrupted workers) over regular queue.
-        Returns None if no pending flows available.
+        Order: pause checkpoints (interrupted workers) first, then the
+        pending queue by priority band — retries of failed flows before
+        flows that haven't started yet — and FIFO (creation order) within
+        a band. Returns None if no pending flows available.
         """
         async with self._lock:
             # First check for pause checkpoints (highest priority)
@@ -346,12 +384,8 @@ class SharedFlowState:
                     self._flow_registry[task.flow_id].status = FlowStatus.PENDING
                 return task
 
-            # Then check regular queue
-            try:
-                task = self._task_queue.get_nowait()
-                return task
-            except asyncio.QueueEmpty:
-                return None
+            # Then the regular queue, highest priority first
+            return self._queue_pop_next()
 
     async def return_flow_to_pending(self, task: FlowTask):
         """
@@ -360,11 +394,12 @@ class SharedFlowState:
         Used when a worker slot isn't available and we need to
         put the flow back for later processing.
         """
-        await self._task_queue.put(task)
+        async with self._lock:
+            self._queue_put(task)
 
     def has_pending_flows(self) -> bool:
         """Check if there are any pending flows in the queue or pause checkpoints."""
-        return bool(self._pause_checkpoints) or not self._task_queue.empty()
+        return bool(self._pause_checkpoints) or bool(self._task_queue)
 
     # -------------------------------------------------------------------------
     # Checkpoint Management
@@ -440,7 +475,7 @@ class SharedFlowState:
                 self._flow_registry[checkpoint.parent_flow_id].child_flow_ids.append(flow_task.flow_id)
 
             # Queue the task
-            await self._task_queue.put(flow_task)
+            self._queue_put(flow_task)
 
             return flow_task
 
@@ -465,11 +500,12 @@ class SharedFlowState:
             return True
 
     async def add_pause_checkpoint(self, checkpoint: "FlowCheckpoint", goal: str) -> Optional["FlowTask"]:
-        """Add checkpoint created during pause. Gets highest priority (150) on resume."""
+        """Add checkpoint created during pause. Resumed via _pause_checkpoints,
+        which claim_pending_flow drains before the priority queue — absolute
+        precedence, so no priority value is involved."""
         async with self._lock:
             self._checkpoint_registry[checkpoint.checkpoint_id] = checkpoint
             flow_task = FlowTask.create_from_checkpoint(checkpoint, goal)
-            flow_task.priority = 150  # Higher than root (100)
 
             # Propagate is_first_worker from parent flow
             parent_is_first_worker = False
@@ -589,6 +625,33 @@ class SharedFlowState:
                 flow_data.completion_reason = completion_reason
                 self._prune_checkpoint_data(flow_data.checkpoint_id)
 
+    # Generic filler words in flow names ("Login Flow", "Search Functionality
+    # Flow") that must not count as a match against the testing goal.
+    _GOAL_MATCH_IGNORED_WORDS = frozenset({
+        "flow", "flows", "test", "tests", "testing", "page", "pages",
+        "site", "menu", "main", "basic", "general", "functionality",
+        "feature", "features", "new", "the", "and", "for", "with", "via",
+    })
+
+    def _is_flow_goal_relevant(self, flow_name: str) -> bool:
+        """Whether a flow's name matches the run's testing goal.
+
+        Deterministic word overlap: a flow is goal-relevant when any
+        significant word of its name appears in the goal text (e.g.
+        "Story Browsing Flow" vs a goal naming "story browsing"). Used to
+        rank retries: flows the goal explicitly asks about outrank
+        retries of generic flows.
+        """
+        if not self.goal:
+            return False
+        goal_words = set(re.findall(r"[a-z0-9]+", self.goal.lower()))
+        return any(
+            len(word) >= 3
+            and word not in self._GOAL_MATCH_IGNORED_WORDS
+            and word in goal_words
+            for word in re.findall(r"[a-z0-9]+", flow_name.lower())
+        )
+
     # A flow gets one automatic retry after a failure (transient browser
     # crashes and API hiccups shouldn't permanently burn a flow's coverage);
     # the second failure is terminal.
@@ -643,7 +706,20 @@ class SharedFlowState:
                     f"Retrying after failure (attempt {task.attempt} of "
                     f"{self.MAX_FLOW_ATTEMPTS}): {error}"
                 )
-                await self._task_queue.put(task)
+                # A retry must run before flows that haven't started yet —
+                # the failed attempt already consumed budget, and under a
+                # tight cost cap a tail-of-queue retry never executes (the
+                # OutfoxStories PR #812 run ended with both goal-critical
+                # retries still queued behind 8 generic flows). Flows named
+                # by the testing goal outrank other retries. max() so a
+                # retried root flow keeps PRIORITY_ROOT.
+                retry_priority = (
+                    PRIORITY_RETRY_GOAL
+                    if self._is_flow_goal_relevant(flow_data.flow_name)
+                    else PRIORITY_RETRY
+                )
+                task.priority = max(task.priority, retry_priority)
+                self._queue_put(task)
                 return True
 
             flow_data.status = FlowStatus.FAILED
@@ -1038,7 +1114,7 @@ class SharedFlowState:
         synchronous contexts. The values read are set under the lock elsewhere, and
         a momentarily stale read here is safe (the caller will re-check on next loop).
         """
-        if not self._task_queue.empty() or self._active_workers > 0:
+        if self._task_queue or self._active_workers > 0:
             return False
         # Don't complete if there are pause checkpoints waiting
         if self._pause_checkpoints:
@@ -1117,7 +1193,7 @@ class SharedFlowState:
                 "checkpoints": len(self._checkpoint_registry),
                 "issues_found": len(self._all_issues),
                 "active_workers": self._active_workers,
-                "queue_depth": self._task_queue.qsize(),
+                "queue_depth": len(self._task_queue),
                 "monitoring": {
                     "console_errors": self._console_error_count,
                     "network_failures": self._network_failure_count,
@@ -1313,7 +1389,7 @@ class SharedFlowState:
                 self._flow_registry[parent_flow_id].child_flow_ids.append(flow_id)
 
             # Queue the task
-            await self._task_queue.put(flow_task)
+            self._queue_put(flow_task)
 
             # Trigger supervisor
             self._supervisor_trigger.set()
@@ -1502,7 +1578,7 @@ class SharedFlowState:
                     )
 
                 # Queue the task
-                await self._task_queue.put(flow_task)
+                self._queue_put(flow_task)
 
                 # Trigger supervisor
                 self._supervisor_trigger.set()
@@ -1684,7 +1760,7 @@ class SharedFlowState:
                     )
 
                 # Queue the task
-                await self._task_queue.put(flow_task)
+                self._queue_put(flow_task)
 
                 new_flows.append({
                     "flow_id": flow_id,
@@ -1919,7 +1995,7 @@ class SharedFlowState:
                 )
 
             # Queue the task
-            await self._task_queue.put(flow_task)
+            self._queue_put(flow_task)
 
             # Trigger supervisor
             self._supervisor_trigger.set()

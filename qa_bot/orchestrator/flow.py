@@ -12,6 +12,21 @@ from typing import Optional
 import uuid
 
 
+# Scheduling priority bands for the pending-flow queue.
+# SharedFlowState.claim_pending_flow dequeues the highest priority first and
+# FIFO within a band, so for normal flows creation order = testing order
+# (the first worker is prompted to create goal-critical flows first).
+# Retries jump ahead of flows that haven't started yet: a retried flow has
+# already consumed budget, so finishing it recovers sunk cost that starting
+# a fresh (typically lower-value) flow would strand — in the OutfoxStories
+# PR #812 run, both goal-critical retries sat at the back of a FIFO queue
+# behind 8 generic flows and never ran before the cost cap hit.
+PRIORITY_DEFAULT = 0      # Normal flows: FIFO in creation order
+PRIORITY_RETRY = 50       # Automatic retry of a failed flow
+PRIORITY_RETRY_GOAL = 60  # Retry of a flow named by the testing goal
+PRIORITY_ROOT = 100       # Root/first-worker flow
+
+
 class FlowStatus(str, Enum):
     """Status of a flow in the exploration."""
     PENDING = "pending"          # Checkpoint exists, not yet claimed
@@ -216,7 +231,7 @@ class FlowTask:
             is_root=True,
             start_url=start_url,
             goal=goal,
-            priority=100,  # Root flows get high priority
+            priority=PRIORITY_ROOT,
             is_first_worker=True,  # Root flow is always first worker
         )
 
@@ -234,7 +249,11 @@ class FlowTask:
             checkpoint_id=checkpoint.checkpoint_id,
             goal=goal,
             parent_flow_id=checkpoint.parent_flow_id,
-            priority=max(0, 100 - len(checkpoint.flow_path) * 10),  # Lower priority for deeper flows
+            # PRIORITY_DEFAULT, deliberately: the scheduler now honors
+            # priority, and a depth-based value here would let sub-branch
+            # checkpoints preempt the goal-ordered initial flows. Fresh
+            # flows keep FIFO creation order; only retries jump the queue.
+            priority=PRIORITY_DEFAULT,
         )
 
 
