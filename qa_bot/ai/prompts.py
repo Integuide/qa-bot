@@ -26,7 +26,10 @@ Each turn:
 
 ## Actions
 
-Respond with a single JSON object. Use ref strings like "ref_1", "ref_2" from the element list.
+Respond with a single JSON object, written in your regular response text — a reply whose only content is thinking cannot be executed. Use ref strings like "ref_1", "ref_2" from the element list.
+
+Element actions (clicks, hover, type, scroll_to) take a "ref" from the CURRENT Interactive Elements list; clicks and hover may instead take a "coordinate" [x, y] read from the screenshot when the target has no ref.
+**Refs are renumbered on EVERY turn** — only refs from the current turn's list are valid. Reusing a ref number from an earlier turn may silently target a different element.
 
 **Click an element:**
 {"action_type": "left_click", "ref": "ref_5", "element": "Sign Up button", "reasoning": "Clicking the Sign Up button"}
@@ -320,7 +323,15 @@ FIRST_WORKER_CONTEXT = """
 
 Look at the screenshot and identify the major user flows to test (login, signup, navigation, key features).
 
-Your ONLY job is to create flows - do NOT test anything yourself. Use multiple add_flow actions (one per turn), then done when finished.
+Your ONLY job is to create flows - do NOT test anything yourself. Do NOT log in, sign up, fill forms, or click through features — the workers assigned to the flows you create will do that. Do not navigate beyond a quick look at the landing page: enumerate flows from the goal text and what is visible, then call done. Use multiple add_flow actions (one per turn), then done when finished — expect roughly 6-8 add_flow actions in total. You have a hard budget of ~15 turns; the flow is force-completed after that.
+
+**Order flows by relevance to the testing goal — goal-critical flows FIRST.** Flows are tested in the order you create them, and the run can hit its cost/time budget before the list is finished, so whatever you create last may never run:
+
+1. Read the Goal in your prompt. If it names specific features, changes, or focus areas (e.g. a pull request's changes), create the flows that directly exercise those FIRST — one flow per named target, most important first. Do this even if you haven't seen those features on the page yet; describe where to find them if you can tell.
+2. Only then add the generic site-wide flows (login, signup, navigation, content browsing).
+3. Name each goal-driven flow using the goal's own key words (goal says "subscription gating and trial-ending emails" → flow names "Subscription Gating" and "Trial Ending Emails", not "Premium Area"), and repeat the relevant goal phrase in the flow_description. The scheduler matches flow names/descriptions against the goal text to keep goal-critical flows at the front of the queue.
+
+If the goal is just generic exploration, enumerate flows by user importance: core value paths (the main thing users come to the site for, checkout/payment) before peripheral ones (footer links, static pages).
 
 Example first action:
 {"action_type": "add_flow", "flow_name": "Login Flow", "flow_description": "Test user authentication", "reasoning": "Login button visible in header"}
@@ -363,7 +374,7 @@ WORKER_ACTION_PROMPT = """## Current State
 
 Look at the screenshot, then respond with ONE JSON action.
 
-Use ref numbers from the list above for click/type actions.
+Use ref numbers from the Interactive Elements list above for click/type actions. Refs were renumbered this turn — a ref from Recent Actions or an earlier turn is stale and may point at a different element now.
 """
 
 

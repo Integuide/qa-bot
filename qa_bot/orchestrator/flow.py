@@ -14,15 +14,28 @@ import uuid
 
 # Scheduling priority bands for the pending-flow queue.
 # SharedFlowState.claim_pending_flow dequeues the highest priority first and
-# FIFO within a band, so for normal flows creation order = testing order
+# FIFO within a band, so within a band creation order = testing order
 # (the first worker is prompted to create goal-critical flows first).
-# Retries jump ahead of flows that haven't started yet: a retried flow has
-# already consumed budget, so finishing it recovers sunk cost that starting
-# a fresh (typically lower-value) flow would strand — in the OutfoxStories
-# PR #812 run, both goal-critical retries sat at the back of a FIFO queue
-# behind 8 generic flows and never ran before the cost cap hit.
+#
+# Two signals promote a flow above the default band:
+# - Goal relevance: a budget-capped run exists to answer its testing goal,
+#   so flows the goal names must not starve behind generic flows (in the
+#   OutfoxStories PR #826 run, all three completed flows were generic
+#   homepage/login/signup flows while every goal-named flow — AI generation,
+#   subscription gating, Stripe return handling — was still queued when the
+#   cost cap hit).
+# - Retry: a retried flow has already consumed budget, so finishing it
+#   recovers sunk cost that starting a fresh flow would strand (PR #812 run:
+#   both goal-critical retries sat at the back of a FIFO queue behind 8
+#   generic flows and never ran before the cost cap hit).
+#
+# Goal-relevant fresh flows deliberately outrank *generic* retries: goal
+# coverage is the run's purpose, and sunk cost on a generic flow doesn't
+# outweigh an untested goal target. Among goal-relevant flows, the retry
+# wins (same goal value, plus sunk cost).
 PRIORITY_DEFAULT = 0      # Normal flows: FIFO in creation order
-PRIORITY_RETRY = 50       # Automatic retry of a failed flow
+PRIORITY_RETRY = 50       # Automatic retry of a failed generic flow
+PRIORITY_GOAL = 55        # Fresh flow named by the testing goal
 PRIORITY_RETRY_GOAL = 60  # Retry of a flow named by the testing goal
 PRIORITY_ROOT = 100       # Root/first-worker flow
 
@@ -249,10 +262,12 @@ class FlowTask:
             checkpoint_id=checkpoint.checkpoint_id,
             goal=goal,
             parent_flow_id=checkpoint.parent_flow_id,
-            # PRIORITY_DEFAULT, deliberately: the scheduler now honors
-            # priority, and a depth-based value here would let sub-branch
-            # checkpoints preempt the goal-ordered initial flows. Fresh
-            # flows keep FIFO creation order; only retries jump the queue.
+            # PRIORITY_DEFAULT, deliberately: the scheduler honors priority,
+            # and a depth-based value here would let sub-branch checkpoints
+            # preempt the goal-ordered initial flows. SharedFlowState
+            # promotes the task to PRIORITY_GOAL at enqueue time when its
+            # name/description matches the testing goal; everything else
+            # keeps FIFO creation order.
             priority=PRIORITY_DEFAULT,
         )
 

@@ -1,6 +1,20 @@
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator, Literal, Optional, Union
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
+
+
+# Actions that target a specific element and are unexecutable without a
+# ref (or a screenshot coordinate). Rejecting a target-less one at parse
+# time routes the mistake into the cheap parse-correction retry loop
+# instead of burning a full browser turn on a guaranteed failure.
+ELEMENT_TARGET_ACTIONS = frozenset({
+    "left_click",
+    "right_click",
+    "double_click",
+    "triple_click",
+    "hover",
+    "scroll_to",
+})
 
 
 class AgentAction(BaseModel):
@@ -98,6 +112,26 @@ class AgentAction(BaseModel):
     # For set_http_auth action
     username_key: Optional[str] = None  # Credential key to use as username
     password_key: Optional[str] = None  # Credential key to use as password
+
+    @model_validator(mode="after")
+    def _require_element_target(self) -> "AgentAction":
+        """Element-targeting actions must carry a ref or a coordinate.
+
+        The validation message is surfaced to the model by the parse
+        correction loop (see claude_provider), so word it as an instruction.
+        """
+        if (
+            self.action_type in ELEMENT_TARGET_ACTIONS
+            and self.ref is None
+            and self.coordinate is None
+        ):
+            raise ValueError(
+                f'{self.action_type} needs a "ref" from the current '
+                f'Interactive Elements list (e.g. "ref": "ref_5") or a '
+                f'"coordinate" [x, y] read from the screenshot. Pick an '
+                f"element from the current list."
+            )
+        return self
 
 
 class WorkerActionResponse(BaseModel):

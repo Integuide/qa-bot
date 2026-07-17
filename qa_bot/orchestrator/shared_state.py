@@ -12,6 +12,8 @@ import uuid
 from qa_bot.agent.state import Issue
 from qa_bot.config import calculate_cost, DEFAULT_MODEL
 from qa_bot.orchestrator.flow import (
+    PRIORITY_DEFAULT,
+    PRIORITY_GOAL,
     PRIORITY_RETRY,
     PRIORITY_RETRY_GOAL,
     FlowTask,
@@ -459,6 +461,13 @@ class SharedFlowState:
 
             # Create flow task from checkpoint
             flow_task = FlowTask.create_from_checkpoint(checkpoint, goal)
+            # Goal-relevant branches dequeue before generic flows (the goal
+            # param carries the branch's description here). max() so a
+            # future caller that pre-sets a higher priority keeps it.
+            flow_task.priority = max(
+                flow_task.priority,
+                self._goal_priority_for_new_flow(checkpoint.branch_name, goal),
+            )
 
             # Initialize flow data
             self._flow_registry[flow_task.flow_id] = FlowExplorationData(
@@ -625,22 +634,34 @@ class SharedFlowState:
                 flow_data.completion_reason = completion_reason
                 self._prune_checkpoint_data(flow_data.checkpoint_id)
 
-    # Generic filler words in flow names ("Login Flow", "Search Functionality
-    # Flow") that must not count as a match against the testing goal.
+    # Generic filler words in flow names/descriptions ("Login Flow", "Verify
+    # the search works correctly") that must not count as a match against
+    # the testing goal. Includes the QA verbs ("verify", "check", ...) that
+    # appear in almost every goal AND almost every flow description — since
+    # descriptions are matched too, those would otherwise make every flow
+    # "goal-relevant" and collapse the priority band back to FIFO.
     _GOAL_MATCH_IGNORED_WORDS = frozenset({
         "flow", "flows", "test", "tests", "testing", "page", "pages",
         "site", "menu", "main", "basic", "general", "functionality",
         "feature", "features", "new", "the", "and", "for", "with", "via",
+        "verify", "verifies", "verifying", "verified",
+        "check", "checks", "checking",
+        "ensure", "ensures", "ensuring",
+        "confirm", "confirms", "confirming",
+        "validate", "validates", "validating", "validation",
+        "user", "users", "works", "working", "correctly", "properly",
     })
 
-    def _is_flow_goal_relevant(self, flow_name: str) -> bool:
-        """Whether a flow's name matches the run's testing goal.
+    def _is_flow_goal_relevant(self, flow_text: str) -> bool:
+        """Whether a flow's name (or name + description) matches the run's
+        testing goal.
 
         Deterministic word overlap: a flow is goal-relevant when any
-        significant word of its name appears in the goal text (e.g.
+        significant word of the given text appears in the goal text (e.g.
         "Story Browsing Flow" vs a goal naming "story browsing"). Used to
-        rank retries: flows the goal explicitly asks about outrank
-        retries of generic flows.
+        schedule goal-relevant flows (fresh and retried) ahead of generic
+        ones, so a budget-capped run covers what the goal asks about before
+        the cost/time cap hits.
         """
         if not self.goal:
             return False
@@ -649,8 +670,23 @@ class SharedFlowState:
             len(word) >= 3
             and word not in self._GOAL_MATCH_IGNORED_WORDS
             and word in goal_words
-            for word in re.findall(r"[a-z0-9]+", flow_name.lower())
+            for word in re.findall(r"[a-z0-9]+", flow_text.lower())
         )
+
+    def _goal_priority_for_new_flow(self, flow_name: str, description: str) -> int:
+        """Priority band for a newly created (fresh) flow.
+
+        Flows whose name or description overlaps the testing goal get
+        PRIORITY_GOAL so they dequeue before generic flows regardless of
+        creation order — the deterministic backstop behind the first
+        worker's prompted goal-first ordering (OutfoxStories PR #826: the
+        cost cap hit after 3 generic flows while every goal-named flow was
+        still queued). The description is included because workers often
+        give flows generic names ("Adventure Mode") while the description
+        carries the goal-relevant substance ("Test AI story generation...").
+        """
+        text = f"{flow_name} {description}"
+        return PRIORITY_GOAL if self._is_flow_goal_relevant(text) else PRIORITY_DEFAULT
 
     # A flow gets one automatic retry after a failure (transient browser
     # crashes and API hiccups shouldn't permanently burn a flow's coverage);
@@ -715,7 +751,11 @@ class SharedFlowState:
                 # retried root flow keeps PRIORITY_ROOT.
                 retry_priority = (
                     PRIORITY_RETRY_GOAL
-                    if self._is_flow_goal_relevant(flow_data.flow_name)
+                    if self._is_flow_goal_relevant(
+                        # task.goal carries the flow's description — same
+                        # matching text the creation-time banding uses.
+                        f"{flow_data.flow_name} {task.goal}"
+                    )
                     else PRIORITY_RETRY
                 )
                 task.priority = max(task.priority, retry_priority)
@@ -929,6 +969,28 @@ class SharedFlowState:
             return True
 
         return False
+
+    def limit_fraction_used(self) -> float:
+        """Fraction of the exploration budget already consumed (0.0-1.0+).
+
+        Takes the max of the cost fraction (against the exploration budget,
+        i.e. max cost minus the synthesis reserve) and the elapsed-time
+        fraction — whichever limit is closer to cutting the run off. Workers
+        use this to switch to wrap-up mode before should_stop() kills them
+        mid-flow, so remaining budget reaches the queued flows instead of
+        being spent going deep on the current one.
+        """
+        exploration_budget = self.max_cost_usd * (1 - self.SYNTHESIS_COST_RESERVE_RATIO)
+        cost_fraction = (
+            self.total_cost_usd / exploration_budget if exploration_budget > 0 else 1.0
+        )
+        elapsed_minutes = (datetime.now() - self.start_time).total_seconds() / 60
+        time_fraction = (
+            elapsed_minutes / self.max_duration_minutes
+            if self.max_duration_minutes > 0
+            else 1.0
+        )
+        return max(cost_fraction, time_fraction)
 
     def get_stop_reason(self) -> str:
         """Get the reason for stopping exploration.
@@ -1372,7 +1434,10 @@ class SharedFlowState:
                 goal=goal,
                 is_root=False,
                 parent_flow_id=parent_flow_id,
-                checkpoint_id=None
+                checkpoint_id=None,
+                # Goal-relevant flows dequeue before generic ones (the goal
+                # param carries the flow's description here).
+                priority=self._goal_priority_for_new_flow(flow_name, goal),
             )
 
             # Initialize flow data

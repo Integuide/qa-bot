@@ -12,7 +12,13 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from qa_bot.ai.base import AIProvider, AgentAction
 from qa_bot.agent.state import Issue
-from qa_bot.browser.controller import BrowserController, BENIGN_FAILURE_REASONS, DuplicateRefError
+from qa_bot.browser.controller import (
+    BrowserController,
+    BENIGN_FAILURE_REASONS,
+    DuplicateRefError,
+    StaleRefError,
+    REF_ACTION_TIMEOUT_MS,
+)
 from qa_bot.orchestrator.browser_pool import BrowserPool, strip_url_credentials
 from qa_bot.orchestrator.shared_state import SharedFlowState, UserDataField, UserDataRequest, format_user_data_for_prompt
 from qa_bot.orchestrator.flow import FlowTask, FlowCheckpoint, FlowStatus
@@ -116,6 +122,81 @@ TURN_SCREENSHOT_TIMEOUT_MS = 15000
 # Past this, a single rollup issue is filed and further repeats are dropped —
 # one broken asset pattern should be one finding, not one issue per URL.
 MAX_NETWORK_ISSUES_PER_PATTERN = 3
+
+# When this fraction of the exploration budget (cost or time) is consumed,
+# workers get a wrap-up note in their prompt: verify the essentials of the
+# current flow quickly and finish, instead of going deep until should_stop()
+# kills the flow mid-action. Graceful degradation — the saved budget reaches
+# the queued (goal-ordered) flows rather than dying inside the current one.
+WRAP_UP_LIMIT_FRACTION = 0.75
+
+# Hard turn cap for the Root/first worker. Its ONLY job is flow enumeration
+# (~6-8 add_flow calls + done), but it can ignore its instructions and start
+# exploring/testing on its own: the #839 staging run's Root flow burned 67
+# API turns (~40-50% of the run's cost) signing up a user before dying,
+# while its retry did the actual enumeration in 37 seconds. From
+# FIRST_WORKER_NUDGE_TURNS a wrap-up note is injected into each turn's
+# prompt; at FIRST_WORKER_MAX_TURNS the flow is force-completed — any flows
+# already added via add_flow are kept.
+FIRST_WORKER_NUDGE_TURNS = 10
+FIRST_WORKER_MAX_TURNS = 15
+
+
+def _budget_wrap_up_note(state: "SharedFlowState") -> str:
+    """Wrap-up instruction for the AI once the run's budget is nearly spent.
+
+    Empty string while there's comfortable budget left. Text-only and
+    appended to the current turn's (never-cached) user message, so it costs
+    no cache efficiency.
+    """
+    fraction = state.limit_fraction_used()
+    if fraction < WRAP_UP_LIMIT_FRACTION:
+        return ""
+    return (
+        f"**BUDGET ALERT: about {min(int(fraction * 100), 99)}% of this run's "
+        "cost/time budget is already used.** Switch to wrap-up mode: quickly "
+        "verify only the single most important remaining aspect of this "
+        "flow's goal, then use the done action. Prefer breadth over depth — "
+        "no long side-explorations, no exhaustive form testing, and only "
+        "add_flow for something essential to the testing goal that is not "
+        "yet covered. An honest 'partially tested' result now is worth more "
+        "than an unfinished deep dive."
+    )
+
+
+def _first_worker_turn_note(is_first_worker: bool, action_count: int) -> str:
+    """Turn-cap warning for the first (flow-enumeration) worker's prompt.
+
+    Empty until FIRST_WORKER_NUDGE_TURNS; from there it tells the model the
+    flow will be force-completed at FIRST_WORKER_MAX_TURNS so it spends its
+    remaining turns on add_flow + done rather than exploring.
+    """
+    if not is_first_worker or action_count < FIRST_WORKER_NUDGE_TURNS:
+        return ""
+    remaining = max(FIRST_WORKER_MAX_TURNS - action_count, 1)
+    return (
+        f"**TURN LIMIT: you have used {action_count} turns; flow enumeration "
+        f"is force-completed after {FIRST_WORKER_MAX_TURNS}.** Your only job "
+        f"is to enumerate flows — do not test or explore. Use your remaining "
+        f"~{remaining} turn(s) for add_flow actions covering anything "
+        f"important not yet listed, then call done."
+    )
+
+
+def _no_target_error(action_type: str) -> str:
+    """Corrective error for an element action with neither ref nor coordinate.
+
+    Parse-time validation (AgentAction._require_element_target) normally
+    rejects these before they reach the browser; this is the defense-in-depth
+    runtime message, worded as an instruction the AI can act on — the old
+    bare "No ref provided" was nonsensical from the model's perspective and
+    caused it to repeat the same action for many turns (#839 run).
+    """
+    return (
+        f'{action_type} needs a "ref" from the current Interactive Elements '
+        f'list (e.g. "ref": "ref_5") or a "coordinate" [x, y] read from the '
+        f"screenshot. Pick an element from the current list."
+    )
 
 
 def _normalize_url_for_comparison(url: str) -> str:
@@ -241,6 +322,10 @@ class ActionResult:
     screenshot: bytes = None  # For explicit screenshot action
     data_request: "UserDataRequest" = None  # For request_data action
     needs_context_rebuild: bool = False  # For set_http_auth: recreate browser context
+    # True when `error` is a crafted corrective instruction for the AI (not a
+    # raw exception string). Corrective errors are kept intact in the action
+    # history shown to the model instead of the tight raw-error truncation.
+    corrective_error: bool = False
 
     def __post_init__(self):
         if self.pending_flows is None:
@@ -500,6 +585,37 @@ class FlowExplorationWorker:
 
             # Main exploration loop - runs until AI returns done/block action, or global limits hit
             while not flow_completed and not self.state.should_stop():
+                # Hard turn cap for the first worker: its only job is flow
+                # enumeration, and a runaway Root flow that starts testing on
+                # its own can eat half the run's budget (#839). The nudge note
+                # (_first_worker_turn_note) warned it for several turns; now
+                # force-complete, keeping the flows it already added.
+                if self.is_first_worker and action_count >= FIRST_WORKER_MAX_TURNS:
+                    completion_reason = (
+                        f"Flow enumeration force-completed at the "
+                        f"{FIRST_WORKER_MAX_TURNS}-turn cap"
+                    )
+                    await self.state.complete_flow(task.flow_id, completion_reason)
+                    if self.state.chat_logger:
+                        self.state.chat_logger.log_worker_completion(
+                            worker_id=self.worker_id,
+                            flow_id=task.flow_id,
+                            reason=completion_reason,
+                            total_turns=action_count
+                        )
+                    yield {
+                        "type": "flow_completed",
+                        "worker_id": self.worker_id,
+                        "data": {
+                            "flow_id": task.flow_id,
+                            "flow_name": task.flow_name,
+                            "completion_reason": completion_reason,
+                            "action_count": action_count
+                        }
+                    }
+                    flow_completed = True
+                    break
+
                 # Check if we're blocked
                 if self._blocked:
                     response = await self.state.wait_for_unblock(self.worker_id, timeout=300)
@@ -712,7 +828,12 @@ class FlowExplorationWorker:
                         action_history=action_history,
                         conversation_history=conversation_history,
                         prior_context=prior_context,
-                        additional_context="",
+                        additional_context="\n\n".join(note for note in (
+                            _budget_wrap_up_note(self.state),
+                            _first_worker_turn_note(
+                                self.is_first_worker, action_count
+                            ),
+                        ) if note),
                         is_first_worker=self.is_first_worker,
                         worker_number=self.worker_number,
                         flow_description=task.goal,
@@ -1225,6 +1346,10 @@ class FlowExplorationWorker:
             # Add action-specific fields
             if action.ref is not None:
                 action_dict["ref"] = action.ref
+            if action.element:
+                action_dict["element"] = action.element
+            if action.coordinate is not None:
+                action_dict["coordinate"] = list(action.coordinate)
             if action.text:
                 action_dict["text"] = action.text
             if action.url:
@@ -1241,13 +1366,25 @@ class FlowExplorationWorker:
 
             if exec_result.error:
                 action_dict["error"] = exec_result.error
+                if exec_result.corrective_error:
+                    # Crafted instruction for the AI — the history formatter
+                    # must not apply the tight raw-error truncation to it
+                    action_dict["error_corrective"] = True
                 events.append({
                     "type": "action_error",
                     "worker_id": self.worker_id,
                     "flow_id": task.flow_id,
                     "data": {
                         "error": exec_result.error,
-                        "action_type": action.action_type
+                        "action_type": action.action_type,
+                        # Targeting fields, for log forensics: distinguishes
+                        # "coordinate click" from "no target at all" (#839)
+                        "ref": action.ref,
+                        "coordinate": (
+                            list(action.coordinate)
+                            if action.coordinate is not None else None
+                        ),
+                        "element": action.element,
                     }
                 })
 
@@ -1631,61 +1768,96 @@ class FlowExplorationWorker:
         Returns ActionResult with success status and any control flow signals.
         """
         try:
-            # Click actions
+            # Click actions. Refs are preferred (auto-wait, actionability
+            # checks), but a bare [x, y] coordinate from the screenshot is
+            # honored too — the action schema documents coordinate support
+            # (Chrome MCP parity), so the model legitimately emits it for
+            # elements that carry no ref. Screenshot coordinates map 1:1 to
+            # viewport coordinates.
             if action.action_type == "left_click":
-                if action.ref is None:
+                if action.ref is not None:
+                    await browser.click_ref(action.ref)
+                elif action.coordinate is not None:
+                    x, y = action.coordinate
+                    await browser.active_page.mouse.click(x, y)
+                else:
                     return ActionResult(
                         success=False,
-                        message="left_click requires ref",
-                        error="No ref provided"
+                        message="left_click requires ref or coordinate",
+                        corrective_error=True,
+                        error=_no_target_error("left_click")
                     )
-                await browser.click_ref(action.ref)
                 await _settle_after_interaction(browser)
-                return ActionResult(success=True, message=f"Clicked {action.ref}")
+                target = action.ref or f"({action.coordinate[0]}, {action.coordinate[1]})"
+                return ActionResult(success=True, message=f"Clicked {target}")
 
             elif action.action_type == "right_click":
-                if action.ref is None:
+                if action.ref is not None:
+                    await browser.right_click_ref(action.ref)
+                elif action.coordinate is not None:
+                    x, y = action.coordinate
+                    await browser.active_page.mouse.click(x, y, button="right")
+                else:
                     return ActionResult(
                         success=False,
-                        message="right_click requires ref",
-                        error="No ref provided"
+                        message="right_click requires ref or coordinate",
+                        corrective_error=True,
+                        error=_no_target_error("right_click")
                     )
-                await browser.right_click_ref(action.ref)
                 await asyncio.sleep(0.3)
-                return ActionResult(success=True, message=f"Right-clicked {action.ref}")
+                target = action.ref or f"({action.coordinate[0]}, {action.coordinate[1]})"
+                return ActionResult(success=True, message=f"Right-clicked {target}")
 
             elif action.action_type == "double_click":
-                if action.ref is None:
+                if action.ref is not None:
+                    await browser.double_click_ref(action.ref)
+                elif action.coordinate is not None:
+                    x, y = action.coordinate
+                    await browser.active_page.mouse.dblclick(x, y)
+                else:
                     return ActionResult(
                         success=False,
-                        message="double_click requires ref",
-                        error="No ref provided"
+                        message="double_click requires ref or coordinate",
+                        corrective_error=True,
+                        error=_no_target_error("double_click")
                     )
-                await browser.double_click_ref(action.ref)
                 await asyncio.sleep(0.5)
-                return ActionResult(success=True, message=f"Double-clicked {action.ref}")
+                target = action.ref or f"({action.coordinate[0]}, {action.coordinate[1]})"
+                return ActionResult(success=True, message=f"Double-clicked {target}")
 
             elif action.action_type == "triple_click":
-                if action.ref is None:
+                if action.ref is not None:
+                    await browser.triple_click_ref(action.ref)
+                elif action.coordinate is not None:
+                    x, y = action.coordinate
+                    await browser.active_page.mouse.click(x, y, click_count=3)
+                else:
                     return ActionResult(
                         success=False,
-                        message="triple_click requires ref",
-                        error="No ref provided"
+                        message="triple_click requires ref or coordinate",
+                        corrective_error=True,
+                        error=_no_target_error("triple_click")
                     )
-                await browser.triple_click_ref(action.ref)
                 await asyncio.sleep(0.3)
-                return ActionResult(success=True, message=f"Triple-clicked {action.ref}")
+                target = action.ref or f"({action.coordinate[0]}, {action.coordinate[1]})"
+                return ActionResult(success=True, message=f"Triple-clicked {target}")
 
             elif action.action_type == "hover":
-                if action.ref is None:
+                if action.ref is not None:
+                    await browser.hover_ref(action.ref)
+                elif action.coordinate is not None:
+                    x, y = action.coordinate
+                    await browser.active_page.mouse.move(x, y)
+                else:
                     return ActionResult(
                         success=False,
-                        message="hover requires ref",
-                        error="No ref provided"
+                        message="hover requires ref or coordinate",
+                        corrective_error=True,
+                        error=_no_target_error("hover")
                     )
-                await browser.hover_ref(action.ref)
                 await asyncio.sleep(0.3)
-                return ActionResult(success=True, message=f"Hovered over {action.ref}")
+                target = action.ref or f"({action.coordinate[0]}, {action.coordinate[1]})"
+                return ActionResult(success=True, message=f"Hovered over {target}")
 
             elif action.action_type == "type":
                 if action.ref is None or action.text is None:
@@ -1720,14 +1892,30 @@ class FlowExplorationWorker:
                 return ActionResult(success=True, message=f"Scrolled {direction}")
 
             elif action.action_type == "scroll_to":
-                if action.ref is None:
-                    return ActionResult(
-                        success=False,
-                        message="scroll_to requires ref",
-                        error="No ref provided"
+                if action.ref is not None:
+                    await browser.scroll_to_ref(action.ref)
+                    return ActionResult(success=True, message=f"Scrolled to {action.ref}")
+                if action.coordinate is not None:
+                    # Coordinate form: bring the given screenshot point toward
+                    # the viewport center (there is no element to anchor on)
+                    x, y = action.coordinate
+                    await browser.active_page.evaluate(
+                        "([x, y]) => window.scrollBy({"
+                        "left: x - window.innerWidth / 2, "
+                        "top: y - window.innerHeight / 2, "
+                        "behavior: 'instant'})",
+                        [x, y],
                     )
-                await browser.scroll_to_ref(action.ref)
-                return ActionResult(success=True, message=f"Scrolled to {action.ref}")
+                    return ActionResult(
+                        success=True,
+                        message=f"Scrolled point ({x}, {y}) toward viewport center"
+                    )
+                return ActionResult(
+                    success=False,
+                    message="scroll_to requires ref or coordinate",
+                    corrective_error=True,
+                    error=_no_target_error("scroll_to")
+                )
 
             elif action.action_type == "key":
                 key = action.key or "Enter"
@@ -2018,6 +2206,42 @@ class FlowExplorationWorker:
             return ActionResult(
                 success=False,
                 message=f"Multiple elements match {e.ref}",
+                corrective_error=True,
+                error=str(e)
+            )
+
+        except StaleRefError as e:
+            # Message is already corrective ("pick a fresh ref from the
+            # updated element list") — keep it intact in the history.
+            return ActionResult(
+                success=False,
+                message=f"Action failed: {action.action_type}",
+                corrective_error=True,
+                error=str(e)
+            )
+
+        except PlaywrightTimeoutError as e:
+            # Playwright's raw timeout message is multi-line and gets
+            # truncated to ~100 chars in the action history the AI sees,
+            # arriving cut off mid-selector. For ref actions, replace it
+            # with a short corrective message (StaleRefError style) the AI
+            # can actually act on. (navigate handles its own timeouts above.)
+            if action.ref is not None:
+                timeout_s = REF_ACTION_TIMEOUT_MS // 1000
+                return ActionResult(
+                    success=False,
+                    message=f"Timed out interacting with {action.ref}",
+                    corrective_error=True,
+                    error=(
+                        f"{action.ref} exists but was not clickable within "
+                        f"{timeout_s}s — likely covered by an overlay/modal or "
+                        f"off-screen. Check the fresh screenshot; try scroll_to "
+                        f"first, dismiss any overlay, or pick a different ref."
+                    )
+                )
+            return ActionResult(
+                success=False,
+                message=f"Action failed: {action.action_type}",
                 error=str(e)
             )
 

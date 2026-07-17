@@ -6,7 +6,7 @@ import random
 import re
 import uuid
 from datetime import datetime
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 from urllib.parse import urlparse
 from anthropic import AsyncAnthropic, RateLimitError, APIError, APIConnectionError, APITimeoutError
 from pydantic import ValidationError
@@ -33,8 +33,10 @@ BACKOFF_MULTIPLIER = 5.0
 JITTER_FACTOR = 0.5  # Add up to 50% randomness to backoff
 
 # Corrective retries when a worker response contains no parseable JSON
-# action. One malformed reply must not kill the whole flow, so we ask the
-# model to reformat before giving up.
+# action — or no text at all (a thinking-only response, an intermittent
+# model failure mode). One bad reply must not kill the whole flow, so we
+# ask the model to reformat (or simply re-sample, when there is no text
+# to correct) before giving up.
 MAX_PARSE_RETRIES = 2
 PARSE_CORRECTION_PROMPT = (
     "Your last reply did not contain a valid JSON action object. "
@@ -376,8 +378,9 @@ class ClaudeProvider(AIProvider):
         in_thinking_block = False
 
         # Outer corrective-retry loop: when a completed response contains no
-        # parseable JSON action, re-ask the model to reformat (up to
-        # MAX_PARSE_RETRIES times) instead of failing the whole flow.
+        # parseable JSON action, re-ask the model to reformat — and when it
+        # contains no text at all (thinking-only), re-sample the same request —
+        # up to MAX_PARSE_RETRIES times, instead of failing the whole flow.
         action = None
         cumulative_usage = _extract_token_usage(None)
 
@@ -520,6 +523,22 @@ class ClaudeProvider(AIProvider):
 
             # Parse the final response - extract action JSON
             if not full_response:
+                # A completed stream can carry thinking but no text block —
+                # an intermittent model failure mode (seen live 2026-07-12:
+                # "No text response from AI" killed the same flow twice, once
+                # 23 actions deep). One text-less response must not be
+                # flow-fatal, so retry within the same corrective budget as a
+                # parse failure. There is no assistant text to echo back (the
+                # API rejects empty text blocks), so the retry re-sends the
+                # identical request — a fresh sample almost always carries
+                # text.
+                if parse_attempt < MAX_PARSE_RETRIES:
+                    logger.warning(
+                        f"Worker stream: response contained no text "
+                        f"(attempt {parse_attempt + 1}/{MAX_PARSE_RETRIES + 1}), "
+                        f"retrying"
+                    )
+                    continue
                 yield {
                     "type": "error",
                     "error": "No text response from AI",
@@ -546,9 +565,17 @@ class ClaudeProvider(AIProvider):
                         "role": "assistant",
                         "content": [{"type": "text", "text": full_response}]
                     })
+                    # Include the specific failure (e.g. a pydantic validation
+                    # message like "left_click needs a ref ... or a
+                    # coordinate") — the generic prompt alone only mentions
+                    # JSON formatting, which isn't always the actual problem.
+                    correction = (
+                        f"{PARSE_CORRECTION_PROMPT}\n\n"
+                        f"Specifically: {str(e)[:500]}"
+                    )
                     messages.append({
                         "role": "user",
-                        "content": [{"type": "text", "text": PARSE_CORRECTION_PROMPT}]
+                        "content": [{"type": "text", "text": correction}]
                     })
                     continue
                 # Yield error event with raw response for debugging
@@ -604,8 +631,14 @@ class ClaudeProvider(AIProvider):
 
             # Add relevant details based on action type
             if action_type in ("left_click", "right_click", "double_click", "triple_click", "hover"):
-                ref = action.get("ref", "?")
-                line += f" ref={ref}"
+                ref = action.get("ref")
+                coordinate = action.get("coordinate")
+                if ref:
+                    line += f" ref={ref}"
+                elif coordinate:
+                    line += f" coordinate={coordinate}"
+                else:
+                    line += " ref=?"
             elif action_type == "type":
                 ref = action.get("ref", "?")
                 text = action.get("text", "")[:30]
@@ -622,8 +655,14 @@ class ClaudeProvider(AIProvider):
             if url:
                 line += f"\n   URL: {simplify_url(url)}"
             if error:
-                # Allow longer error text for duplicate-ref disambiguation
-                max_err = 300 if error.startswith(DUPLICATE_REF_PREFIX) else 100
+                # Crafted corrective messages (duplicate-ref disambiguation,
+                # ref-timeout guidance, missing-target instructions) must
+                # arrive intact; only raw exception text is truncated hard.
+                is_corrective = (
+                    action.get("error_corrective")
+                    or error.startswith(DUPLICATE_REF_PREFIX)
+                )
+                max_err = 300 if is_corrective else 100
                 line += f"\n   Error: {error[:max_err]}"
             note = action.get("note", "")
             if note:
@@ -650,24 +689,49 @@ class ClaudeProvider(AIProvider):
         """
         text = text.strip()
 
-        # Try to parse as direct JSON. AgentAction(**data) raises pydantic
-        # ValidationError (a ValueError) on schema mismatch and TypeError when
-        # data isn't a mapping — both mean "this candidate isn't the action",
-        # so fall through to the next extraction layer rather than aborting.
+        # Remember the last ValidationError raised by a candidate that was
+        # clearly meant to be the action (a dict carrying "action_type"): if
+        # no later candidate parses cleanly, its message — worded as an
+        # instruction by AgentAction's validators — is what the parse
+        # correction retry should feed back to the model, not a generic
+        # "no valid JSON" complaint.
+        validation_error: ValidationError | None = None
+
+        def _try_build(data) -> Optional[AgentAction]:
+            nonlocal validation_error
+            try:
+                return AgentAction(**data)
+            except TypeError:
+                # data isn't a mapping — this candidate isn't the action
+                return None
+            except ValidationError as e:
+                if isinstance(data, dict) and "action_type" in data:
+                    validation_error = e
+                return None
+
+        # Try to parse as direct JSON. Schema mismatch or non-mapping data
+        # means "this candidate isn't the (valid) action", so fall through
+        # to the next extraction layer rather than aborting.
         try:
             data = json.loads(text)
-            return AgentAction(**data)
-        except (json.JSONDecodeError, TypeError, ValidationError):
-            pass
+        except json.JSONDecodeError:
+            data = None
+        if data is not None:
+            action = _try_build(data)
+            if action is not None:
+                return action
 
         # Try to extract JSON from markdown code block
         match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
         if match:
             try:
                 data = json.loads(match.group(1).strip())
-                return AgentAction(**data)
-            except (json.JSONDecodeError, TypeError, ValidationError):
-                pass
+            except json.JSONDecodeError:
+                data = None
+            if data is not None:
+                action = _try_build(data)
+                if action is not None:
+                    return action
 
         # Fall back to scanning for a JSON object containing "action_type".
         # raw_decode is string-aware, so braces inside string values (e.g.
@@ -687,15 +751,24 @@ class ClaudeProvider(AIProvider):
                 except json.JSONDecodeError:
                     data = None
                 if isinstance(data, dict) and "action_type" in data:
-                    try:
-                        return AgentAction(**data)
-                    except ValidationError:
-                        # Schema-invalid candidate (e.g. a quoted example or
-                        # truncated object) — keep scanning; a valid action
-                        # may still appear later in the response. JSON keys
-                        # are always strings, so TypeError cannot occur here.
-                        pass
+                    # Schema-invalid candidates (e.g. a quoted example or
+                    # truncated object) are recorded and scanning continues;
+                    # a valid action may still appear later in the response.
+                    action = _try_build(data)
+                    if action is not None:
+                        return action
                 search_end = start
+
+        if validation_error is not None:
+            # The response DID contain an action object — it just failed
+            # schema validation (e.g. a click with neither ref nor
+            # coordinate). Surface the validator's own message so the
+            # correction retry tells the model exactly what to fix.
+            details = "; ".join(
+                err.get("msg", "invalid value")
+                for err in validation_error.errors()[:3]
+            )
+            raise ValueError(f"Action JSON failed validation: {details}")
 
         # Show context in error
         preview = text[:500] if len(text) > 500 else text

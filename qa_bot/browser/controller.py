@@ -39,6 +39,15 @@ MAIN_FRAME_MAX_REFS = 500
 
 DUPLICATE_REF_PREFIX = "[duplicate-ref] "
 
+# Explicit timeout for ref-based element interactions, shorter than the
+# browser context default (10s). get_element_by_ref has already verified the
+# element exists, so actionability (visible/stable/receives events) should
+# resolve in well under 5s — a longer wait almost always means an
+# overlay/modal is covering the element. Failing fast returns the turn to
+# the AI with a corrective error (see worker._execute_action) instead of
+# burning 10s per doomed attempt.
+REF_ACTION_TIMEOUT_MS = 5_000
+
 # _pending_requests pruning: entries whose response/failure event never fired
 # (page closed mid-flight) are dropped once the dict grows past the prune
 # size and they are older than the max age.
@@ -1187,7 +1196,7 @@ class BrowserController:
             ref: The ref string (e.g., "ref_5")
         """
         locator = await self.get_element_by_ref(ref)
-        await locator.click()
+        await locator.click(timeout=REF_ACTION_TIMEOUT_MS)
 
     async def right_click_ref(self, ref: str) -> None:
         """
@@ -1197,7 +1206,7 @@ class BrowserController:
             ref: The ref string (e.g., "ref_5")
         """
         locator = await self.get_element_by_ref(ref)
-        await locator.click(button="right")
+        await locator.click(button="right", timeout=REF_ACTION_TIMEOUT_MS)
 
     async def double_click_ref(self, ref: str) -> None:
         """
@@ -1207,7 +1216,7 @@ class BrowserController:
             ref: The ref string (e.g., "ref_5")
         """
         locator = await self.get_element_by_ref(ref)
-        await locator.dblclick()
+        await locator.dblclick(timeout=REF_ACTION_TIMEOUT_MS)
 
     async def triple_click_ref(self, ref: str) -> None:
         """
@@ -1217,7 +1226,7 @@ class BrowserController:
             ref: The ref string (e.g., "ref_5")
         """
         locator = await self.get_element_by_ref(ref)
-        await locator.click(click_count=3)
+        await locator.click(click_count=3, timeout=REF_ACTION_TIMEOUT_MS)
 
     async def hover_ref(self, ref: str) -> None:
         """
@@ -1227,7 +1236,7 @@ class BrowserController:
             ref: The ref string (e.g., "ref_5")
         """
         locator = await self.get_element_by_ref(ref)
-        await locator.hover()
+        await locator.hover(timeout=REF_ACTION_TIMEOUT_MS)
 
     async def scroll_to_ref(self, ref: str) -> None:
         """
@@ -1248,7 +1257,7 @@ class BrowserController:
             text: Text to fill
         """
         locator = await self.get_element_by_ref(ref)
-        await locator.fill(text)
+        await locator.fill(text, timeout=REF_ACTION_TIMEOUT_MS)
 
     def _parse_and_format_date(self, value: str, target_format: str) -> str:
         """

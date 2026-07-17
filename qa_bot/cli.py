@@ -205,12 +205,23 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
             description = data.get("description", "")
             worker_id = data.get("worker_id", "")
             if action_type in ("left_click", "right_click", "double_click", "triple_click"):
-                element = data.get("element", "unknown element")
                 ref = data.get("ref", "")
+                coordinate = data.get("coordinate")
+                # Fall back to whatever target info exists — a missing
+                # `element` label must not hide the ref/coordinate the model
+                # actually targeted (log forensics for coordinate clicks)
+                element = data.get("element") or ref or (
+                    f"coordinate {tuple(coordinate)}" if coordinate else "unknown element"
+                )
                 click_name = action_type.replace("_", " ").title()
-                return f"[{timestamp}] [Action] {click_name}: {element}" + (f" ({ref})" if ref else "")
+                suffix = f" ({ref})" if ref and element != ref else ""
+                return f"[{timestamp}] [Action] {click_name}: {element}{suffix}"
             elif action_type == "hover":
-                element = data.get("element", "unknown element")
+                ref = data.get("ref", "")
+                coordinate = data.get("coordinate")
+                element = data.get("element") or ref or (
+                    f"coordinate {tuple(coordinate)}" if coordinate else "unknown element"
+                )
                 return f"[{timestamp}] [Action] Hover: {element}"
             elif action_type == "type":
                 element = data.get("element", "unknown element")

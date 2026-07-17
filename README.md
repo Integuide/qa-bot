@@ -197,6 +197,13 @@ QA Bot tracks API costs in real-time and stops when limits are reached:
 
 Adjust with `max-cost` and `max-duration` inputs.
 
+When the budget runs out mid-run, flows are cut off in queue order — so the
+bot schedules flows that match the `goal` text first and tells workers to
+wrap up early as the limit approaches. A specific `goal` (naming the features
+to verify) therefore buys much better coverage per dollar than a generic one.
+If a run's report says goal-critical flows were still untested at the cost
+limit, raise `max-cost` for that workflow.
+
 ## Issue Severity
 
 Issues are categorized by severity:
