@@ -16,6 +16,8 @@ from qa_bot.browser.controller import (
     BrowserController,
     BENIGN_FAILURE_REASONS,
     DuplicateRefError,
+    NativeSelectClickError,
+    SelectOptionNotFoundError,
     StaleRefError,
     REF_ACTION_TIMEOUT_MS,
 )
@@ -1779,6 +1781,9 @@ class FlowExplorationWorker:
                     await browser.click_ref(action.ref)
                 elif action.coordinate is not None:
                     x, y = action.coordinate
+                    select_options = await browser.select_options_at_point(x, y)
+                    if select_options is not None:
+                        raise NativeSelectClickError(f"({x}, {y})", select_options)
                     await browser.active_page.mouse.click(x, y)
                 else:
                     return ActionResult(
@@ -1813,6 +1818,9 @@ class FlowExplorationWorker:
                     await browser.double_click_ref(action.ref)
                 elif action.coordinate is not None:
                     x, y = action.coordinate
+                    select_options = await browser.select_options_at_point(x, y)
+                    if select_options is not None:
+                        raise NativeSelectClickError(f"({x}, {y})", select_options)
                     await browser.active_page.mouse.dblclick(x, y)
                 else:
                     return ActionResult(
@@ -1830,6 +1838,9 @@ class FlowExplorationWorker:
                     await browser.triple_click_ref(action.ref)
                 elif action.coordinate is not None:
                     x, y = action.coordinate
+                    select_options = await browser.select_options_at_point(x, y)
+                    if select_options is not None:
+                        raise NativeSelectClickError(f"({x}, {y})", select_options)
                     await browser.active_page.mouse.click(x, y, click_count=3)
                 else:
                     return ActionResult(
@@ -2206,6 +2217,25 @@ class FlowExplorationWorker:
             return ActionResult(
                 success=False,
                 message=f"Multiple elements match {e.ref}",
+                corrective_error=True,
+                error=str(e)
+            )
+
+        except NativeSelectClickError as e:
+            # Clicking a native <select> can never work (the open dropdown
+            # is an OS overlay invisible in screenshots) — hand the turn
+            # back with the option list and the form_input steer.
+            return ActionResult(
+                success=False,
+                message=f"Refused click on native <select> {e.target}",
+                corrective_error=True,
+                error=str(e)
+            )
+
+        except SelectOptionNotFoundError as e:
+            return ActionResult(
+                success=False,
+                message=f"No matching option on {e.ref}",
                 corrective_error=True,
                 error=str(e)
             )

@@ -29,6 +29,7 @@ Each turn:
 Respond with a single JSON object, written in your regular response text — a reply whose only content is thinking cannot be executed. Use ref strings like "ref_1", "ref_2" from the element list.
 
 Element actions (clicks, hover, type, scroll_to) take a "ref" from the CURRENT Interactive Elements list; clicks and hover may instead take a "coordinate" [x, y] read from the screenshot when the target has no ref.
+**Never click a native `<select>` dropdown** (by ref OR coordinate): the opened option list is drawn by the OS and is INVISIBLE in screenshots, so follow-up clicks aimed at its options actually hit whatever page element sits underneath. Always drive selects with form_input, passing the option's visible label (or value).
 **Refs are renumbered on EVERY turn** — only refs from the current turn's list are valid. Reusing a ref number from an earlier turn may silently target a different element.
 
 **Click an element:**
@@ -53,6 +54,7 @@ Element actions (clicks, hover, type, scroll_to) take a "ref" from the CURRENT I
 {"action_type": "form_input", "ref": "ref_7", "value": true, "reasoning": "Checking the terms checkbox"}
 {"action_type": "form_input", "ref": "ref_9", "value": "Option 2", "reasoning": "Selecting dropdown option"}
 {"action_type": "form_input", "ref": "ref_11", "value": "15/01/1990", "reasoning": "Setting date of birth"}
+form_input is the ONLY way to operate a `<select>` dropdown — clicking one open cannot work (see above). For selects, "value" matches the option's value or visible label; if no option matches you'll get the real option list back to retry with.
 
 **Scroll the page:**
 {"action_type": "scroll", "scroll_direction": "down", "scroll_amount": 3, "reasoning": "Scrolling to see more content"}

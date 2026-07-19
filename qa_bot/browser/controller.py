@@ -93,6 +93,66 @@ class DuplicateRefError(Exception):
         )
 
 
+# Cap on option labels echoed back in select-related corrective errors —
+# a huge <select> (country lists) must not flood the action history.
+_MAX_SELECT_OPTIONS_SHOWN = 20
+
+
+class NativeSelectClickError(Exception):
+    """Raised when a click action targets a native ``<select>`` element.
+
+    Clicking a native select "opens" a dropdown the automation can never
+    operate: the option list is drawn as an OS-level overlay that does NOT
+    appear in screenshots, so the AI's follow-up clicks are aimed at an
+    invisible list and land on whatever page element sits underneath (seen
+    live: coordinate clicks meant for a model dropdown hitting the form
+    field below it). form_input drives selects reliably via select_option,
+    so a click on one is always a mistake worth correcting immediately.
+
+    Attributes:
+        target: Human-readable target ("ref_5" or "(x, y)").
+        options: Visible labels of the select's options.
+    """
+
+    def __init__(self, target: str, options: list[str]):
+        self.target = target
+        self.options = options
+        shown = ", ".join(repr(o) for o in options[:_MAX_SELECT_OPTIONS_SHOWN])
+        if len(options) > _MAX_SELECT_OPTIONS_SHOWN:
+            shown += f", ... ({len(options)} total)"
+        super().__init__(
+            f"{target} is a native <select> dropdown — clicking it opens an "
+            f"overlay that is NOT visible in screenshots, so neither clicks "
+            f"nor coordinates can choose an option. Use form_input with the "
+            f"option's label or value instead. "
+            f"Available options: {shown or 'none'}."
+        )
+
+
+class SelectOptionNotFoundError(Exception):
+    """Raised when form_input names an option a ``<select>`` doesn't have.
+
+    Playwright's select_option would otherwise auto-wait its full timeout
+    for an option that will never exist, and the resulting timeout message
+    ("not clickable within 5s") sends the AI down the wrong path — toward
+    clicking the dropdown open. Failing fast with the real option list is
+    a corrective the AI can act on next turn.
+    """
+
+    def __init__(self, ref: str, value: str, options: list[str]):
+        self.ref = ref
+        self.value = value
+        self.options = options
+        shown = ", ".join(repr(o) for o in options[:_MAX_SELECT_OPTIONS_SHOWN])
+        if len(options) > _MAX_SELECT_OPTIONS_SHOWN:
+            shown += f", ... ({len(options)} total)"
+        super().__init__(
+            f"{ref} is a <select> with no option matching {value!r}. "
+            f"Available options: {shown or 'none'}. Retry form_input with "
+            f"one of these labels (or its value) exactly."
+        )
+
+
 # Browser-initiated abort reasons that are not real failures.
 # These occur during normal navigation, ad-blocking, or page unload.
 # Shared with qa_bot.orchestrator.worker.classify_network_failure (Layer 2).
@@ -1188,6 +1248,53 @@ class BrowserController:
             descriptions.append(desc)
         return descriptions
 
+    # Returns the option labels when the element is a native <select>,
+    # else null. Used to refuse dropdown-opening clicks (see
+    # NativeSelectClickError) with an actionable option list.
+    _SELECT_OPTIONS_IF_SELECT_SCRIPT = (
+        "el => el.tagName && el.tagName.toLowerCase() === 'select'"
+        " ? Array.from(el.options).map("
+        "o => (o.label || o.textContent || '').trim())"
+        " : null"
+    )
+
+    async def _reject_native_select_click(self, locator, target: str) -> None:
+        """Raise NativeSelectClickError if the locator is a native <select>.
+
+        Best-effort: an introspection failure must never block a click on a
+        normal element, so any evaluate error falls through silently.
+        """
+        try:
+            options = await locator.evaluate(
+                self._SELECT_OPTIONS_IF_SELECT_SCRIPT
+            )
+        except PlaywrightError:
+            return
+        if options is not None:
+            raise NativeSelectClickError(target, options)
+
+    async def select_options_at_point(
+        self, x: int, y: int
+    ) -> Optional[list[str]]:
+        """Option labels if the element at viewport (x, y) is a native
+        <select>, else None. Guards coordinate clicks the same way
+        _reject_native_select_click guards ref clicks. Best-effort: any
+        evaluate failure returns None (never blocks the click)."""
+        page = self.active_page
+        if not page:
+            return None
+        try:
+            return await page.evaluate(
+                "([x, y]) => { const el = document.elementFromPoint(x, y);"
+                " return el && el.tagName.toLowerCase() === 'select'"
+                " ? Array.from(el.options).map("
+                "o => (o.label || o.textContent || '').trim())"
+                " : null; }",
+                [x, y],
+            )
+        except PlaywrightError:
+            return None
+
     async def click_ref(self, ref: str) -> None:
         """
         Click an element by its ref (left click).
@@ -1196,6 +1303,7 @@ class BrowserController:
             ref: The ref string (e.g., "ref_5")
         """
         locator = await self.get_element_by_ref(ref)
+        await self._reject_native_select_click(locator, ref)
         await locator.click(timeout=REF_ACTION_TIMEOUT_MS)
 
     async def right_click_ref(self, ref: str) -> None:
@@ -1216,6 +1324,7 @@ class BrowserController:
             ref: The ref string (e.g., "ref_5")
         """
         locator = await self.get_element_by_ref(ref)
+        await self._reject_native_select_click(locator, ref)
         await locator.dblclick(timeout=REF_ACTION_TIMEOUT_MS)
 
     async def triple_click_ref(self, ref: str) -> None:
@@ -1226,6 +1335,7 @@ class BrowserController:
             ref: The ref string (e.g., "ref_5")
         """
         locator = await self.get_element_by_ref(ref)
+        await self._reject_native_select_click(locator, ref)
         await locator.click(click_count=3, timeout=REF_ACTION_TIMEOUT_MS)
 
     async def hover_ref(self, ref: str) -> None:
@@ -1371,8 +1481,7 @@ class BrowserController:
         input_type = await locator.evaluate("el => el.type || ''")
 
         if tag_name == "select":
-            # For select elements, use select_option
-            await locator.select_option(str(value))
+            await self._select_dropdown_option(locator, ref, str(value))
         elif input_type in ("checkbox", "radio"):
             # For checkboxes/radios, check or uncheck based on bool value
             is_checked = await locator.is_checked()
@@ -1432,6 +1541,66 @@ class BrowserController:
         else:
             # For text inputs, textareas, etc., use fill
             await locator.fill(str(value))
+
+    async def _select_dropdown_option(
+        self, locator, ref: str, value: str
+    ) -> None:
+        """Select an option on a native <select>, matching value OR label.
+
+        Playwright's bare select_option(str) matches the option *value*
+        attribute only, but the AI works from screenshots and naturally
+        supplies the *visible label* (which on dynamic dropdowns rarely
+        equals the value — e.g. label "Claude Opus (~8x $)" over value
+        "claude-opus-x"). A miss would auto-wait the full timeout and
+        surface as a misleading "not clickable" error, steering the AI
+        toward clicking the dropdown open (which cannot work — see
+        NativeSelectClickError). So resolve the option ourselves:
+        exact value → exact label → case/whitespace-insensitive label →
+        unambiguous label prefix/substring; no match raises
+        SelectOptionNotFoundError listing the real options.
+        """
+        options = await locator.evaluate(
+            "el => Array.from(el.options).map((o, index) => ({"
+            "index, value: o.value, "
+            "label: (o.label || o.textContent || '').trim()}))"
+        )
+
+        def norm(s: str) -> str:
+            return " ".join(s.split()).casefold()
+
+        target = value.strip()
+        match = next(
+            (o for o in options if o["value"] == target), None
+        )
+        if match is None:
+            match = next(
+                (o for o in options if o["label"] == target), None
+            )
+        if match is None:
+            match = next(
+                (o for o in options if norm(o["label"]) == norm(target)),
+                None,
+            )
+        if match is None and target:
+            # Tolerate decorated labels ("Claude Opus (~8x $)") — but only
+            # when exactly one option matches, so "Claude" against a list
+            # of Claude models stays an error rather than a silent guess.
+            partial = [
+                o for o in options if norm(o["label"]).startswith(norm(target))
+            ] or [o for o in options if norm(target) in norm(o["label"])]
+            if len(partial) == 1:
+                match = partial[0]
+
+        if match is None:
+            raise SelectOptionNotFoundError(
+                ref, value, [o["label"] for o in options]
+            )
+
+        # Select by index, not value — duplicate or empty value attributes
+        # would otherwise resolve to the wrong option.
+        await locator.select_option(
+            index=match["index"], timeout=REF_ACTION_TIMEOUT_MS
+        )
 
     async def drag(
         self,

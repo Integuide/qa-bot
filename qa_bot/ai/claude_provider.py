@@ -49,6 +49,33 @@ PARSE_CORRECTION_PROMPT = (
 # Ephemeral cache has a 5-minute TTL - sufficient for multi-turn conversations
 CACHE_CONTROL_EPHEMERAL = {"type": "ephemeral"}
 
+# History windowing for long worker flows.
+#
+# Every turn re-sends the full text conversation (each user turn carries the
+# complete action prompt: ref list, recap, boilerplate — several K tokens), so
+# an uncapped flow grows quadratically in cost and, deep into a flow, the
+# request gets large enough to feed the intermittent "thinking-only / no text"
+# response failure mode (2026-07-17 prod QA run: the image-fallback flow died
+# to it twice, ~46 turns deep, with the run's token counter moving ~100K per
+# turn). Windowing bounds both. Continuity survives trimming because every
+# turn's prompt independently carries the flow goal (system prompt) and a
+# recent-actions recap (action_history), and an omission note tells the model
+# the tail was cut.
+#
+# The boundary is stepped, not a pure sliding tail: dropping `len - KEEP`
+# messages each call would shift the kept prefix every turn and defeat prompt
+# caching. Instead the drop count rounds up to a multiple of
+# HISTORY_TRIM_STEP, so the boundary only jumps every STEP/2 turns (a turn
+# appends 2 messages) — one cache re-write per jump instead of one per turn.
+# The kept window oscillates between (WINDOW - STEP) and WINDOW messages.
+HISTORY_WINDOW_MESSAGES = 60  # ~30 exchanges; only histories beyond this are trimmed
+HISTORY_TRIM_STEP = 20  # drop count rounds up to a multiple of this
+HISTORY_OMITTED_NOTE = (
+    "[Context note: the earliest {count} messages of this session were "
+    "omitted to keep the conversation compact. Rely on the Recent Actions "
+    "list in the current prompt and your flow goal for continuity.]"
+)
+
 
 # Model-id prefixes that REQUIRE adaptive thinking (they reject the legacy
 # enabled+budget_tokens form with HTTP 400). Keyed on the config constants so it
@@ -158,7 +185,8 @@ class ClaudeProvider(AIProvider):
     def _build_messages_from_history(
         conversation_history: list[dict],
     ) -> list[dict]:
-        """Build messages list from conversation history, stripping screenshots.
+        """Build messages list from conversation history, stripping screenshots
+        and windowing long histories.
 
         Replaces **all** image blocks with a lightweight text placeholder.
         Only the *current turn* (appended by the caller) carries a real
@@ -166,13 +194,35 @@ class ClaudeProvider(AIProvider):
         Anthropic prompt-caching can reuse it, and avoids resending large
         base64 payloads that the model has already seen.
 
+        Histories longer than HISTORY_WINDOW_MESSAGES are trimmed to a recent
+        window (stepped boundary — see the constant's comment for the caching
+        rationale) with a leading user note stating how many messages were
+        omitted.  Windowing happens here, at message-build time, so the
+        stored history stays complete for checkpoints and flow forking.
+
         The original ``conversation_history`` is NOT mutated.
         """
         if not conversation_history:
             return []
 
         messages: list[dict] = []
-        for msg in conversation_history:
+
+        window = conversation_history
+        if len(conversation_history) > HISTORY_WINDOW_MESSAGES:
+            over = len(conversation_history) - HISTORY_WINDOW_MESSAGES
+            # Round the drop count up to a step multiple so the boundary is
+            # stable across several turns (prompt-cache friendly).
+            drop = ((over + HISTORY_TRIM_STEP - 1) // HISTORY_TRIM_STEP) * HISTORY_TRIM_STEP
+            window = conversation_history[drop:]
+            messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": HISTORY_OMITTED_NOTE.format(count=drop),
+                }],
+            })
+
+        for msg in window:
             content = msg.get("content")
             if isinstance(content, list):
                 new_blocks = []
