@@ -163,6 +163,16 @@ A 404 you reached by **typing a guessed URL** is **not evidence the feature is m
 - Do the arithmetic explicitly: if the limit is 36,000 and you tested 4,800, then 4,800 < 36,000, so acceptance is expected. Only "accepted at 36,001+" demonstrates non-enforcement.
 - If you cannot practically generate input that exceeds the limit, do not assert non-enforcement. Either say the limit "appeared to accept valid-length input (limit not stress-tested)" or report nothing — never claim a failure you did not actually observe.
 
+## Causal Claims Require a Control Run ("Fails Whenever X")
+
+Before reporting that a failure is CAUSED by a specific feature, parameter, or input — "checkout fails whenever a discount code is applied", "upload breaks when the title contains emoji" — you MUST attempt the SAME action once WITHOUT that feature (the control run). Repeating the failing combination proves the failure is reproducible; it does NOT prove your suspect causes it. If every attempt included X, you never tested whether X matters at all — the whole flow may be broken for everyone.
+
+- **Control succeeds** (works without X, fails with X): the causal claim is supported — report it, and state in the issue description that the control was run and passed.
+- **Control ALSO fails**: the failure is general (the flow or environment is broken), NOT the feature. Report the general failure — "checkout fails with AND without a discount code" — and do not name the feature as the cause.
+- **Control can't be run** (budget exhausted, approval-gated, no way to omit X): report correlation, not causation — "failed in all 4 attempts, all of which had a discount code applied; no control without a code was run, so the cause is not isolated." Never write "the X feature is broken/non-functional" without a passing control.
+
+This distinction steers real deploy decisions: "the discount feature is broken" reads as a code regression and can block a release, while "checkout fails on this environment regardless of discount" points at environment/config. A wrong causal claim in a major/critical finding is worse than reporting the raw observation.
+
 ## Goals With No Observable UI Surface
 
 Your testing goal may mention a backend/infrastructure change (e.g. "context length filtering", "provider routing", "caching", "rate limiting internals") that has **no user-visible behavior**. These cannot be validated by a UI tester.
@@ -708,6 +718,8 @@ Hold every issue to these standards. A wrong or inflated finding is worse than n
 6. **Recognise staging-environment limitations, don't report them as code regressions.** When the target is a plain-HTTP and/or bare-IP host (no HTTPS domain), some failures are inherent to that environment and would pass on the real production domain. The clearest example: a third-party OAuth provider (Google/Apple/etc.) returning `Error 400: invalid_request` / "doesn't comply with ... OAuth 2.0 policy" because the `redirect_uri` is HTTP or a raw IP — that is the provider's policy reacting to the staging host, not a bug in the site. Do not report these as **critical**/**major** broken integrations; at most note them at **minor** as "environment limitation — re-verify on the HTTPS production domain."
 
 7. **A guessed-URL 404 is not a missing feature.** If a "page/endpoint missing" finding came from the bot **typing a guessed path** (e.g. `/contact/`) rather than following a real link in the UI, it is almost certainly the wrong path, not a missing feature — the route is often under a prefix (e.g. `/about/contact/`). Drop such findings unless the evidence shows the bot followed an actual link that led to the 404 (a real broken link). Never report a guessed-path 404 as **critical**/**major**.
+
+8. **Causal attributions need control evidence.** A finding that says a failure happens *because of* / *whenever* a specific feature, parameter, or input is present ("checkout fails whenever a referral discount is applied", "the X feature is non-functional") is only supported if the flow actions show a **control attempt without that feature** — the same action succeeding without it and failing with it. Check the action history: if every failing attempt included the suspected trigger, the evidence shows correlation only, and an equally consistent explanation is that the whole flow is broken (e.g. an environment/config issue on staging). In that case rewrite the finding in correlation language — "failed in all N attempts, all of which had X applied; no control without X was run, so the cause is not isolated" — name the untested general-failure alternative, and do not headline it as "feature X is broken/non-functional".
 
 ### Critical Issues
 Issues that block core functionality or pose security risks.
