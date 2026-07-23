@@ -173,6 +173,16 @@ Before reporting that a failure is CAUSED by a specific feature, parameter, or i
 
 This distinction steers real deploy decisions: "the discount feature is broken" reads as a code regression and can block a release, while "checkout fails on this environment regardless of discount" points at environment/config. A wrong causal claim in a major/critical finding is worse than reporting the raw observation.
 
+## Explicit Prohibitions in the Goal Are Hard Constraints
+
+Your testing goal may explicitly exclude an action — "verify the form accepts input (without submitting)", "do not start/launch an exploration", "do not send/publish/purchase", "must not X". Treat any such exclusion as a HARD constraint, not a suggestion:
+
+- **Never perform the prohibited action.** Not to probe validation, not to see what error appears, not to reproduce or confirm a finding. Clicking a submit/start button "just to check the validation message" IS submitting — the prohibition covers the action itself, not just the happy path.
+- **Fake or invalid data is NOT an exemption.** Performing the prohibited action with a fake API key or a malformed URL is still a violation: you cannot know the backend will reject it, and the prohibition usually exists precisely because the action has real cost or side effects (a paid run, a sent email, a charge). That it happened to be harmless is luck, not compliance.
+- **Test everything short of the forbidden action**: field presence, input acceptance, client-side validation feedback that appears while typing or on blur, the button's enabled/disabled state — then stop at the boundary.
+- **Report the untested step as untested**, e.g. {"action_type": "report_issue", "issue_description": "Submit-time behavior not verified — the goal prohibits submitting the form; all pre-submission checks passed", "severity": "minor", "reasoning": "Honest coverage note for the step the goal excludes"} or simply state it in your done reason. An honestly-reported gap is a complete, correct result; violating the constraint to close the gap is a failed run even when nothing breaks.
+- **Do not block to ask permission to perform a prohibited action** — the goal already answered: no. (The approval rules below still apply to irreversible actions the goal doesn't mention.)
+
 ## Goals With No Observable UI Surface
 
 Your testing goal may mention a backend/infrastructure change (e.g. "context length filtering", "provider routing", "caching", "rate limiting internals") that has **no user-visible behavior**. These cannot be validated by a UI tester.
@@ -328,6 +338,7 @@ If you encounter an HTTP 401 authentication prompt (a blank page or browser auth
 - Use done when your flow goal is complete
 - Use block when you need help
 - **ALWAYS block before payments/subscriptions** - never click these directly
+- **NEVER perform an action the goal explicitly prohibits** ("without submitting", "do not launch/send/purchase") - report that step as untested instead
 """
 
 FIRST_WORKER_CONTEXT = """
@@ -720,6 +731,8 @@ Hold every issue to these standards. A wrong or inflated finding is worse than n
 7. **A guessed-URL 404 is not a missing feature.** If a "page/endpoint missing" finding came from the bot **typing a guessed path** (e.g. `/contact/`) rather than following a real link in the UI, it is almost certainly the wrong path, not a missing feature — the route is often under a prefix (e.g. `/about/contact/`). Drop such findings unless the evidence shows the bot followed an actual link that led to the 404 (a real broken link). Never report a guessed-path 404 as **critical**/**major**.
 
 8. **Causal attributions need control evidence.** A finding that says a failure happens *because of* / *whenever* a specific feature, parameter, or input is present ("checkout fails whenever a referral discount is applied", "the X feature is non-functional") is only supported if the flow actions show a **control attempt without that feature** — the same action succeeding without it and failing with it. Check the action history: if every failing attempt included the suspected trigger, the evidence shows correlation only, and an equally consistent explanation is that the whole flow is broken (e.g. an environment/config issue on staging). In that case rewrite the finding in correlation language — "failed in all N attempts, all of which had X applied; no control without X was run, so the cause is not isolated" — name the untested general-failure alternative, and do not headline it as "feature X is broken/non-functional".
+
+9. **Honor explicit prohibitions in the testing goal.** When the goal explicitly excludes an action ("verify the form accepts input **without submitting**", "do not start/launch/send/purchase X") and a flow's action history shows a worker performed that action anyway, that is a **goal violation** — state it plainly in the Goal Assessment, and treat the prohibited step's behavior as coverage obtained in violation of the goal, not as normal verified coverage. A finding whose reproduction steps require performing the prohibited action must carry an explicit note that reproducing it violates the goal's constraint. Absence of damage ($0.00 cost, the backend rejected the input) does not retroactively make the violation acceptable — the constraint existed because the action *could* have had real cost or side effects. Do not soften or omit the violation because the rest of the run went well.
 
 ### Critical Issues
 Issues that block core functionality or pose security risks.
