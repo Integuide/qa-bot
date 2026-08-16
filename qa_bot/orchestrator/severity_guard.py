@@ -32,6 +32,19 @@ severity so they can never, on their own, fail a deploy:
    UI. A guessed path that 404s is not evidence of a missing feature. Capped
    to ``minor``.
 
+4. **Worker-tagged known issues** -- a description starting with ``[KNOWN]``
+   (tolerating markdown decoration a half-obeying model plausibly adds:
+   ``**[KNOWN]**``, ``[Known]``, ``- [KNOWN]``), the marker the worker prompt
+   tells the model to emit when an observation
+   matches the operator-provided known-issues list. The semantic *matching* of
+   findings against that list deliberately stays with the model (no reliable
+   textual signature), but the prefix itself is deterministic: an issue the
+   worker has explicitly tagged as already-acknowledged must never fail a
+   deploy on its own, even if the model then contradicts itself on severity.
+   Safe because the prompt forbids tagging materially-worse/different behavior
+   ``[KNOWN]`` -- a real regression in a known-issue area arrives untagged and
+   keeps its severity. Capped to ``minor``.
+
 This guard only ever **lowers** severity, never raises it, and it is
 intentionally conservative: it matches specific, high-confidence phrases so it
 won't mask genuine app regressions (a real broken click that surfaces a JS
@@ -167,6 +180,16 @@ _GUESSED_PATH_PATTERNS = [
 ]
 
 
+# 4. Worker-tagged known issues ----------------------------------------------
+# The tag must sit at the START of the description -- that anchor is what makes
+# the cap safe (a mid-sentence mention of a known issue is not a self-tag). But
+# this class exists as a backstop for a HALF-obeying model, and a half-obeying
+# model plausibly decorates the tag: "**[KNOWN]**", "[Known]", "- [KNOWN]". So
+# tolerate leading whitespace, a list marker ("-"/"*" plus space), and
+# bold/emphasis asterisks, and match the tag itself case-insensitively.
+_KNOWN_TAG_PATTERN = re.compile(r"^\s*(?:[-*]\s+)?\*{0,2}\[known\]", re.IGNORECASE)
+
+
 def _matches_any(patterns, text: str) -> bool:
     return any(p.search(text) for p in patterns)
 
@@ -227,7 +250,13 @@ def cap_severity(severity: str, description: str, action_context: str = "") -> t
     normalized = (severity or "minor").strip().lower()
     text = f"{description or ''}\n{action_context or ''}"
 
-    reason = classify_non_regression(text)
+    # 4. Worker-tagged known issue. Checked on the DESCRIPTION only (a
+    #    "[KNOWN]" appearing mid-sentence, or only in the action context,
+    #    is not the worker's deliberate self-tag).
+    if _KNOWN_TAG_PATTERN.match(description or ""):
+        reason = "known_issue"
+    else:
+        reason = classify_non_regression(text)
     if reason is None:
         return normalized, None
 

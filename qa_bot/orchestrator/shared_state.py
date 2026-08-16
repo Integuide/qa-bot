@@ -151,6 +151,12 @@ class SharedFlowState:
     target_url: str
     target_domain: str
     goal: str
+    # Operator-provided known-issues/environment-caveats text (GitHub Action
+    # `known-issues` input / CLI `--known-issues`). Injected into the worker
+    # base prompt (don't re-investigate; tag matches `[KNOWN]` at minor) and
+    # the synthesis context (matches go in "Known Issues Observed Again", not
+    # the severity sections). Empty string = no known-issues list.
+    known_issues: str = ""
 
     # Configuration
     max_branches_per_flow: int = 10  # Limit branching to prevent explosion
@@ -273,6 +279,7 @@ class SharedFlowState:
         skip_permissions: bool = False,
         interactive: bool = True,
         exploration_id: Optional[str] = None,
+        known_issues: str = "",
     ) -> "SharedFlowState":
         """Create a new shared flow state with initial root flow."""
         exploration_id = exploration_id or str(uuid.uuid4())
@@ -283,6 +290,7 @@ class SharedFlowState:
             target_url=target_url,
             target_domain=target_domain,
             goal=goal,
+            known_issues=known_issues,
             max_branches_per_flow=max_branches_per_flow,
             max_duration_minutes=max_duration_minutes,
             max_cost_usd=max_cost_usd,
@@ -819,7 +827,8 @@ class SharedFlowState:
         synthesis agent's curation), so a single over-escalated observation can
         turn a clean deploy red. The guard caps well-understood non-regressions
         (the bot's own click-tooling timeouts, third-party OAuth refusing a
-        bare-IP/HTTP staging host, and guessed-URL 404s) so they can never, on
+        bare-IP/HTTP staging host, guessed-URL 404s, and worker-tagged
+        ``[KNOWN]`` known-issue observations) so they can never, on
         their own, fail a deploy. It only ever lowers severity. Mutating the
         Issue in place means the downstream ``issue`` SSE event, the synthesis
         input, and the deploy gate all see the same corrected severity.

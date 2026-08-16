@@ -16,6 +16,11 @@ inputs:
     required: false
     default: 'Explore user flows and find bugs, broken elements, or usability problems.'
 
+  known-issues:
+    description: 'Known issues / environment caveats already acknowledged by the team (free text, e.g. one per line). Matching observations are not re-investigated and appear in the report only as one-line "observed again" notes instead of new findings, so recurring test-environment artifacts stop re-appearing as headline issues run after run.'
+    required: false
+    default: ''
+
   max-agents:
     description: 'Maximum parallel AI agents (more = faster but more API usage)'
     required: false
@@ -101,6 +106,7 @@ runs:
     ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
     INPUT_URL: ${{ inputs.url }}
     INPUT_GOAL: ${{ inputs.goal }}
+    INPUT_KNOWN_ISSUES: ${{ inputs.known-issues }}
     INPUT_MAX_AGENTS: ${{ inputs.max-agents }}
     INPUT_MAX_COST: ${{ inputs.max-cost }}
     INPUT_MAX_DURATION: ${{ inputs.max-duration }}

@@ -30,6 +30,7 @@ To post the report as a PR comment, the job also needs `permissions: pull-reques
 | `url` | Yes | - | Target URL to test |
 | `anthropic-api-key` | Yes | - | Anthropic API key |
 | `goal` | No | Explore flows and find bugs | Testing focus |
+| `known-issues` | No | - | Already-acknowledged issues / environment caveats (free text, one per line). Matches aren't re-investigated and appear only as one-line "observed again" notes in the report, not as new findings |
 | `max-agents` | No | `3` | Parallel AI agents (1-10) |
 | `max-cost` | No | `5.0` | Maximum cost in USD |
 | `max-duration` | No | `30` | Maximum duration in minutes |

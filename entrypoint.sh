@@ -24,6 +24,14 @@ if [ -n "$INPUT_CREDENTIALS" ]; then
 else
     echo "Credentials: [not provided]"
 fi
+if [ -n "$INPUT_KNOWN_ISSUES" ]; then
+    # printf '%s' (no added newline) + grep -c '' counts every line exactly:
+    # `grep -c .` missed blank lines; `echo | wc -l` overcounted the YAML
+    # block scalar's trailing newline.
+    echo "Known Issues: [provided - $(printf '%s' "$INPUT_KNOWN_ISSUES" | grep -c '') line(s)]"
+else
+    echo "Known Issues: [not provided]"
+fi
 if [ -n "$TESTMAIL_API_KEY" ] && [ -n "$TESTMAIL_NAMESPACE" ]; then
     echo "Email Testing: Configured (Testmail.app) - experimental, email-reading actions not yet active"
 else
@@ -51,6 +59,13 @@ if [ "$INPUT_DANGEROUSLY_SKIP_PERMISSIONS" = "true" ]; then
     SKIP_PERMISSIONS_ARG="--dangerously-skip-permissions"
 fi
 
+# Handle known issues (multiline free text — an array keeps the value intact
+# through the unquoted-args expansion below)
+KNOWN_ISSUES_ARGS=()
+if [ -n "$INPUT_KNOWN_ISSUES" ]; then
+    KNOWN_ISSUES_ARGS=(--known-issues "$INPUT_KNOWN_ISSUES")
+fi
+
 # Run QA bot and capture output. A non-zero exit here is not necessarily
 # fatal (the CLI exits 1 when critical issues are found but still writes
 # results), so capture the exit code and decide based on the result file.
@@ -66,6 +81,7 @@ python -m qa_bot.cli "$INPUT_URL" \
     --output json \
     --output-file /tmp/qa-result.json \
     --log-level full \
+    "${KNOWN_ISSUES_ARGS[@]}" \
     $CREDS_ARGS \
     $SKIP_PERMISSIONS_ARG || CLI_EXIT=$?
 echo "::endgroup::"

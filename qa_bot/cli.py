@@ -380,7 +380,8 @@ async def run_exploration(
     log_level: LogLevel = "quiet",
     credentials: Optional[dict[str, str]] = None,
     max_cost_usd: float = 5.0,
-    skip_permissions: bool = False
+    skip_permissions: bool = False,
+    known_issues: str = ""
 ) -> dict:
     """
     Run QA exploration and return results.
@@ -397,6 +398,9 @@ async def run_exploration(
         credentials: Optional dict of credentials (e.g., {"USERNAME": "user", "PASSWORD": "pass"})
         max_cost_usd: Maximum cost in USD (default: $5.00)
         skip_permissions: If True, auto-approve all irreversible actions (dangerous!)
+        known_issues: Operator-provided known-issues/environment-caveats text;
+            workers skip re-investigating matches and the report lists them as
+            one-line "observed again" notes instead of findings
 
     Returns:
         dict with report, issues, and metadata. ``completed`` is False when the
@@ -440,7 +444,8 @@ async def run_exploration(
         goal=goal,
         max_agents=max_agents,
         max_duration_minutes=max_duration,
-        max_cost_usd=max_cost_usd
+        max_cost_usd=max_cost_usd,
+        known_issues=known_issues
     ):
         events.append(event)
         event_type = event.get("type", "")
@@ -534,6 +539,16 @@ Examples:
         "--goal", "-g",
         default="Explore user flows and find bugs, broken elements, or usability problems.",
         help="Testing goal/focus (default: general exploration)"
+    )
+    parser.add_argument(
+        "--known-issues",
+        default="",
+        help=(
+            "Known issues / environment caveats the team has already "
+            "acknowledged (free text, e.g. one per line). Workers won't "
+            "re-investigate matching observations and the report lists them "
+            "as one-line 'observed again' notes instead of new findings."
+        )
     )
     parser.add_argument(
         "--max-agents", "-a",
@@ -677,6 +692,7 @@ Examples:
         result = asyncio.run(run_exploration(
             url=args.url,
             goal=args.goal,
+            known_issues=args.known_issues,
             max_agents=args.max_agents,
             max_duration=args.max_duration,
             api_key=api_key,

@@ -365,6 +365,7 @@ class SynthesisAgent:
                 blocked_flows=blocked_flows,
                 incomplete_flows=incomplete_flows,
                 goal=shared_state.goal or "",
+                known_issues=shared_state.known_issues or "",
             )
 
             # Track token usage by type
@@ -410,6 +411,7 @@ class SynthesisAgent:
                 incomplete_flows=incomplete_flows,
                 goal=shared_state.goal or "",
                 error=str(e),
+                known_issues=shared_state.known_issues or "",
             )
 
     def generate_not_tested_report(
@@ -486,6 +488,7 @@ class SynthesisAgent:
         incomplete_flows: list[dict] | None = None,
         goal: str = "",
         error: str | None = None,
+        known_issues: str = "",
     ) -> str:
         """Generate a simple report without AI."""
         lines = [
@@ -573,5 +576,18 @@ class SynthesisAgent:
 
         if not issues:
             lines.append("**No issues found during testing.**")
+
+        if known_issues and known_issues.strip():
+            # The AI-side known-issues curation didn't run (fallback path), so
+            # surface the operator's list: issues above may match it.
+            lines.extend([
+                "",
+                "## Known Issues (operator-provided)",
+                "The following were already known before this run; issues "
+                "listed above may be re-observations of them (AI curation "
+                "was unavailable for this report):",
+                "",
+                known_issues.strip(),
+            ])
 
         return "\n".join(lines)

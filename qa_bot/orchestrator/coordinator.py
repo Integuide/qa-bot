@@ -205,6 +205,7 @@ class FlowExplorationOrchestrator:
         testmail_api_key: Optional[str] = None,
         testmail_namespace: Optional[str] = None,
         exploration_id: Optional[str] = None,
+        known_issues: str = "",
     ) -> AsyncGenerator[dict, None]:
         """
         Run flow-based parallel exploration of target URL.
@@ -245,6 +246,7 @@ class FlowExplorationOrchestrator:
             skip_permissions=self._skip_permissions,
             interactive=self._interactive,
             exploration_id=exploration_id,
+            known_issues=known_issues,
         )
 
         # Set initial credentials if provided
@@ -282,6 +284,7 @@ class FlowExplorationOrchestrator:
                 "max_duration_minutes": max_duration_minutes,
                 "max_cost_usd": max_cost_usd,
                 "has_credentials": bool(self._initial_credentials),
+                "has_known_issues": bool(known_issues),
                 "credential_keys": list(self._initial_credentials.keys()) if self._initial_credentials else [],
                 "timestamp": datetime.now().isoformat()
             }

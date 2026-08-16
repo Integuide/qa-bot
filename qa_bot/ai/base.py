@@ -165,6 +165,7 @@ class AIProvider(ABC):
         viewport_height: int = 720,
         credentials: dict[str, str] = None,
         user_data: dict[str, dict[str, str]] = None,
+        known_issues: str = "",
     ) -> AsyncGenerator[dict, None]:
         """
         Stream AI analysis for worker-based exploration.
@@ -209,6 +210,7 @@ class AIProvider(ABC):
         blocked_flows: list[dict] | None = None,
         incomplete_flows: list[dict] | None = None,
         goal: str = "",
+        known_issues: str = "",
     ) -> dict:
         """
         Generate final QA synthesis report.

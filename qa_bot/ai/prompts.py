@@ -148,6 +148,12 @@ You may be pointed at a **staging environment** served over plain HTTP on a bare
 
 If the target URL you are testing is HTTP and/or a raw IP, and you hit one of these, report it at most as a `minor` note clearly labelled as an environment limitation — e.g. "Google OAuth returns invalid_request on this staging host; expected because the redirect URI is HTTP/bare-IP, which Google rejects by policy. Should be re-verified on the HTTPS production domain." **Do not call it a broken integration or a critical regression.**
 
+## Anti-Abuse Systems Reacting to YOU, the Tester
+
+Unlike the HTTP/bare-IP limitations above, this applies on ANY target host — HTTPS staging domains included. You are an automated tester, and this run likely shares an IP address and browser fingerprint with many previous QA runs against the same site (each of which may have created accounts). Sites with anti-abuse protection can correctly flag your freshly-created account as suspicious: banners saying the account is "restricted", "flagged", "associated with" or "pattern-matched to" another account, forced extra verification steps, CAPTCHAs, or rate-limit blocks appearing right after an otherwise-clean signup.
+
+That is the site's abuse protection working as designed against repeated automated signups from one runner — a genuinely new human user on their own device would not trip it. Do NOT report it as a bug that would "alarm legitimate users" or cause signup abandonment. Report it at most ONCE at `minor`, framed as a probable test-environment artifact (e.g. "restriction banner after signup — likely the site's anti-abuse system reacting to repeated QA-runner signups from one IP/fingerprint, not something a fresh human user would see"). If it hard-blocks your flow, complete the unlock step it offers if you can (e.g. verification), otherwise report the flow as blocked and note the blocker is probably runner-specific.
+
 ## Discover URLs — Don't Guess Them
 
 To reach a page, **navigate the rendered UI**: click the real link in the nav, footer, or body. Do NOT guess a conventional path (`/contact/`, `/login/`, `/help/`) and then report a 404 as a "missing feature" — the real route is often under a prefix you haven't seen (e.g. the contact form may live at `/about/contact/`, not `/contact/`).
@@ -341,6 +347,25 @@ If you encounter an HTTP 401 authentication prompt (a blank page or browser auth
 - **NEVER perform an action the goal explicitly prohibits** ("without submitting", "do not launch/send/purchase") - report that step as untested instead
 """
 
+# Operator-provided known-issues section, appended to the shared worker base
+# prompt when the run was given a known-issues list (GitHub Action
+# `known-issues` input / CLI `--known-issues`). Per-run constant, so it lives
+# in the shared cached base block, not the per-turn user message.
+# Resolved with .replace() (NOT .format()) like the rest of the worker base:
+# the operator's free text may legitimately contain braces (JSON snippets,
+# templated error messages) and .format() would crash on them.
+KNOWN_ISSUES_WORKER_SECTION = """
+## Known Issues & Environment Caveats (operator-provided)
+
+The team running this test already knows about the following issues and test-environment artifacts:
+
+{known_issues}
+
+Do NOT spend turns re-investigating these. If you observe one of them:
+- Report it ONCE at severity `minor`, prefix the description with `[KNOWN]`, and say which known issue it matches — then move on with your flow. Do not re-verify it, do not escalate it, do not let it distract from your assigned flow.
+- ONLY report it as a normal (non-`[KNOWN]`) issue if what you observe is materially WORSE or DIFFERENT from the description above (e.g. a banner described as dismissable now hard-blocks the flow, or a new error appears in the same place) — and then describe explicitly how it differs from the known issue.
+"""
+
 FIRST_WORKER_CONTEXT = """
 ## First Worker Instructions
 
@@ -410,6 +435,7 @@ def get_worker_system_prompt_parts(
     target_domain: str = "",
     current_date: str = "",
     run_nonce: str = "",
+    known_issues: str = "",
 ) -> tuple[str, str]:
     """Get the worker system prompt as (shared base, per-worker context).
 
@@ -422,6 +448,11 @@ def get_worker_system_prompt_parts(
     current_date/run_nonce ground the model's test-data generation: the model's
     internal date is stale, and reused "unique" emails collide with accounts
     registered by previous QA runs (false "already exists" criticals).
+
+    known_issues is the operator-provided known-issues/environment-caveats
+    text (per-run constant, so it belongs in the shared base block): workers
+    stop re-investigating already-acknowledged findings and tag matching
+    observations `[KNOWN]` at minor severity instead of re-reporting them.
     """
     if not current_date:
         current_date = datetime.now().strftime("%Y-%m-%d (%A)")
@@ -435,6 +466,11 @@ def get_worker_system_prompt_parts(
     ).replace(
         "{run_nonce}", run_nonce
     )
+
+    if known_issues and known_issues.strip():
+        base += KNOWN_ISSUES_WORKER_SECTION.replace(
+            "{known_issues}", known_issues.strip()
+        )
 
     if is_first_worker:
         context = FIRST_WORKER_CONTEXT
@@ -462,6 +498,7 @@ def get_worker_system_prompt(
     target_domain: str = "",
     current_date: str = "",
     run_nonce: str = "",
+    known_issues: str = "",
 ) -> str:
     """Full worker system prompt as one string (base + per-worker context).
 
@@ -477,6 +514,7 @@ def get_worker_system_prompt(
         target_domain=target_domain,
         current_date=current_date,
         run_nonce=run_nonce,
+        known_issues=known_issues,
     )
     return base + context
 
@@ -734,6 +772,8 @@ Hold every issue to these standards. A wrong or inflated finding is worse than n
 
 9. **Honor explicit prohibitions in the testing goal.** When the goal explicitly excludes an action ("verify the form accepts input **without submitting**", "do not start/launch/send/purchase X") and a flow's action history shows a worker performed that action anyway, that is a **goal violation** — state it plainly in the Goal Assessment, and treat the prohibited step's behavior as coverage obtained in violation of the goal, not as normal verified coverage. A finding whose reproduction steps require performing the prohibited action must carry an explicit note that reproducing it violates the goal's constraint. Absence of damage ($0.00 cost, the backend rejected the input) does not retroactively make the violation acceptable — the constraint existed because the action *could* have had real cost or side effects. Do not soften or omit the violation because the rest of the run went well.
 
+10. **Match findings against the operator's known-issues list.** When the input includes a "Known Issues / Environment Caveats" section, compare every candidate finding against it before writing the report. A finding that matches a listed known issue — same behavior on the same surface; the wording does not need to match exactly, and worker issues tagged `[KNOWN]` are pre-matched — must NOT appear in the severity sections (Critical/Major/Minor/Cosmetic) and must NOT be counted in the Executive Summary's issue totals. Instead, list it as ONE line in the "Known Issues Observed Again" section, e.g. "- Post-signup restriction banner (known issue) — observed again, behavior unchanged." Two qualifications: (a) if the observed behavior is materially worse or different from the known-issue description (now hard-blocks a flow, a new error message, a different page), report the DIFFERENCE as a normal finding and state explicitly how it departs from the known issue; (b) never silently drop a matched observation — the one-line "observed again" note is what keeps a real regression in that area visible instead of masked forever.
+
 ### Critical Issues
 Issues that block core functionality or pose security risks.
 - **Include reproduction steps** derived from the flow actions where available
@@ -749,6 +789,9 @@ Small bugs and inconveniences.
 
 ### Cosmetic Issues
 Visual/styling problems.
+
+### Known Issues Observed Again
+Only when the input includes a "Known Issues / Environment Caveats" section AND findings matched it (see Report Quality Standard 10): one line per matched known issue confirming it was observed again and whether its behavior changed. Matched findings live ONLY here — not in the severity sections, not in the issue counts. Omit this section entirely when there is no known-issues list or nothing matched.
 
 ### Test Coverage
 - List each flow tested and what was validated
@@ -782,6 +825,8 @@ These finding patterns are usually caused by the testing setup, not the site. Do
 2. **Navigation timeouts**: if a worker reports pages "timing out" but other flows loaded pages from the same site fine, the cause is likely the test harness's page-load wait, not the server. Report as "needs investigation" with the affected URLs, not as a confirmed outage.
 
 3. **"Element not clickable/non-functional"** where the worker note says the element had no ref or the tool couldn't target it: that is a tooling limitation. Severity minor at most, explicitly marked unverified.
+
+4. **Anti-abuse / fraud-detection trips right after signup**: banners or blocks saying a fresh account is "restricted", "flagged", "associated with"/"pattern-matched to" another account, extra forced verification, CAPTCHAs, or rate limits appearing immediately after an otherwise-clean automated signup. The QA runner reuses one IP address and browser fingerprint across many runs (each of which may have created accounts), so the site's anti-abuse system is usually reacting — correctly — to the test setup itself; a genuinely new human user on their own device would not trip it. Do not present this as a defect that would "alarm legitimate users" or cause signup abandonment. Report it at most as a minor environment note ("probable test-runner artifact: repeated automated signups from one IP/fingerprint"), unless the evidence shows it also fires for genuinely distinct users.
 
 ## Deduplication Guidelines
 
@@ -830,7 +875,7 @@ SYNTHESIS_CONTEXT_TEMPLATE = """## QA Test Results
 
 ### Detailed Flow Summaries:
 {flow_summaries}
-{blocked_section}{incomplete_section}
+{blocked_section}{incomplete_section}{known_issues_section}
 ---
 
 Generate a comprehensive QA report based on the above findings. Use the flow action summaries to construct reproduction steps for issues."""
@@ -877,8 +922,21 @@ def format_synthesis_context(
     blocked_flows: list[dict] | None = None,
     incomplete_flows: list[dict] | None = None,
     goal: str = "",
+    known_issues: str = "",
 ) -> str:
     """Format the synthesis context for the AI."""
+
+    def format_known_issues(known_issues: str) -> str:
+        if not known_issues or not known_issues.strip():
+            return ""
+        return (
+            "\n### Known Issues / Environment Caveats (operator-provided):\n"
+            "The team already knows about these. Findings matching them belong"
+            " in the \"Known Issues Observed Again\" section as one-line notes"
+            " — NOT in the severity sections or issue counts (see Report"
+            " Quality Standard 10):\n"
+            f"{known_issues.strip()}\n"
+        )
 
     def format_issues(issues: list[dict]) -> str:
         if not issues:
@@ -977,4 +1035,5 @@ def format_synthesis_context(
         flow_summaries=format_flow_summaries(completed_flows),
         blocked_section=format_blocked_flows(blocked_flows),
         incomplete_section=format_incomplete_flows(incomplete_flows),
+        known_issues_section=format_known_issues(known_issues),
     )

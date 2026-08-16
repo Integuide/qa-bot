@@ -845,6 +845,7 @@ class FlowExplorationWorker:
                         viewport_height=viewport_size["height"],
                         credentials=credentials,
                         user_data=user_data,
+                        known_issues=self.state.known_issues,
                     ):
                         # Handle AI events
                         result = await self._handle_ai_event(

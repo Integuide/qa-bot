@@ -340,6 +340,7 @@ class ClaudeProvider(AIProvider):
         viewport_height: int = 720,
         credentials: dict[str, str] | None = None,
         user_data: dict[str, dict[str, str]] | None = None,
+        known_issues: str = "",
     ) -> AsyncGenerator[dict, None]:
         """
         Stream AI analysis for worker-based exploration.
@@ -375,6 +376,7 @@ class ClaudeProvider(AIProvider):
             target_domain=target_domain,
             run_nonce=self.run_nonce,
             current_date=self.run_date,
+            known_issues=known_issues,
         )
         system_prompt = system_base + system_worker_context  # for logging
 
@@ -970,6 +972,7 @@ class ClaudeProvider(AIProvider):
         blocked_flows: list[dict] | None = None,
         incomplete_flows: list[dict] | None = None,
         goal: str = "",
+        known_issues: str = "",
     ) -> dict:
         """
         Generate final QA synthesis report.
@@ -989,6 +992,7 @@ class ClaudeProvider(AIProvider):
             blocked_flows=blocked_flows,
             incomplete_flows=incomplete_flows,
             goal=goal,
+            known_issues=known_issues,
         )
 
         async def _make_synthesis_request():
