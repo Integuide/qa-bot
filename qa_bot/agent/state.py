@@ -12,6 +12,16 @@ class Issue:
     timestamp: datetime = field(default_factory=datetime.now)
     action_context: str = ""
     screenshot_path: str = ""  # Relative path to screenshot file on disk
+    # Attribution: which worker/flow filed the issue, on which turn (the
+    # worker's 0-based action count — matches the `TURN n` header in the
+    # worker's chat transcript and the turnNNN.png filename), and from which
+    # detector. Lets a false critical in the report or summary.json be traced
+    # straight to the model's reasoning turn instead of grepped for.
+    worker_id: str = ""
+    flow_id: str = ""
+    flow_name: str = ""
+    turn: Optional[int] = None
+    source: str = "ai"  # "ai" | "console" | "network" | "dialog"
 
     def to_dict(self) -> dict:
         result = {
@@ -19,10 +29,19 @@ class Issue:
             "severity": self.severity,
             "url": self.url,
             "timestamp": self.timestamp.isoformat(),
-            "context": self.action_context
+            "context": self.action_context,
+            "source": self.source,
         }
         if self.screenshot_path:
             result["screenshot_path"] = self.screenshot_path
+        if self.worker_id:
+            result["worker_id"] = self.worker_id
+        if self.flow_id:
+            result["flow_id"] = self.flow_id
+        if self.flow_name:
+            result["flow_name"] = self.flow_name
+        if self.turn is not None:
+            result["turn"] = self.turn
         return result
 
 

@@ -81,6 +81,7 @@ jobs:
           FLOWS: ${{ steps.qa.outputs.flows-explored }}
           ISSUES: ${{ steps.qa.outputs.issues-count }}
           CRITICAL: ${{ steps.qa.outputs.critical-issues }}
+          CURATED: ${{ steps.qa.outputs.curated-critical-issues }}
           REPORT: ${{ steps.qa.outputs.report }}
         run: |
           echo "### QA Bot Results for $INPUT_URL" >> $GITHUB_STEP_SUMMARY
@@ -89,7 +90,8 @@ jobs:
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Flows Explored | $FLOWS |" >> $GITHUB_STEP_SUMMARY
           echo "| Issues Found | $ISSUES |" >> $GITHUB_STEP_SUMMARY
-          echo "| Critical Issues | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical (raw worker findings) | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical (after curation) | ${CURATED:-n/a} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Full Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY

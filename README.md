@@ -31,13 +31,16 @@ To post the report as a PR comment, the job also needs `permissions: pull-reques
 | `anthropic-api-key` | Yes | - | Anthropic API key |
 | `goal` | No | Explore flows and find bugs | Testing focus |
 | `known-issues` | No | - | Already-acknowledged issues / environment caveats (free text, one per line). Matches aren't re-investigated and appear only as one-line "observed again" notes in the report, not as new findings |
-| `max-agents` | No | `3` | Parallel AI agents (1-10) |
-| `max-cost` | No | `5.0` | Maximum cost in USD |
-| `max-duration` | No | `30` | Maximum duration in minutes |
+| `previous-report` | No | - | The previous run's report for the same target (path to its `report.md`, or the markdown inline). Findings are labelled **NEW** / **recurring (seen in previous run)** and previous findings not observed are listed once (never as "fixed"); the PR footer prints "N new, M recurring". Labels only — severity never changes; use `known-issues` to acknowledge a finding |
+| `mode` | No | `full` | `full` explores user flows against the goal; `smoke` runs one turn-capped worker that opens each top-level navigation link once (no sign-up/login/forms, no flow forking, `goal` ignored) and tags the report and PR comment "SMOKE TEST ONLY — not a regression test". For deploys that don't change the surface under test |
+| `max-agents` | No | `3` (smoke: `1`) | Parallel AI agents (1-10). Empty = the default for the mode |
+| `max-cost` | No | `5.0` (smoke: `0.75`) | Maximum cost in USD. Empty = the default for the mode |
+| `max-duration` | No | `30` (smoke: `5`) | Maximum duration in minutes. Empty = the default for the mode |
 | `model` | No | `claude-sonnet-5` | Claude model |
 | `post-comment` | No | `true` | Post results as PR comment |
+| `comment-mode` | No | `update` | On re-runs, `update` edits the earlier QA Bot report comment in place (one current report per PR); `new` posts a fresh comment and collapses the earlier one under a "Superseded QA Bot report" summary |
 | `github-token` | No | - | GitHub token for PR comments. Pass `${{ github.token }}` when `post-comment` is `true` |
-| `fail-on-critical` | No | `true` | Fail workflow on critical issues |
+| `fail-on-critical` | No | `true` | Fail workflow on critical issues (curated report count when available, raw worker count otherwise) |
 | `fail-on-zero-flows` | No | `true` | Fail the workflow when no flows were tested at all (missing credentials, unreachable target) so an untested deploy can't read as a green check |
 | `credentials` | No | - | Test credentials (see below) |
 | `testmail-api-key` | No | - | Testmail.app API key for email flows (experimental — not yet active) |
@@ -49,18 +52,27 @@ To post the report as a PR comment, the job also needs `permissions: pull-reques
 | Output | Description |
 |--------|-------------|
 | `report` | Markdown QA report with findings |
-| `issues-count` | Total number of issues found |
-| `critical-issues` | Number of critical issues |
-| `flows-explored` | Number of user flows tested |
+| `issues-count` | Total number of issues found (raw, pre-synthesis) |
+| `critical-issues` | Number of critical issues — raw worker-reported count (pre-curation). Gates `fail-on-critical` only when `curated-critical-issues` is empty |
+| `curated-critical-issues` | Critical issues in the synthesized report after curation — drives `fail-on-critical` whenever present (empty when no AI verdict was available; the raw count gates then) |
+| `flows-explored` | Number of user flows tested to completion (the initial flow-enumeration step is not counted) |
 | `cost-usd` | Estimated Claude API cost of the run in USD |
+| `mode` | The run mode that produced the report: `full` or `smoke` |
+| `new-findings` / `recurring-findings` | Findings labelled NEW / recurring against `previous-report` (empty when none was supplied or no curated verdict) |
 
-## Issue Screenshots
+## Issue Screenshots and Run Files
 
 When the bot captures visual evidence for an issue, it exports the PNGs to a
-`qa-bot-screenshots/` directory in the workspace. Add an
+`qa-bot-screenshots/` directory in the workspace, together with the run's
+credential-masked `report.md` and `summary.json`. Upload `report.md` under a
+stable per-target artifact name and pass its text back as `previous-report`
+on the next run to get NEW / recurring labels (the Integuide monorepo
+workflows show the wiring). Add an
 `actions/upload-artifact` step after the QA Bot step (shown in the examples
 below) to publish them as a workflow artifact — the PR comment points
-reviewers at that artifact whenever screenshots were captured.
+reviewers at that artifact whenever screenshots were captured, and the report
+cites each finding's screenshot by filename (e.g. `issue_003.png`) so it can
+be found in the artifact.
 
 > **Warning:** Issue screenshots may capture authenticated pages — anything
 > visible after the bot logs in with the credentials you provide (account
@@ -220,6 +232,8 @@ Issues are categorized by severity:
 
 - Anthropic API key ([get one here](https://console.anthropic.com/))
 - Publicly accessible URL (or use a tunnel for localhost)
+
+**Re-running on the same PR?** The report comment is updated in place by default (it carries a hidden `<!-- qa-bot-report -->` marker), so a fix-and-rerun cycle never leaves a stack of stale reports. Set `comment-mode: new` to keep each run as its own comment — earlier reports are then collapsed under a "Superseded QA Bot report" summary. A run that fails before producing results always posts a separate, short failure notice.
 
 **Report not appearing as a PR comment?** Make sure the workflow passes `github-token: ${{ github.token }}` to the action and the job grants `permissions: pull-requests: write` — without both, the run completes but the comment is silently skipped.
 

@@ -21,20 +21,30 @@ inputs:
     required: false
     default: ''
 
-  max-agents:
-    description: 'Maximum parallel AI agents (more = faster but more API usage)'
+  previous-report:
+    description: 'The previous run''s report for the same target — a path to its report.md in the workspace, or the markdown itself. The report then labels each finding **NEW** or **recurring (seen in previous run)** and lists previous findings not observed this run (never as "fixed"); the PR comment footer prints "N new, M recurring". Labels only: severity is never changed and nothing is suppressed — use `known-issues` to acknowledge a finding. The action exports this run''s report.md and summary.json next to the screenshots so a workflow can upload them under a stable per-target artifact name and feed them back on the next run.'
     required: false
-    default: '3'
+    default: ''
+
+  mode:
+    description: 'Run mode: `full` (default) explores user flows in parallel against the goal; `smoke` runs the preflight probe, then a single turn-capped worker that loads the target and opens each top-level navigation link once (no sign-up/login/forms, no flow forking). In smoke mode `goal` is ignored, the limit defaults drop to 1 agent / $0.75 / 5 min, and the report and PR comment are tagged "SMOKE TEST ONLY — not a regression test". Use it for deploys that do not change the surface under test.'
+    required: false
+    default: 'full'
+
+  max-agents:
+    description: 'Maximum parallel AI agents (more = faster but more API usage). Empty = the CLI default for the mode (3, or 1 in smoke mode)'
+    required: false
+    default: ''
 
   max-cost:
-    description: 'Maximum cost in USD (default: $5.00)'
+    description: 'Maximum cost in USD. Empty = the CLI default for the mode ($5.00, or $0.75 in smoke mode)'
     required: false
-    default: '5.0'
+    default: ''
 
   max-duration:
-    description: 'Maximum exploration duration in minutes'
+    description: 'Maximum exploration duration in minutes. Empty = the CLI default for the mode (30, or 5 in smoke mode)'
     required: false
-    default: '30'
+    default: ''
 
   anthropic-api-key:
     description: 'Anthropic API key for Claude'
@@ -49,6 +59,11 @@ inputs:
     description: 'Post results as a PR comment (true/false)'
     required: false
     default: 'true'
+
+  comment-mode:
+    description: 'How re-runs on the same PR treat the earlier QA Bot report comment: `update` edits it in place so the PR shows one current report; `new` posts a fresh comment and collapses the earlier one under a "Superseded QA Bot report" summary.'
+    required: false
+    default: 'update'
 
   fail-on-critical:
     description: 'Fail the workflow if critical issues are found (true/false)'
@@ -91,13 +106,25 @@ outputs:
     description: 'Total number of issues found'
 
   critical-issues:
-    description: 'Number of critical issues found'
+    description: 'Number of critical issues found (raw worker findings, pre-synthesis). Kept for compatibility; fail-on-critical gates on curated-critical-issues when present and on this count only when no curated verdict exists'
+
+  curated-critical-issues:
+    description: 'Number of critical issues in the synthesized report after dedup/curation — this count drives fail-on-critical whenever it is present. Empty when no AI verdict was available (fallback / NOT TESTED report), in which case the raw count gates'
 
   flows-explored:
-    description: 'Number of user flows explored'
+    description: 'Number of user flows tested to completion (flow enumeration is not counted)'
 
   cost-usd:
     description: 'Estimated Claude API cost of the run in USD'
+
+  mode:
+    description: 'The run mode that produced this report: `full` or `smoke` (a smoke pass is not regression coverage)'
+
+  new-findings:
+    description: 'Findings labelled NEW against `previous-report`. Empty when no previous report was supplied or synthesis produced no curated verdict'
+
+  recurring-findings:
+    description: 'Findings labelled recurring (seen in previous run) against `previous-report`. Empty when no previous report was supplied or synthesis produced no curated verdict'
 
 runs:
   using: 'docker'
@@ -107,11 +134,14 @@ runs:
     INPUT_URL: ${{ inputs.url }}
     INPUT_GOAL: ${{ inputs.goal }}
     INPUT_KNOWN_ISSUES: ${{ inputs.known-issues }}
+    INPUT_PREVIOUS_REPORT: ${{ inputs.previous-report }}
+    INPUT_MODE: ${{ inputs.mode }}
     INPUT_MAX_AGENTS: ${{ inputs.max-agents }}
     INPUT_MAX_COST: ${{ inputs.max-cost }}
     INPUT_MAX_DURATION: ${{ inputs.max-duration }}
     INPUT_MODEL: ${{ inputs.model }}
     INPUT_POST_COMMENT: ${{ inputs.post-comment }}
+    INPUT_COMMENT_MODE: ${{ inputs.comment-mode }}
     INPUT_FAIL_ON_CRITICAL: ${{ inputs.fail-on-critical }}
     INPUT_FAIL_ON_ZERO_FLOWS: ${{ inputs.fail-on-zero-flows }}
     INPUT_CREDENTIALS: ${{ inputs.credentials }}

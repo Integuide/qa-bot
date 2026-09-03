@@ -5,6 +5,12 @@
 #
 # If no URL is provided, falls back to the QA_BOT_STAGING_URL repository variable.
 #
+# If you also use qa-staging-to-prod.yml (the deploy gate), it responds to the
+# same @QABot comment on staging -> production PRs. The first step below skips
+# those PRs so one comment doesn't start two paid runs; set DEPLOY_HEAD and
+# DEPLOY_BASE there to the branch names your deploy gate uses, or leave them
+# empty if you don't use it.
+#
 # Setup:
 # 1. Copy this file to .github/workflows/qa-bot-on-demand.yml
 # 2. Add ANTHROPIC_API_KEY to repository secrets
@@ -46,7 +52,36 @@ jobs:
       issues: write
 
     steps:
+      # A DEPLOY_HEAD -> DEPLOY_BASE PR is the deploy gate's job (it runs with
+      # gating semantics on the same comment). Decide this FIRST so nothing
+      # below, not even the acknowledgement comment, fires for it.
+      - name: Defer to deploy gate on staging -> production PRs
+        id: gate
+        uses: actions/github-script@v7
+        env:
+          DEPLOY_HEAD: staging      # match qa-staging-to-prod.yml; '' to disable
+          DEPLOY_BASE: production
+        with:
+          script: |
+            const head = process.env.DEPLOY_HEAD;
+            const base = process.env.DEPLOY_BASE;
+            let handledElsewhere = false;
+            if (head && base) {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number
+              });
+              console.log(`PR #${pr.number}: ${pr.head.ref} -> ${pr.base.ref}`);
+              handledElsewhere = pr.head.ref === head && pr.base.ref === base;
+            }
+            core.setOutput('handled_elsewhere', handledElsewhere ? 'true' : 'false');
+            if (handledElsewhere) {
+              core.notice(`Skipping on-demand run: ${head} -> ${base} PRs are handled by the deploy gate workflow (qa-staging-to-prod.yml), which responds to the same @QABot comment.`);
+            }
+
       - name: Extract URL from comment
+        if: steps.gate.outputs.handled_elsewhere != 'true'
         id: extract
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
@@ -73,6 +108,7 @@ jobs:
           echo "url=$URL" >> $GITHUB_OUTPUT
 
       - name: Acknowledge request
+        if: steps.gate.outputs.handled_elsewhere != 'true'
         uses: actions/github-script@v7
         env:
           TARGET_URL: ${{ steps.extract.outputs.url }}
@@ -87,9 +123,11 @@ jobs:
             })
 
       - name: Checkout repository
+        if: steps.gate.outputs.handled_elsewhere != 'true'
         uses: actions/checkout@v4
 
       - name: Get PR details
+        if: steps.gate.outputs.handled_elsewhere != 'true'
         id: pr-details
         env:
           GH_TOKEN: ${{ github.token }}
@@ -110,6 +148,7 @@ jobs:
           } >> $GITHUB_OUTPUT
 
       - name: Generate testing goal from PR
+        if: steps.gate.outputs.handled_elsewhere != 'true'
         id: generate-goal
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -157,6 +196,7 @@ jobs:
           echo "Generated goal: $GOAL"
 
       - name: Run QA Bot
+        if: steps.gate.outputs.handled_elsewhere != 'true'
         id: qa
         uses: Integuide/qa-bot@main
         with:
@@ -168,7 +208,7 @@ jobs:
           fail-on-critical: 'false'  # Don't fail, just report
 
       - name: Upload issue screenshots
-        if: always() && steps.qa.outcome != 'cancelled'
+        if: always() && steps.gate.outputs.handled_elsewhere != 'true' && steps.qa.outcome != 'cancelled'
         uses: actions/upload-artifact@v4
         with:
           name: qa-bot-screenshots
@@ -180,7 +220,7 @@ jobs:
       # QA-step failures are excluded: the action's entrypoint already posts
       # its own failure notice with PR context, and double-commenting is noise.
       - name: Report failure on PR
-        if: failure() && steps.qa.outcome != 'failure'
+        if: failure() && steps.gate.outputs.handled_elsewhere != 'true' && steps.qa.outcome != 'failure'
         uses: actions/github-script@v7
         with:
           script: |
@@ -193,7 +233,7 @@ jobs:
             });
 
       - name: Summary
-        if: always() && steps.qa.outcome != 'cancelled'
+        if: always() && steps.gate.outputs.handled_elsewhere != 'true' && steps.qa.outcome != 'cancelled'
         env:
           FLOWS: ${{ steps.qa.outputs.flows-explored }}
           ISSUES: ${{ steps.qa.outputs.issues-count }}

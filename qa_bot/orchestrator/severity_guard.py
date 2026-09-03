@@ -45,6 +45,24 @@ severity so they can never, on their own, fail a deploy:
    ``[KNOWN]`` -- a real regression in a known-issue area arrives untagged and
    keeps its severity. Capped to ``minor``.
 
+5. **Signup test-data collisions** -- a signup/registration attempt rejected
+   because the email/username "already exists / is taken / is registered".
+   The runner reuses test identities across runs, so this is almost always a
+   collision with an account a previous run created, not a broken signup
+   (the synthesis prompt's "Likely False Positives" #1). Requires BOTH a
+   signup context word AND the already-exists phrase; a description that
+   says the site *accepted* / *allowed* a duplicate is a real bug and is
+   excluded. Capped to ``minor``.
+
+6. **Post-signup anti-abuse artifacts** -- a freshly created account being
+   "restricted", "flagged", "suspended", "associated with another account"
+   or "pattern-matched" right after signup. The runner's single IP address
+   and browser fingerprint create many accounts, so the site's anti-abuse
+   system is reacting -- correctly -- to the tester (synthesis "Likely False
+   Positives" #4). Requires BOTH a restriction signal AND a new/just-created
+   account signal, so an *existing* user being suspended keeps its severity.
+   Capped to ``minor``.
+
 This guard only ever **lowers** severity, never raises it, and it is
 intentionally conservative: it matches specific, high-confidence phrases so it
 won't mask genuine app regressions (a real broken click that surfaces a JS
@@ -180,6 +198,72 @@ _GUESSED_PATH_PATTERNS = [
 ]
 
 
+# 5. Signup test-data collisions ---------------------------------------------
+# Both halves are required: the signup CONTEXT (so "login returns 500 for
+# existing users" -- no collision phrase -- keeps its severity) and the
+# already-exists PHRASE (so "signup returns 500" keeps its severity).
+_SIGNUP_CONTEXT_PATTERNS = [
+    re.compile(r"\bsign[\s-]?up\b", re.IGNORECASE),
+    re.compile(r"\bregist(?:er|ration|ering)\b", re.IGNORECASE),
+    re.compile(r"\b(?:creat(?:e|ing|ed)|new)\s+(?:an?\s+|new\s+)?(?:account|user)\b", re.IGNORECASE),
+    re.compile(r"\baccount\s+creation\b", re.IGNORECASE),
+]
+_ALREADY_EXISTS_PATTERNS = [
+    re.compile(
+        r"\balready\s+(?:exists?|taken|registered|in\s+use|been\s+(?:registered|taken|used)|has\s+an\s+account)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:email|username|e-mail|address)\s+(?:is\s+)?(?:taken|in\s+use|unavailable)\b", re.IGNORECASE),
+]
+# A description saying the site ACCEPTED a duplicate ("signup accepts an
+# email that already exists -- duplicate accounts created") is a genuine bug
+# that merely quotes the collision phrase. Never cap those.
+_DUPLICATE_ACCEPTED_PATTERNS = [
+    re.compile(r"\bduplicate\b", re.IGNORECASE),
+    re.compile(r"\b(?:accept(?:s|ed)?|allow(?:s|ed)?|permit(?:s|ted)?)\b", re.IGNORECASE),
+    re.compile(r"\b(?:second|two|multiple)\s+accounts?\b", re.IGNORECASE),
+]
+
+# Rule 5, second escape: the collision phrasing describes a REAL failure.
+# "Signup returns 500 — a brand-new address is rejected with 'email already
+# registered'" carries both halves of the collision signature and none of the
+# duplicate-accepted wording, so without this it would be capped to minor and
+# could never fail a deploy — the exact masking the guard promises not to do
+# (2026-09-03 review). Deliberately narrow: a server-error signal or an
+# explicitly-fresh identity, never a bare "error" (a genuine collision is
+# almost always narrated as one).
+_SIGNUP_REAL_FAILURE_PATTERNS = [
+    re.compile(r"\b5\d{2}\b"),
+    re.compile(r"\binternal server error\b", re.IGNORECASE),
+    re.compile(r"\bcrash(?:es|ed|ing)?\b", re.IGNORECASE),
+    re.compile(r"\b(?:brand[-\s]?new|fresh|unused|never[-\s]+(?:been[-\s]+)?"
+               r"(?:registered|used|seen))\b", re.IGNORECASE),
+    re.compile(r"\b(?:random(?:ly)?|newly|uniquely)[-\s]*generated\b", re.IGNORECASE),
+]
+
+# 6. Post-signup anti-abuse artifacts ----------------------------------------
+# Both halves are required: the restriction SIGNAL and the FRESH-ACCOUNT
+# signal. "Existing user suspended after login" has no fresh-account signal
+# and keeps its severity; "new account creation returns 500" has no
+# restriction signal and keeps its severity.
+# A bare "restricted/suspended/locked" is NOT enough: "newly created account
+# is locked out — login after registration returns 'account suspended'" is a
+# broken signup, not an anti-abuse artifact. The restriction must come with
+# an anti-abuse/review context.
+_ANTI_ABUSE_PATTERNS = [
+    re.compile(r"\b(?:restricted|flagged|suspended|locked)\b.{0,80}\b(?:pending|under|manual|security)\s+review\b", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\bassociated\s+with\s+(?:another|an\s+existing|a\s+different)\s+(?:account|user)\b", re.IGNORECASE),
+    re.compile(r"\bpattern[\s-]?match(?:ed|ing)?\b", re.IGNORECASE),
+    re.compile(r"\b(?:fraud|anti-?abuse|abuse\s+(?:detection|prevention)|unusual\s+activity|suspicious\s+activity)\b", re.IGNORECASE),
+]
+_FRESH_ACCOUNT_PATTERNS = [
+    re.compile(r"\b(?:after|following|upon|post)[\s-]+(?:a\s+|the\s+|successful\s+|completing\s+)*(?:sign[\s-]?up|registration|registering|account\s+creation|creating\s+(?:an?\s+|the\s+)?account)\b", re.IGNORECASE),
+    re.compile(r"\b(?:new|newly[\s-]created|just[\s-]created|fresh|freshly[\s-]created|brand[\s-]new)\s+(?:user\s+)?account\b", re.IGNORECASE),
+    re.compile(r"\baccount\s+(?:that\s+)?(?:was\s+)?just\s+(?:created|registered|signed\s+up)\b", re.IGNORECASE),
+    re.compile(r"\bimmediately\s+after\s+(?:creating|registering|signing\s+up)\b", re.IGNORECASE),
+]
+
+
 # 4. Worker-tagged known issues ----------------------------------------------
 # The tag must sit at the START of the description -- that anchor is what makes
 # the cap safe (a mid-sentence mention of a known issue is not a self-tag). But
@@ -198,7 +282,8 @@ def classify_non_regression(text: str) -> str | None:
     """Return a short reason code if ``text`` describes a known non-regression.
 
     Returns one of ``"tooling_failure"``, ``"environment_limitation"``,
-    ``"guessed_url_404"`` or ``None`` if no signature matches.
+    ``"guessed_url_404"``, ``"signup_collision"``,
+    ``"post_signup_antiabuse"`` or ``None`` if no signature matches.
 
     ``text`` should be the combined human-readable signal for the issue
     (description + action context). Matching is conservative and high-confidence
@@ -224,6 +309,23 @@ def classify_non_regression(text: str) -> str | None:
     #    followed is a real broken link and keeps its severity.
     if _matches_any(_NOT_FOUND_PATTERNS, text) and _matches_any(_GUESSED_PATH_PATTERNS, text):
         return "guessed_url_404"
+
+    # 5. Signup rejected because the test identity already exists. Require
+    #    BOTH the signup context AND the collision phrase, and never cap a
+    #    description that says a duplicate was ACCEPTED, or that reports the
+    #    collision as a real failure (a 5xx, a crash, a brand-new address).
+    if (
+        _matches_any(_SIGNUP_CONTEXT_PATTERNS, text)
+        and _matches_any(_ALREADY_EXISTS_PATTERNS, text)
+        and not _matches_any(_DUPLICATE_ACCEPTED_PATTERNS, text)
+        and not _matches_any(_SIGNUP_REAL_FAILURE_PATTERNS, text)
+    ):
+        return "signup_collision"
+
+    # 6. Anti-abuse system reacting to a freshly created account. Require
+    #    BOTH the restriction signal AND the fresh-account signal.
+    if _matches_any(_ANTI_ABUSE_PATTERNS, text) and _matches_any(_FRESH_ACCOUNT_PATTERNS, text):
+        return "post_signup_antiabuse"
 
     return None
 

@@ -6,8 +6,10 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+from qa_bot.utils.secrets import redact_values
 
 
 # Query parameters that may contain sensitive data and should be masked
@@ -159,8 +161,36 @@ class ChatLogger:
         # Track which files we've initialized (to write headers)
         self._initialized_files: set[str] = set()
 
+        # Secret values (credentials, password-typed user data) redacted from
+        # everything written to disk. Key-name masking alone misses a typed
+        # password (`type 'hunter2'`) and non-standard keys (ADMIN_PW).
+        self._secret_values: set[str] = set()
+
         # Set up Python logger for operations.log
         self._ops_logger = self._setup_ops_logger()
+
+    def register_secrets(self, values: Iterable[str]):
+        """Register secret values to redact by value from every log file.
+
+        Called by SharedFlowState whenever credentials or user data arrive.
+        Values shorter than MIN_SECRET_LENGTH are ignored at redaction time.
+        """
+        self._secret_values.update(v for v in values if isinstance(v, str) and v)
+
+    def _redact(self, text: str) -> str:
+        """Replace registered secret values in text with a length-hint mask."""
+        return redact_values(text, self._secret_values)
+
+    def _redact_obj(self, obj):
+        """Redact every string inside a nested dict/list (before JSON-encoding,
+        so a secret containing quotes or non-ASCII isn't hidden by escaping)."""
+        if isinstance(obj, str):
+            return self._redact(obj)
+        if isinstance(obj, dict):
+            return {k: self._redact_obj(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._redact_obj(v) for v in obj]
+        return obj
 
     def _cleanup_old_logs(self):
         """Remove old exploration logs, keeping only the most recent ones."""
@@ -236,9 +266,9 @@ class ChatLogger:
             f.write("=" * 80 + "\n\n")
 
     def _append(self, file_path: Path, content: str):
-        """Append content to a file."""
+        """Append content to a file, redacting registered secret values."""
         with open(file_path, "a", encoding='utf-8') as f:
-            f.write(content)
+            f.write(self._redact(content))
 
     # =========================================================================
     # Operations Log (SSE Events)
@@ -258,7 +288,7 @@ class ChatLogger:
         message = self._format_event_message(event_type, data, event)
 
         if message:
-            self._ops_logger.info(f"{event_type:20} | {message}")
+            self._ops_logger.info(f"{event_type:20} | {self._redact(message)}")
 
     def _format_event_message(
         self,
@@ -384,10 +414,21 @@ class ChatLogger:
 
         elif event_type == "issue":
             severity = data.get("severity", "unknown")
-            desc = data.get("description", "unknown")
+            desc = data.get("description") or "unknown"
             if len(desc) > 60:
                 desc = desc[:60] + "..."
-            return f"[{severity}] {desc}"
+            # Attribution so a finding can be traced back to the worker's
+            # transcript turn: "worker-2 turn 12 [console] [major] ..."
+            prefix = ""
+            worker = event.get("worker_id") or data.get("worker_id")
+            if worker:
+                prefix = f"{worker} "
+            if data.get("turn") is not None:
+                prefix += f"turn {data['turn']} "
+            source = data.get("source")
+            if source:
+                prefix += f"[{source}] "
+            return f"{prefix}[{severity}] {desc}"
 
         # AI thinking events (skip deltas, only log complete)
         elif event_type == "ai_thinking_start":
@@ -546,6 +587,30 @@ class ChatLogger:
         self._append(file_path, json.dumps(_mask_credentials_in_dict(response), indent=2))
         self._append(file_path, "\n\n")
 
+    def log_worker_issue(
+        self,
+        worker_id: str,
+        flow_id: str,
+        turn_number: int,
+        severity: str,
+        description: str,
+        source: str = "ai",
+        screenshot_path: str = "",
+    ):
+        """Append an ISSUE REPORTED marker to the worker's chat transcript.
+
+        Written right after the turn that filed the issue, so
+        `grep -n 'ISSUE REPORTED' chats/*.txt` lands on the exact turn. This
+        is also the only place auto-detected (console/network/dialog) issues
+        appear in a chat file — they have no model turn of their own.
+        """
+        file_path = self._get_chat_file(worker_id, flow_id)
+        line = f"*** ISSUE REPORTED | turn {turn_number} | [{severity}] | source={source}"
+        if screenshot_path:
+            line += f" | {screenshot_path}"
+        self._append(file_path, line + "\n")
+        self._append(file_path, f"    {_mask_credentials_in_text(description)}\n\n")
+
     def log_worker_completion(
         self,
         worker_id: str,
@@ -584,19 +649,19 @@ class ChatLogger:
 
         # Error message
         self._append(file_path, "--- ERROR ---\n")
-        self._append(file_path, error)
+        self._append(file_path, _mask_credentials_in_text(error))
         self._append(file_path, "\n\n")
 
         # Assistant thinking (if available)
         if thinking:
             self._append(file_path, "--- ASSISTANT (thinking) ---\n")
-            self._append(file_path, thinking)
+            self._append(file_path, _mask_credentials_in_text(thinking))
             self._append(file_path, "\n\n")
 
         # Raw response (for debugging)
         if raw_response:
             self._append(file_path, "--- RAW RESPONSE ---\n")
-            self._append(file_path, raw_response)
+            self._append(file_path, _mask_credentials_in_text(raw_response))
             self._append(file_path, "\n\n")
 
     # =========================================================================
@@ -713,11 +778,11 @@ class ChatLogger:
         self._append(file_path, "=" * 80 + "\n\n")
 
         self._append(file_path, "--- CONTEXT ---\n")
-        self._append(file_path, context)
+        self._append(file_path, _mask_credentials_in_text(context))
         self._append(file_path, "\n\n")
 
         self._append(file_path, "--- REPORT ---\n")
-        self._append(file_path, report)
+        self._append(file_path, _mask_credentials_in_text(report))
         self._append(file_path, "\n\n")
 
     # =========================================================================
@@ -738,7 +803,9 @@ class ChatLogger:
         """
         report_path = self.base_dir / "report.md"
         try:
-            report_path.write_text(_mask_credentials_in_text(report), encoding="utf-8")
+            report_path.write_text(
+                self._redact(_mask_credentials_in_text(report)), encoding="utf-8"
+            )
         except Exception as e:
             logging.warning(f"Failed to write report.md: {e}")
 
@@ -746,13 +813,16 @@ class ChatLogger:
         """
         Write a summary.json file to the exploration log directory.
 
-        This is called at the end of an exploration (success or error) to
-        provide a machine-readable summary for monitoring and analytics.
+        Called at run start ("running"), before the synthesis AI call
+        ("synthesizing") and at the end (completed/error/interrupted/...),
+        overwriting each time, so the directory always carries a
+        machine-readable state for monitoring and analytics even if the
+        process dies mid-run. See docs/architecture.md, Logging Structure.
         """
         summary_path = self.base_dir / "summary.json"
         try:
             with open(summary_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, default=str)
+                json.dump(self._redact_obj(data), f, indent=2, default=str)
         except Exception as e:
             logging.warning(f"Failed to write summary.json: {e}")
 

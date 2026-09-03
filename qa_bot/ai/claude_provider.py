@@ -8,7 +8,16 @@ import uuid
 from datetime import datetime
 from typing import AsyncGenerator, Optional
 from urllib.parse import urlparse
-from anthropic import AsyncAnthropic, RateLimitError, APIError, APIConnectionError, APITimeoutError
+from anthropic import (
+    AsyncAnthropic,
+    AuthenticationError,
+    BadRequestError,
+    PermissionDeniedError,
+    RateLimitError,
+    APIError,
+    APIConnectionError,
+    APITimeoutError,
+)
 from pydantic import ValidationError
 
 from qa_bot.browser.controller import DUPLICATE_REF_PREFIX
@@ -120,6 +129,39 @@ def _calculate_wait_time(backoff: float) -> float:
     # Add randomness: wait_time = backoff * (1 + random(0, JITTER_FACTOR))
     jitter = random.random() * JITTER_FACTOR
     return min(backoff * (1 + jitter), MAX_BACKOFF)
+
+
+def api_error_message(exc: Exception) -> str:
+    """The human-readable message inside an Anthropic API error.
+
+    ``str(exc)`` on a status error is ``"Error code: 401 - {...raw body...}"``;
+    the body's ``error.message`` ("invalid x-api-key", "Your credit balance
+    is too low ...") is what a user can act on.
+    """
+    body = getattr(exc, "body", None)
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict) and error.get("message"):
+        return str(error["message"])
+    return getattr(exc, "message", None) or str(exc)
+
+
+def fatal_api_error_reason(exc: Exception) -> str | None:
+    """Return an actionable reason when an API error cannot be fixed by retrying.
+
+    A rejected key (401), a key without permission for this API (403) or an
+    account with no credit (400 "credit balance is too low") fails every
+    call the run will ever make — retrying the flow, or letting the next
+    flow try, only burns browser launches before ending as an untested
+    "Complete". Returns None for everything else (rate limits, transient
+    5xx, malformed requests), which stays on the normal retry path.
+    """
+    if isinstance(exc, AuthenticationError):
+        return "Anthropic rejected this API key — check it at console.anthropic.com"
+    if isinstance(exc, PermissionDeniedError):
+        return f"Anthropic refused this API key (permission denied): {api_error_message(exc)}"
+    if isinstance(exc, BadRequestError) and "credit balance" in api_error_message(exc).lower():
+        return f"Anthropic account has no credit: {api_error_message(exc)}"
+    return None
 
 
 def _extract_token_usage(usage) -> dict:
@@ -673,7 +715,10 @@ class ClaudeProvider(AIProvider):
         for i, action in enumerate(action_history[-10:], 1):  # Last 10 actions
             action_type = action.get("action_type", "unknown")
             reasoning = action.get("reasoning", "")
-            url = action.get("url", "")
+            # The worker records where an action ran as page_url (and the
+            # navigate target as target_url); "url" is kept as a fallback
+            # for older/hand-built history dicts.
+            url = action.get("page_url") or action.get("url", "")
             error = action.get("error", "")
             success = action.get("success", True)
 
@@ -696,8 +741,12 @@ class ClaudeProvider(AIProvider):
                 text = action.get("text", "")[:30]
                 line += f" ref={ref} text=\"{text}\""
             elif action_type == "navigate":
-                nav_url = action.get("url", "")
-                line += f" → {simplify_url(nav_url)}"
+                nav_url = action.get("target_url") or action.get("url", "")
+                if nav_url:
+                    # "back"/"forward" have no scheme — simplify_url would
+                    # render them as "://back"
+                    shown = simplify_url(nav_url) if "://" in nav_url else nav_url
+                    line += f" → {shown}"
             elif action_type in ("done", "block"):
                 reason = action.get("reason", "")[:50]
                 line += f" \"{reason}\""
@@ -833,6 +882,7 @@ class ClaudeProvider(AIProvider):
         pending_flows: list[dict],
         completed_flows: list[dict],
         issues: list[dict],
+        goal: str = "",
     ) -> dict:
         """
         Call AI for supervisor decisions.
@@ -847,7 +897,8 @@ class ClaudeProvider(AIProvider):
             blocked_workers=blocked_workers,
             pending_flows=pending_flows,
             completed_flows=completed_flows,
-            issues=issues
+            issues=issues,
+            goal=goal,
         )
 
         async def _make_supervisor_request():
@@ -973,6 +1024,7 @@ class ClaudeProvider(AIProvider):
         incomplete_flows: list[dict] | None = None,
         goal: str = "",
         known_issues: str = "",
+        previous_report: str = "",
     ) -> dict:
         """
         Generate final QA synthesis report.
@@ -993,6 +1045,7 @@ class ClaudeProvider(AIProvider):
             incomplete_flows=incomplete_flows,
             goal=goal,
             known_issues=known_issues,
+            previous_report=previous_report,
         )
 
         async def _make_synthesis_request():

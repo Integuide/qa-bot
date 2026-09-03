@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import uuid
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 from datetime import datetime
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from qa_bot.ai.base import AIProvider, AgentAction
+from qa_bot.ai.claude_provider import fatal_api_error_reason
 from qa_bot.agent.state import Issue
 from qa_bot.browser.controller import (
     BrowserController,
@@ -23,9 +24,62 @@ from qa_bot.browser.controller import (
 )
 from qa_bot.orchestrator.browser_pool import BrowserPool, strip_url_credentials
 from qa_bot.orchestrator.shared_state import SharedFlowState, UserDataField, UserDataRequest, format_user_data_for_prompt
+from qa_bot.utils.secrets import mask_value, redact_values
 from qa_bot.orchestrator.flow import FlowTask, FlowCheckpoint, FlowStatus
 
 logger = logging.getLogger(__name__)
+
+
+# ── Origin helpers (shared by network + console classification) ─────────
+
+# Two-label public suffixes where the registrable domain is three labels
+# (example.co.uk, not co.uk). Deliberately small: enough for the common cases
+# without pulling in a public-suffix list.
+_SECOND_LEVEL_TLDS = frozenset({"co", "com", "org", "net", "gov", "ac", "edu"})
+
+
+def registrable_domain(host: str) -> str:
+    """Reduce ``static.cdn.example.co.uk:443`` to ``example.co.uk``.
+
+    IPs and bare hosts (localhost) are returned unchanged (minus port).
+    Embedded userinfo (``user:pass@host``, as in a Basic-Auth target URL) is
+    dropped so it can't be mistaken for a port separator.
+    """
+    host = (host or "").lower().rsplit("@", 1)[-1]
+    if host and not host.startswith("["):
+        host = host.rsplit(":", 1)[0] if ":" in host else host
+    if not host or host.replace(".", "").isdigit():
+        return host
+    labels = host.split(".")
+    if len(labels) <= 2:
+        return host
+    if len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVEL_TLDS:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def is_first_party(host: str, target_domain: str, page_url: str = "") -> bool:
+    """True when ``host`` belongs to the site under test.
+
+    "Belongs" means the same registrable domain as the run's target, so
+    ``api.example.com`` / ``static.example.com`` / ``cdn.example.com`` are
+    the target's own infrastructure while ``api.stripe.com`` is not. Judged
+    against the target rather than the current page because the page may be
+    a third-party popup (OAuth provider) whose own failures are not the
+    target's regressions. Falls back to the page host when no target is
+    known. An unknown host on either side is treated as first-party (a blank
+    host only comes from a malformed URL; better a loud major than a silent
+    downgrade).
+    """
+    if not host:
+        # blob:/data:/about: requests have no host; they are not the target's
+        # infrastructure and must not file as first-party majors.
+        return False
+    origin = registrable_domain(host)
+    reference = registrable_domain(target_domain or urlparse(page_url).netloc)
+    if not origin or not reference:
+        return True
+    return origin == reference
 
 
 # ── Network failure classification ──────────────────────────────────────
@@ -38,11 +92,18 @@ def classify_network_failure(
     req_resource_type: str,
     req_failure_reason: str,
     page_url: str,
+    target_domain: str = "",
 ) -> tuple[str, str] | None:
     """Classify a failed network request into (severity, description) or None to skip.
 
     Returns None if the failure is benign (browser abort, ad-blocker, etc.)
     and should not be reported as an issue.
+
+    First-party failures (same registrable domain as ``target_domain`` — so
+    the target's own ``api.``/``static.``/``cdn.`` subdomains count) are
+    ``major``; third-party ones (analytics, fonts, ad networks, payment
+    providers) are ``minor`` at most. ``target_domain`` falls back to the
+    page host when empty. Mirrors ``classify_console_error``.
     """
     failure = req_failure_reason or ""
 
@@ -64,35 +125,105 @@ def classify_network_failure(
     ):
         return None
 
-    # Determine if the failed request is same-origin.
-    # Only strips "www." — subdomains like api.example.com are treated as
-    # third-party. This is intentional: most cross-subdomain failures are
-    # external services, and same-site APIs typically share the main domain.
-    page_origin = urlparse(page_url).netloc.removeprefix("www.")
-    req_origin = urlparse(req_url).netloc.removeprefix("www.")
-    is_same_origin = req_origin == page_origin
+    # First-party = same registrable domain as the target (api./static./cdn.
+    # subdomains included). A 502 from the product's own API is the strongest
+    # regression signal a deploy gate gets; it must not be downgraded because
+    # it lives on a subdomain. The party tag in the description lets
+    # synthesis apply the same rule without re-deriving it from the URL.
+    same_site = is_first_party(urlparse(req_url).netloc, target_domain, page_url)
+    party = "first-party" if same_site else "third-party"
 
     if req_status >= 500:
-        severity = "major" if is_same_origin else "minor"
-        desc = f"Server error {req_status}: {req_method} {req_url[:100]}"
+        severity = "major" if same_site else "minor"
+        desc = f"Server error {req_status} ({party}): {req_method} {req_url[:100]}"
     elif req_status == 0:
         # Real connection failures (not aborted — those were filtered above)
-        if is_same_origin:
+        if same_site:
             severity = "major"
         elif req_resource_type in ("document", "xhr", "fetch"):
             severity = "minor"
         else:
             # Third-party image/font/style failures — not actionable
             return None
-        desc = f"Network failure: {req_method} {req_url[:100]} - {failure}"
+        desc = f"Network failure ({party}): {req_method} {req_url[:100]} - {failure}"
     elif req_status == 404:
-        severity = "minor" if is_same_origin else "cosmetic"
-        desc = f"404 Not Found: {req_method} {req_url[:100]}"
+        severity = "minor" if same_site else "cosmetic"
+        desc = f"404 Not Found ({party}): {req_method} {req_url[:100]}"
     else:
         severity = "minor"
-        desc = f"HTTP {req_status}: {req_method} {req_url[:100]}"
+        desc = f"HTTP {req_status} ({party}): {req_method} {req_url[:100]}"
 
     return severity, desc
+
+
+# ── Console error classification ────────────────────────────────────────
+
+# A console error is auto-filed only when its text looks like a JS exception
+# (an app deliberately logging a handled failure is left for the AI to weigh).
+JS_ERROR_KEYWORDS = ("uncaught", "exception", "typeerror", "referenceerror")
+
+# Substrings (lower-cased) of error families that are browser/third-party
+# noise, not a bug in the target's code. Never auto-filed.
+BENIGN_CONSOLE_ERROR_PATTERNS = (
+    # Cross-origin script threw and the browser masked the details — there
+    # is nothing to act on and the origin is by definition not the target.
+    "script error.",
+    # Media autoplay/pause races: "The play() request was interrupted by a
+    # call to pause()" / "by a new load request" (Chromium AbortError).
+    "the play() request was interrupted",
+    # Autoplay policy: user gesture required — environment, not a regression.
+    "play() failed because the user didn't interact",
+    # Layout-observer throttling warning surfaced as an exception.
+    "resizeobserver loop",
+)
+
+def script_host_from_location(location: str) -> str:
+    """Host of the script in a ``url:line:col`` console/pageerror location.
+
+    Returns "" for inline/eval frames (no URL) or unparseable locations.
+    """
+    if not location:
+        return ""
+    url = location.rsplit(":", 2)[0] if location.count(":") >= 2 else location
+    return urlparse(url).netloc if "://" in url else ""
+
+
+def classify_console_error(
+    text: str,
+    location: str,
+    page_url: str,
+    target_domain: str,
+    stack_locations: list[str] | None = None,
+) -> tuple[str, str] | None:
+    """Classify a console error into (severity, description) or None to skip.
+
+    Mirrors ``classify_network_failure``: an exception thrown by the target's
+    own code (script on the same registrable domain, or an inline/eval frame
+    with no script URL) is ``major``; one thrown by a third-party script
+    (tag manager, chat widget, ad iframe, OAuth provider page) is ``minor`` at
+    most — it is not a regression in the site under test and must not fail a
+    deploy gate. Known-benign families are dropped entirely.
+    """
+    lower = text.lower()
+    if not any(keyword in lower for keyword in JS_ERROR_KEYWORDS):
+        return None
+    if any(pattern in lower for pattern in BENIGN_CONSOLE_ERROR_PATTERNS):
+        return None
+
+    # Origin of the throwing code: the script's host when known, else the
+    # page it ran on (an inline script on a third-party page is still that
+    # party's code, not the target's).
+    origin_host = script_host_from_location(location) or urlparse(page_url).netloc
+    # An uncaught exception whose TOP frame is a CDN-hosted vendor bundle
+    # (react-dom on jsdelivr) but which the site's own code triggered has a
+    # first-party frame further down the stack: any first-party frame makes
+    # it the target's crash.
+    frame_hosts = [script_host_from_location(loc) for loc in (stack_locations or [])]
+    if any(h and is_first_party(h, target_domain) for h in frame_hosts):
+        return "major", f"JavaScript error: {text[:200]}"
+    if not is_first_party(origin_host, target_domain):
+        return "minor", f"Third-party script error ({origin_host}): {text[:200]}"
+    return "major", f"JavaScript error: {text[:200]}"
 
 
 def _strip_old_screenshots(history: list[dict]) -> None:
@@ -113,6 +244,13 @@ def _strip_old_screenshots(history: list[dict]) -> None:
                     content[j] = {"type": "text", "text": "[Screenshot of page]"}
 
 
+# Returned for the `screenshot` / `zoom` action types, which are accepted by
+# the parser (older prompts advertised them) but have no implementation.
+NOOP_CAPTURE_ERROR = (
+    "zoom/screenshot are not available; every turn already shows a fresh "
+    "viewport screenshot — scroll or resize instead."
+)
+
 # Explicit budget for the per-turn screenshot. The browser context's default
 # action timeout is deliberately short (fail fast on stale refs), but the
 # main-loop screenshot is not a ref-based action: a heavy animation or busy
@@ -124,6 +262,12 @@ TURN_SCREENSHOT_TIMEOUT_MS = 15000
 # Past this, a single rollup issue is filed and further repeats are dropped —
 # one broken asset pattern should be one finding, not one issue per URL.
 MAX_NETWORK_ISSUES_PER_PATTERN = 3
+
+# Same cap for auto-filed console errors, per (script host, message prefix).
+# A poll loop that throws "Exception in poll: request <uuid> failed" every
+# turn is one finding, not one major issue per turn.
+MAX_CONSOLE_ISSUES_PER_PATTERN = 3
+CONSOLE_ISSUE_PATTERN_PREFIX_LEN = 40
 
 # When this fraction of the exploration budget (cost or time) is consumed,
 # workers get a wrap-up note in their prompt: verify the essentials of the
@@ -142,6 +286,14 @@ WRAP_UP_LIMIT_FRACTION = 0.75
 # already added via add_flow are kept.
 FIRST_WORKER_NUDGE_TURNS = 10
 FIRST_WORKER_MAX_TURNS = 15
+
+# Hard turn cap for the single smoke-mode worker (SharedFlowState.smoke).
+# A smoke pass is "load the target, open each top-level nav link once":
+# enough turns for a site with a dozen nav entries plus a few scrolls, but
+# nowhere near a full exploration. Same shape as the first-worker cap: a
+# nudge note from SMOKE_NUDGE_TURNS, force-complete at SMOKE_MAX_TURNS.
+SMOKE_NUDGE_TURNS = 18
+SMOKE_MAX_TURNS = 25
 
 
 def _budget_wrap_up_note(state: "SharedFlowState") -> str:
@@ -183,6 +335,36 @@ def _first_worker_turn_note(is_first_worker: bool, action_count: int) -> str:
         f"~{remaining} turn(s) for add_flow actions covering anything "
         f"important not yet listed, then call done."
     )
+
+
+def _smoke_mode_note(smoke: bool, action_count: int) -> str:
+    """Per-turn smoke-mode instruction (SharedFlowState.smoke).
+
+    Text-only, appended to the current turn's user message like the other
+    notes, so it costs no prompt-cache efficiency. Restates the smoke
+    contract every turn (the flow goal already carries SMOKE_GOAL) and,
+    from SMOKE_NUDGE_TURNS, warns about the SMOKE_MAX_TURNS force-complete.
+    """
+    if not smoke:
+        return ""
+    note = (
+        "**SMOKE MODE.** This run is a smoke test, not an exploration: load "
+        "the page, open each top-level navigation link once, and confirm "
+        "each page renders without server errors, console exceptions or "
+        "broken layout. Do NOT sign up, log in, submit forms, or use "
+        "add_flow (no child flows are scheduled in smoke mode). Report only "
+        "what you actually observe. When every top-level link has been "
+        "opened once, use the done action."
+    )
+    if action_count >= SMOKE_NUDGE_TURNS:
+        remaining = max(SMOKE_MAX_TURNS - action_count, 1)
+        note += (
+            f" **TURN LIMIT: {action_count} turns used; the smoke pass is "
+            f"force-completed after {SMOKE_MAX_TURNS}.** Use your remaining "
+            f"~{remaining} turn(s) to open any top-level link not yet "
+            f"visited, then call done."
+        )
+    return note
 
 
 def _no_target_error(action_type: str) -> str:
@@ -321,7 +503,7 @@ class ActionResult:
     block_reason: str = ""
     pending_flows: list = None
     reported_issues: list = None
-    screenshot: bytes = None  # For explicit screenshot action
+    screenshot: bytes = None  # Unused: no action captures a screenshot (kept for compatibility)
     data_request: "UserDataRequest" = None  # For request_data action
     needs_context_rebuild: bool = False  # For set_http_auth: recreate browser context
     # True when `error` is a crafted corrective instruction for the AI (not a
@@ -374,8 +556,6 @@ class FlowExplorationWorker:
     - scroll_to: Scroll element into view
     - key: Press keyboard key(s)
     - left_click_drag: Drag from start to end coordinate
-    - screenshot: Take explicit screenshot
-    - zoom: Zoom into region for inspection
     - wait: Wait/pause
     - navigate: Go to URL or back/forward
     - resize: Resize viewport
@@ -409,6 +589,21 @@ class FlowExplorationWorker:
         # used to cap repeat spam (one broken asset pattern = one finding,
         # not one issue per URL variant)
         self._network_issue_counts: dict[tuple[int, str], int] = {}
+        # (script host, message prefix) -> count of auto-filed console errors
+        self._console_issue_counts: dict[tuple[str, str], int] = {}
+
+    def _turn_cap(self) -> Optional[int]:
+        """Hard turn cap for this worker, or None for a normal worker.
+
+        The first (flow-enumeration) worker is capped at
+        FIRST_WORKER_MAX_TURNS; the single smoke-mode worker at
+        SMOKE_MAX_TURNS. Both are force-completed at the cap.
+        """
+        if self.is_first_worker:
+            return FIRST_WORKER_MAX_TURNS
+        if getattr(self.state, "smoke", False):
+            return SMOKE_MAX_TURNS
+        return None
 
     async def run(self) -> AsyncGenerator[dict, None]:
         """Execute the assigned flow task."""
@@ -468,7 +663,15 @@ class FlowExplorationWorker:
                 "worker_id": self.worker_id,
                 "is_root": task.is_root,
                 "parent_flow_id": task.parent_flow_id,
-                "flow_path": task.flow_path.to_list()
+                "flow_path": task.flow_path.to_list(),
+                # Set when this flow continues a paused/blocked one under
+                # the same name — the UI shows "(resumed)" from this flag
+                "resumed_from": flow_data.resumed_from,
+                "resume_kind": flow_data.resume_kind,
+                # The Root flow (and its resume/retry clones) only enumerates
+                # flows — the UI excludes it from "Completed" like
+                # get_progress() does, so the card and the pause modal agree
+                "is_first_worker": flow_data.is_first_worker,
             }
         }
 
@@ -524,7 +727,9 @@ class FlowExplorationWorker:
                     raise ValueError(f"Checkpoint {task.checkpoint_id} not found for flow {task.flow_id}")
 
                 await self.state.claim_checkpoint(task.checkpoint_id, self.worker_id)
-                parent_flow_name = checkpoint.branch_name or ""
+                # A resume clone is the same flow continuing, not a branch:
+                # don't tell the AI it "branched from" itself.
+                parent_flow_name = "" if flow_data.resumed_from else (checkpoint.branch_name or "")
 
                 context = await self.browser_pool.create_isolated_context(
                     storage_state=checkpoint.browser_storage_state,
@@ -592,11 +797,20 @@ class FlowExplorationWorker:
                 # its own can eat half the run's budget (#839). The nudge note
                 # (_first_worker_turn_note) warned it for several turns; now
                 # force-complete, keeping the flows it already added.
-                if self.is_first_worker and action_count >= FIRST_WORKER_MAX_TURNS:
-                    completion_reason = (
-                        f"Flow enumeration force-completed at the "
-                        f"{FIRST_WORKER_MAX_TURNS}-turn cap"
-                    )
+                # Smoke mode gets the same treatment at SMOKE_MAX_TURNS: the
+                # single smoke worker must stay a short bounded pass.
+                turn_cap = self._turn_cap()
+                if turn_cap is not None and action_count >= turn_cap:
+                    if self.is_first_worker:
+                        completion_reason = (
+                            f"Flow enumeration force-completed at the "
+                            f"{FIRST_WORKER_MAX_TURNS}-turn cap"
+                        )
+                    else:
+                        completion_reason = (
+                            f"Smoke pass force-completed at the "
+                            f"{SMOKE_MAX_TURNS}-turn cap"
+                        )
                     await self.state.complete_flow(task.flow_id, completion_reason)
                     if self.state.chat_logger:
                         self.state.chat_logger.log_worker_completion(
@@ -647,7 +861,7 @@ class FlowExplorationWorker:
                             current_url=browser.current_url,
                             conversation_history=conversation_history.copy(),
                             flow_path=task.flow_path,
-                            branch_name=f"credential_resume:{task.flow_name}",
+                            branch_name=task.flow_name,
                             created_by_worker=self.worker_id
                         )
                         # Save checkpoint without queueing - task will be created
@@ -691,7 +905,7 @@ class FlowExplorationWorker:
                             current_url=browser.current_url,
                             conversation_history=conversation_history.copy(),
                             flow_path=task.flow_path,
-                            branch_name=f"approval_resume:{task.flow_name}",
+                            branch_name=task.flow_name,
                             created_by_worker=self.worker_id
                         )
                         # Save checkpoint without queueing - task will be created
@@ -736,7 +950,7 @@ class FlowExplorationWorker:
                             current_url=browser.current_url,
                             conversation_history=conversation_history.copy(),
                             flow_path=task.flow_path,
-                            branch_name=f"data_resume:{task.flow_name}",
+                            branch_name=task.flow_name,
                             created_by_worker=self.worker_id
                         )
                         # Save checkpoint without queueing - task will be created
@@ -835,6 +1049,7 @@ class FlowExplorationWorker:
                             _first_worker_turn_note(
                                 self.is_first_worker, action_count
                             ),
+                            _smoke_mode_note(self.state.smoke, action_count),
                         ) if note),
                         is_first_worker=self.is_first_worker,
                         worker_number=self.worker_number,
@@ -894,6 +1109,15 @@ class FlowExplorationWorker:
                 except Exception as e:
                     last_error = str(e)
                     exit_reason = "ai_exception"
+                    # A rejected key / no credit fails every call this run
+                    # will make: abort the run (which also blocks the flow
+                    # retry below) instead of burning a second browser
+                    # context on a doomed attempt.
+                    fatal_reason = fatal_api_error_reason(e)
+                    if fatal_reason:
+                        last_error = fatal_reason
+                        logger.error(f"Worker {self.worker_id}: fatal API error — {fatal_reason}")
+                        self.state.abort(fatal_reason)
                     yield {
                         "type": "ai_error",
                         "worker_id": self.worker_id,
@@ -1031,7 +1255,7 @@ class FlowExplorationWorker:
                             current_url=browser.current_url if browser else page.url,
                             conversation_history=conversation_history.copy(),
                             flow_path=task.flow_path,
-                            branch_name=f"pause_resume:{task.flow_name}",
+                            branch_name=task.flow_name,  # resume clone keeps the flow's human name
                             created_by_worker=self.worker_id
                         )
                         await self.state.add_pause_checkpoint(checkpoint, f"Resume after pause: {task.goal}")
@@ -1073,6 +1297,35 @@ class FlowExplorationWorker:
             )
         return None
 
+    def _cap_console_issue(
+        self, host: str, text: str, severity: str, desc: str
+    ) -> tuple[str, str] | None:
+        """Per-flow cap on auto-filed console errors, keyed on (host, prefix).
+
+        Mirrors ``_cap_network_issue``: the first
+        MAX_CONSOLE_ISSUES_PER_PATTERN errors from one script host whose text
+        shares a prefix file individually, the next becomes a rollup, the
+        rest are dropped. Keying on a prefix (not the full text) catches
+        messages that embed a request id or timestamp, which exact dedup in
+        SharedFlowState cannot.
+
+        Returns (severity, desc) to file, or None to skip.
+        """
+        prefix = text[:CONSOLE_ISSUE_PATTERN_PREFIX_LEN]
+        key = (host, prefix)
+        seen = self._console_issue_counts.get(key, 0)
+        self._console_issue_counts[key] = seen + 1
+        if seen < MAX_CONSOLE_ISSUES_PER_PATTERN:
+            return severity, desc
+        if seen == MAX_CONSOLE_ISSUES_PER_PATTERN:
+            where = f" from {host}" if host else ""
+            return "minor", (
+                f"Multiple additional JavaScript errors{where} "
+                f"matching \"{prefix}…\" — further occurrences not "
+                f"individually reported"
+            )
+        return None
+
     async def _take_turn_screenshot(self, browser: BrowserController) -> bytes:
         """Take the per-turn screenshot with an explicit timeout and one retry.
 
@@ -1090,6 +1343,79 @@ class FlowExplorationWorker:
             )
             await asyncio.sleep(1.0)
             return await browser.screenshot(timeout_ms=TURN_SCREENSHOT_TIMEOUT_MS)
+
+    async def _capture_issue_screenshot(
+        self, browser: BrowserController, source: str
+    ) -> str:
+        """Screenshot the page for an issue being filed; return its saved path.
+
+        Same timeout + one retry as the per-turn screenshot, but a persistent
+        failure returns "" (issue filed without a screenshot) instead of
+        raising: the issue paths run from _handle_ai_event outside any
+        per-action error handling, so a raised PlaywrightTimeoutError would
+        fail the whole flow — and the page most likely to throw console errors
+        or 5xx is exactly the busy page most likely to stall a screenshot. An
+        issue without a screenshot is far better than a dead flow.
+        """
+        if not self.state.chat_logger:
+            logger.debug(f"chat_logger unavailable, {source} issue screenshot discarded")
+            return ""
+        screenshot = None
+        for attempt in (1, 2):
+            try:
+                screenshot = await browser.screenshot(timeout_ms=TURN_SCREENSHOT_TIMEOUT_MS)
+                break
+            except Exception as e:
+                if attempt == 1:
+                    logger.warning(
+                        f"{self.worker_id}: {source} issue screenshot failed ({e}); retrying once"
+                    )
+                    await asyncio.sleep(1.0)
+                else:
+                    logger.warning(
+                        f"{self.worker_id}: {source} issue screenshot failed again ({e}); "
+                        "filing issue without a screenshot"
+                    )
+        if screenshot is None:
+            return ""
+        idx = await self.state.get_next_issue_screenshot_index()
+        return self.state.chat_logger.save_issue_screenshot(screenshot, idx) or ""
+
+    def _issue_event(self, task: FlowTask, issue: Issue, is_new: bool) -> dict:
+        """Build the `issue` SSE event for a filed issue (shared by the AI,
+        console, network and dialog paths so all four carry the same
+        attribution fields)."""
+        return {
+            "type": "issue",
+            "worker_id": self.worker_id,
+            "flow_id": task.flow_id,
+            "data": {
+                "description": issue.description,
+                "severity": issue.severity,
+                "url": issue.url,
+                "source": issue.source,
+                "flow_name": issue.flow_name,
+                "turn": issue.turn,
+                "is_new": is_new,
+                "screenshot_path": issue.screenshot_path,
+            },
+        }
+
+    def _log_issue_to_transcript(self, task: FlowTask, issue: Issue):
+        """Drop an ISSUE REPORTED marker into the worker's chat transcript so
+        `grep -n 'ISSUE REPORTED' chats/*.txt` lands on the exact turn — this
+        is the only place auto-detected (console/network/dialog) issues
+        appear in any chat file."""
+        if self.state.chat_logger:
+            self.state.chat_logger.log_worker_issue(
+                worker_id=self.worker_id,
+                flow_id=task.flow_id,
+                turn_number=issue.turn if issue.turn is not None else 0,
+                severity=issue.severity,
+                description=issue.description,
+                source=issue.source,
+                screenshot_path=issue.screenshot_path,
+            )
 
     def _build_flow_context(self, task: FlowTask, conversation_history: list[dict]) -> str:
         """Build context string from flow path and history."""
@@ -1354,7 +1680,14 @@ class FlowExplorationWorker:
             if action.coordinate is not None:
                 action_dict["coordinate"] = list(action.coordinate)
             if action.text:
-                action_dict["text"] = action.text
+                # A typed credential/password must not leave the worker in
+                # cleartext: this dict feeds the SSE `action` event (UI
+                # activity log, JSON export), operations.log and the AI's
+                # own history. The raw value only ever reaches the browser.
+                # Substring redaction (same as the loggers): "user:hunter2"
+                # or a value the model padded must not slip out because it is
+                # not byte-identical to the registered secret.
+                action_dict["text"] = redact_values(action.text, self.state.get_secret_values())
             if action.url:
                 action_dict["target_url"] = action.url  # Target URL for navigate action
             if action.reason:
@@ -1514,6 +1847,10 @@ class FlowExplorationWorker:
                                 "parent_action_index": action_count
                             }
                         })
+                    elif getattr(self.state, "smoke", False):
+                        # Smoke mode never forks; the refusal is by design,
+                        # not a duplicate — don't log a phantom duplicate.
+                        logger.debug(f"Smoke mode: not scheduling child flow {pending_flow.name!r}")
                     else:
                         events.append({
                             "type": "flow_skipped",
@@ -1524,18 +1861,30 @@ class FlowExplorationWorker:
                             }
                         })
 
-            # Process reported issues
-            issue_screenshot_path = None
-            for reported_issue in exec_result.reported_issues:
-                if issue_screenshot_path is None:
-                    issue_screenshot = await browser.screenshot()
-                    idx = await self.state.get_next_issue_screenshot_index()
-                    if self.state.chat_logger:
-                        issue_screenshot_path = self.state.chat_logger.save_issue_screenshot(issue_screenshot, idx) or ""
-                    else:
-                        issue_screenshot_path = ""
-                        logger.debug("chat_logger unavailable, issue screenshot discarded")
+            # Attribution shared by every issue filed on this turn: which
+            # worker/flow, and the 0-based turn (= chat transcript TURN n).
+            attribution = dict(
+                worker_id=self.worker_id,
+                flow_id=task.flow_id,
+                flow_name=task.flow_name,
+                turn=action_count,
+            )
 
+            # One issue screenshot per turn, shared by every source (AI
+            # report_issue, console, network, dialog): they all show the same
+            # viewport, so the first filing captures + saves the file and the
+            # rest cite the same screenshots/issue_NNN.png. A failed capture
+            # ("") is memoised too — one 15s x2 stall per turn, not four.
+            turn_issue_screenshot_path: str | None = None
+
+            async def issue_screenshot(source: str) -> str:
+                nonlocal turn_issue_screenshot_path
+                if turn_issue_screenshot_path is None:
+                    turn_issue_screenshot_path = await self._capture_issue_screenshot(browser, source)
+                return turn_issue_screenshot_path
+
+            # Process reported issues
+            for reported_issue in exec_result.reported_issues:
                 issue = Issue(
                     description=reported_issue.description,
                     severity=reported_issue.severity,
@@ -1543,65 +1892,58 @@ class FlowExplorationWorker:
                     # (popup when one is open), not the opener page
                     url=browser.current_url,
                     action_context=f"{action.action_type}: {action.reasoning[:100]}",
-                    screenshot_path=issue_screenshot_path
+                    screenshot_path=await issue_screenshot("ai"),
+                    source="ai",
+                    **attribution,
                 )
                 is_new = await self.state.add_issue(issue)
-
-                events.append({
-                    "type": "issue",
-                    "worker_id": self.worker_id,
-                    "flow_id": task.flow_id,
-                    "data": {
-                        "description": issue.description,
-                        "severity": issue.severity,
-                        "url": issue.url,
-                        "is_new": is_new,
-                        "screenshot_path": issue_screenshot_path
-                    }
-                })
+                if is_new:
+                    self._log_issue_to_transcript(task, issue)
+                events.append(self._issue_event(task, issue, is_new))
 
             # Auto-report console errors
             console_errors = browser.get_console_errors()
-            console_screenshot_path = None
             for error in console_errors:
-                if any(keyword in error.text.lower() for keyword in ["uncaught", "exception", "typeerror", "referenceerror"]):
-                    if console_screenshot_path is None:
-                        console_screenshot = await browser.screenshot()
-                        idx = await self.state.get_next_issue_screenshot_index()
-                        if self.state.chat_logger:
-                            console_screenshot_path = self.state.chat_logger.save_issue_screenshot(console_screenshot, idx) or ""
-                        else:
-                            console_screenshot_path = ""
-                            logger.debug("chat_logger unavailable, console error screenshot discarded")
+                page_url = error.url or browser.current_url
+                classification = classify_console_error(
+                    text=error.text,
+                    location=error.location,
+                    page_url=page_url,
+                    target_domain=self.state.target_domain,
+                    stack_locations=getattr(error, "stack_locations", None),
+                )
+                if classification is None:
+                    continue
+                severity, desc = classification
 
-                    issue = Issue(
-                        description=f"JavaScript error: {error.text[:200]}",
-                        severity="major",
-                        url=error.url or browser.current_url,
-                        action_context=f"Console error at {error.location}" if error.location else "Console error",
-                        screenshot_path=console_screenshot_path
-                    )
-                    is_new = await self.state.add_issue(issue)
-                    if is_new:
-                        events.append({
-                            "type": "issue",
-                            "worker_id": self.worker_id,
-                            "flow_id": task.flow_id,
-                            "data": {
-                                "description": issue.description,
-                                "severity": issue.severity,
-                                "url": issue.url,
-                                "source": "console",
-                                "is_new": True,
-                                "screenshot_path": console_screenshot_path
-                            }
-                        })
-                        await self.state.record_console_error()
+                capped = self._cap_console_issue(
+                    script_host_from_location(error.location) or urlparse(page_url).netloc,
+                    error.text,
+                    severity,
+                    desc,
+                )
+                if capped is None:
+                    continue
+                severity, desc = capped
+
+                issue = Issue(
+                    description=desc,
+                    severity=severity,
+                    url=page_url,
+                    action_context=f"Console error at {error.location}" if error.location else "Console error",
+                    screenshot_path=await issue_screenshot("console"),
+                    source="console",
+                    **attribution,
+                )
+                is_new = await self.state.add_issue(issue)
+                if is_new:
+                    self._log_issue_to_transcript(task, issue)
+                    events.append(self._issue_event(task, issue, True))
+                    await self.state.record_console_error()
             browser.clear_console_messages()
 
             # Auto-report failed network requests
             failed_requests = browser.get_failed_requests(clear=True)
-            network_screenshot_path = None
 
             for req in failed_requests:
                 # NOTE: must not be named `result` — that would shadow the
@@ -1613,6 +1955,7 @@ class FlowExplorationWorker:
                     req_resource_type=req.resource_type,
                     req_failure_reason=req.failure_reason,
                     page_url=browser.current_url,
+                    target_domain=self.state.target_domain,
                 )
                 if classification is None:
                     continue
@@ -1625,37 +1968,19 @@ class FlowExplorationWorker:
                     continue
                 severity, desc = capped
 
-                if network_screenshot_path is None:
-                    network_screenshot = await browser.screenshot()
-                    idx = await self.state.get_next_issue_screenshot_index()
-                    if self.state.chat_logger:
-                        network_screenshot_path = self.state.chat_logger.save_issue_screenshot(network_screenshot, idx) or ""
-                    else:
-                        network_screenshot_path = ""
-                        logger.debug("chat_logger unavailable, network error screenshot discarded")
-
                 issue = Issue(
                     description=desc,
                     severity=severity,
                     url=browser.current_url,
                     action_context=f"Network request to {req.url[:50]}",
-                    screenshot_path=network_screenshot_path
+                    screenshot_path=await issue_screenshot("network"),
+                    source="network",
+                    **attribution,
                 )
                 is_new = await self.state.add_issue(issue)
                 if is_new:
-                    events.append({
-                        "type": "issue",
-                        "worker_id": self.worker_id,
-                        "flow_id": task.flow_id,
-                        "data": {
-                            "description": issue.description,
-                            "severity": issue.severity,
-                            "url": issue.url,
-                            "source": "network",
-                            "is_new": True,
-                            "screenshot_path": network_screenshot_path
-                        }
-                    })
+                    self._log_issue_to_transcript(task, issue)
+                    events.append(self._issue_event(task, issue, True))
                     await self.state.record_network_failure()
 
             # Clear all accumulated network requests to free memory
@@ -1693,7 +2018,6 @@ class FlowExplorationWorker:
 
             # Report dialogs
             dialogs = browser.get_dialogs(clear=True)
-            dialog_screenshot_path = None
             for dialog in dialogs:
                 events.append({
                     "type": "dialog",
@@ -1709,37 +2033,19 @@ class FlowExplorationWorker:
                 await self.state.record_dialog()
 
                 if dialog.dialog_type == "alert" and any(kw in dialog.message.lower() for kw in ["error", "failed", "invalid"]):
-                    if dialog_screenshot_path is None:
-                        dialog_screenshot = await browser.screenshot()
-                        idx = await self.state.get_next_issue_screenshot_index()
-                        if self.state.chat_logger:
-                            dialog_screenshot_path = self.state.chat_logger.save_issue_screenshot(dialog_screenshot, idx) or ""
-                        else:
-                            dialog_screenshot_path = ""
-                            logger.debug("chat_logger unavailable, dialog screenshot discarded")
-
                     issue = Issue(
                         description=f"Alert dialog with error: {dialog.message[:100]}",
                         severity="minor",
                         url=dialog.url or browser.current_url,
                         action_context="Dialog appeared during testing",
-                        screenshot_path=dialog_screenshot_path
+                        screenshot_path=await issue_screenshot("dialog"),
+                        source="dialog",
+                        **attribution,
                     )
                     is_new = await self.state.add_issue(issue)
                     if is_new:
-                        events.append({
-                            "type": "issue",
-                            "worker_id": self.worker_id,
-                            "flow_id": task.flow_id,
-                            "data": {
-                                "description": issue.description,
-                                "severity": issue.severity,
-                                "url": issue.url,
-                                "source": "dialog",
-                                "is_new": True,
-                                "screenshot_path": dialog_screenshot_path
-                            }
-                        })
+                        self._log_issue_to_transcript(task, issue)
+                        events.append(self._issue_event(task, issue, True))
 
             # Increment action counter and emit event
             await self.state.increment_actions()
@@ -1970,28 +2276,17 @@ class FlowExplorationWorker:
                     message=f"Dragged from {action.start_coordinate} to {action.coordinate}"
                 )
 
-            elif action.action_type == "screenshot":
-                # Take a screenshot - could be stored/returned for explicit capture
-                full_page = action.full_page or False
-                screenshot_bytes = await browser.screenshot(full_page=full_page)
+            elif action.action_type in ("screenshot", "zoom"):
+                # Neither is implemented: the model only ever sees the
+                # per-turn viewport screenshot, so a "successful" zoom or
+                # full-page capture would show it nothing new and invite a
+                # false "icon missing / content cut off" finding. Keep the
+                # types parseable but steer the model to what works.
                 return ActionResult(
-                    success=True,
-                    message=f"Took screenshot (full_page={full_page})",
-                    screenshot=screenshot_bytes
-                )
-
-            elif action.action_type == "zoom":
-                # Zoom is primarily for inspection - we just acknowledge it
-                # The actual cropping would be done if we stored the screenshot
-                if action.region is None:
-                    return ActionResult(
-                        success=False,
-                        message="zoom requires region [x0, y0, x1, y1]",
-                        error="Missing region"
-                    )
-                return ActionResult(
-                    success=True,
-                    message=f"Zoom region captured: {action.region}"
+                    success=False,
+                    message=NOOP_CAPTURE_ERROR,
+                    error=NOOP_CAPTURE_ERROR,
+                    corrective_error=True,
                 )
 
             elif action.action_type == "navigate":

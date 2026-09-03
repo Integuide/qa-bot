@@ -168,6 +168,29 @@ _NOISE_RESOURCE_TYPES = frozenset({
 })
 
 
+# First "at ... (https://host/x.js:12:34)" / "at https://host/x.js:12:34" frame
+# of a V8 stack. Only http(s) frames count: inline/eval frames show up as
+# "<anonymous>" or a data: URL and carry no script origin.
+_STACK_FRAME_RE = re.compile(r"\bat (?:.*?\()?(https?://[^\s()]+?):(\d+):(\d+)\)?\s*$", re.MULTILINE)
+
+
+def stack_frame_locations(stack: str) -> list[str]:
+    """All ``url:line:col`` http(s) frames of a JS stack, outermost first."""
+    return [f"{m.group(1)}:{m.group(2)}:{m.group(3)}" for m in _STACK_FRAME_RE.finditer(stack or "")]
+
+
+def first_stack_frame_location(stack: str) -> str:
+    """Return ``url:line:col`` of the first http(s) frame in a JS stack, or "".
+
+    Matches the ``location`` format of console messages so uncaught
+    exceptions can be origin-classified the same way.
+    """
+    m = _STACK_FRAME_RE.search(stack or "")
+    if not m:
+        return ""
+    return f"{m.group(1)}:{m.group(2)}:{m.group(3)}"
+
+
 @dataclass
 class CapturedConsoleMessage:
     """A captured console message from the browser."""
@@ -177,6 +200,10 @@ class CapturedConsoleMessage:
     url: str
     timestamp: str  # ISO format
     location: str  # e.g., "app.js:42:10"
+    # Every script frame of an uncaught exception's stack (pageerror only):
+    # a crash thrown inside a CDN-hosted vendor bundle by the site's own
+    # code has a first-party frame further down, and must classify as such.
+    stack_locations: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -289,6 +316,7 @@ class BrowserController:
         if not self._page:
             return  # No page, no listeners to set up
         self._setup_console_listener(self._page)
+        self._setup_pageerror_listener(self._page)
         self._setup_network_listeners(self._page)
         self._setup_dialog_listener(self._page)
         self._setup_download_listener(self._page)
@@ -314,6 +342,36 @@ class BrowserController:
             )
 
         page.on("console", on_console)
+
+    def _setup_pageerror_listener(self, page: Page):
+        """Capture uncaught JS exceptions as error-level console messages.
+
+        Chromium routes ``Runtime.exceptionThrown`` to Playwright's
+        ``pageerror`` event, NOT to ``console`` — so without this listener a
+        bundle that throws ``Uncaught TypeError`` on load (blank page, dead
+        handlers) is invisible unless the app console.error()s it itself.
+        Feeding it into the same captured-console path lets the worker's
+        JS-error filter, screenshot and origin classification apply unchanged.
+        """
+
+        def on_pageerror(err: Exception):
+            name = getattr(err, "name", None) or type(err).__name__
+            message = getattr(err, "message", None) or str(err)
+            # Cross-origin scripts arrive with name "Uncaught RangeError"
+            # (Chromium pre-formats them) — don't double the prefix.
+            name = name.removeprefix("Uncaught ")
+            self._console_messages.append(
+                CapturedConsoleMessage(
+                    level="error",
+                    text=f"Uncaught {name}: {message}",
+                    url=page.url if page else "",
+                    timestamp=datetime.now().isoformat(),
+                    location=first_stack_frame_location(getattr(err, "stack", "") or ""),
+                    stack_locations=stack_frame_locations(getattr(err, "stack", "") or ""),
+                )
+            )
+
+        page.on("pageerror", on_pageerror)
 
     def _setup_network_listeners(self, page: Page):
         """Set up network request/response listeners on a page."""
@@ -552,6 +610,7 @@ class BrowserController:
         listener is included so popup-from-popup chains stay visible.
         """
         self._setup_console_listener(popup)
+        self._setup_pageerror_listener(popup)
         self._setup_network_listeners(popup)
         self._setup_dialog_listener(popup)
         self._setup_download_listener(popup)

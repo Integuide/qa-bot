@@ -23,6 +23,16 @@ from qa_bot.orchestrator.flow import (
     FlowExplorationData,
 )
 from qa_bot.orchestrator.severity_guard import cap_severity
+from qa_bot.utils.secrets import is_sensitive_key, mask_value
+
+# Fixed goal for smoke mode (CLI `--smoke`, action `mode: smoke`). The
+# coordinator forces this goal whenever smoke is on so a smoke run can never
+# be steered into a full exploration by a caller-supplied goal.
+SMOKE_GOAL = (
+    "SMOKE: load the target, open each top-level navigation link once, "
+    "confirm pages render without server errors, console exceptions or "
+    "broken layout — do not sign up, log in, or submit forms."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,23 +118,16 @@ def format_user_data_for_prompt(
             if field.field_type == "password":
                 password_keys.add(field.key)
 
-    # Also use heuristics for keys that look sensitive (fallback if no fields provided)
-    sensitive_patterns = (
-        "password", "secret", "token", "api_key", "apikey", "credential",
-        "auth", "bearer", "private_key", "privatekey",
-    )
-
+    # Also use heuristics for keys that look sensitive (fallback if no fields
+    # provided) — same rules as SharedFlowState's secret tracking
     lines = []
     for key, value in data.items():
         # Check if this is a password field or looks sensitive
-        is_sensitive = key in password_keys or any(
-            pattern in key.lower() for pattern in sensitive_patterns
-        )
+        is_sensitive = key in password_keys or is_sensitive_key(key)
 
         if is_sensitive and value:
             # Mask the value, showing only length hint
-            masked = f"[MASKED - {len(value)} chars]"
-            lines.append(f"- {key}: {masked}")
+            lines.append(f"- {key}: {mask_value(value)}")
         else:
             lines.append(f"- {key}: {value}")
 
@@ -157,6 +160,18 @@ class SharedFlowState:
     # the synthesis context (matches go in "Known Issues Observed Again", not
     # the severity sections). Empty string = no known-issues list.
     known_issues: str = ""
+    # The previous run's report for the same target (GitHub Action
+    # `previous-report` input / CLI `--previous-report`). Synthesis-only
+    # context: each finding is labelled NEW or recurring (seen in previous
+    # run) and previous items not seen again are listed once as "Not observed
+    # this run". Never fed to workers and never changes severity — a
+    # recurring critical is still critical. Empty string = no previous run.
+    previous_report: str = ""
+    # Smoke mode (CLI `--smoke`, action `mode: smoke`): one worker, fixed
+    # SMOKE_GOAL, hard turn cap, and NO flow forking — add_flow_task /
+    # add_checkpoint refuse to schedule children so the run stays a single
+    # bounded pass. The report is tagged "SMOKE TEST ONLY".
+    smoke: bool = False
 
     # Configuration
     max_branches_per_flow: int = 10  # Limit branching to prevent explosion
@@ -173,6 +188,21 @@ class SharedFlowState:
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
     stop_requested: bool = False
+    # Set by abort(): a reason no retry can fix (rejected API key, no
+    # credit). The coordinator ends the run through its fatal-error path.
+    fatal_error: str = ""
+
+    def abort(self, reason: str) -> None:
+        """Stop the whole run for a reason that makes every further call futile.
+
+        Sets stop_requested so fail_flow() refuses to re-queue the failing
+        flow and no new workers are spawned; the coordinator sees
+        fatal_error on its next loop pass and ends the run as a fatal error
+        instead of a green "Complete" with a NOT TESTED report.
+        """
+        if not self.fatal_error:
+            self.fatal_error = reason
+        self.stop_requested = True
 
     @property
     def total_tokens_used(self) -> int:
@@ -231,6 +261,11 @@ class SharedFlowState:
     # User data management (new flexible system)
     _user_data: dict = field(default_factory=dict)  # request_name -> {key: value, ...}
     _pending_data_requests: list = field(default_factory=list)  # list[UserDataRequest]
+    # Every secret *value* we have been handed (credentials under a
+    # sensitive-looking key, user data in password-typed fields). Workers
+    # mask typed text against this set before it reaches an SSE event, and
+    # the chat logger redacts these values from everything it writes.
+    _secret_values: set = field(default_factory=set)
 
     # Resume flows created before the blocked worker finished saving its
     # checkpoint (the user answered the credentials/data/approval request
@@ -280,8 +315,16 @@ class SharedFlowState:
         interactive: bool = True,
         exploration_id: Optional[str] = None,
         known_issues: str = "",
+        smoke: bool = False,
+        previous_report: str = "",
     ) -> "SharedFlowState":
-        """Create a new shared flow state with initial root flow."""
+        """Create a new shared flow state with initial root flow.
+
+        In smoke mode the root flow is the ONLY flow and does the smoke pass
+        itself, so it is not marked ``is_first_worker`` (that flag means
+        "enumeration only" — excluded from Flows Tested and from the
+        zero-flow gate, and prompted to add_flow rather than explore).
+        """
         exploration_id = exploration_id or str(uuid.uuid4())
         target_domain = extract_domain(target_url)
 
@@ -291,6 +334,8 @@ class SharedFlowState:
             target_domain=target_domain,
             goal=goal,
             known_issues=known_issues,
+            smoke=smoke,
+            previous_report=previous_report,
             max_branches_per_flow=max_branches_per_flow,
             max_duration_minutes=max_duration_minutes,
             max_cost_usd=max_cost_usd,
@@ -305,6 +350,8 @@ class SharedFlowState:
             goal=goal,
             flow_name="Root"
         )
+        if smoke:
+            root_flow.is_first_worker = False
 
         # Initialize flow data for root
         state._flow_registry[root_flow.flow_id] = FlowExplorationData(
@@ -392,6 +439,18 @@ class SharedFlowState:
                 task = self._pause_checkpoints.pop(0)
                 if task.flow_id in self._flow_registry:
                     self._flow_registry[task.flow_id].status = FlowStatus.PENDING
+                # The clone is about to continue the paused flow, so the
+                # original is done in its own right — mark it RESUMED (as
+                # provide_credentials does) rather than leaving it
+                # BLOCKED_FOR_PAUSE, which is_complete() blocks on and would
+                # keep the run spinning until the next limit or a manual Stop.
+                # Only claims do this: a pause that times out (non-interactive
+                # runs never claim) still reports the original as interrupted.
+                parent = self._flow_registry.get(task.parent_flow_id) if task.parent_flow_id else None
+                if parent is not None and parent.status == FlowStatus.BLOCKED_FOR_PAUSE:
+                    parent.status = FlowStatus.RESUMED
+                    parent.completion_reason = "Resumed after pause (continued by a new worker)"
+                    parent.completed_at = datetime.now()
                 return task
 
             # Then the regular queue, highest priority first
@@ -439,17 +498,29 @@ class SharedFlowState:
             - FlowCheckpoint if checkpoint saved but not queued (queue_task=False)
             - None if checkpoint was rejected (duplicate, branch limit, etc.)
         """
+        # Smoke mode never forks: the single smoke pass is the whole run.
+        # (queue_task=False is the same flow's own credential/approval
+        # resume checkpoint, not a child — leave that path alone.)
+        if self.smoke and queue_task:
+            return None
+
         async with self._lock:
             # Check if we already have this checkpoint
             if checkpoint.checkpoint_id in self._checkpoint_registry:
                 return None
 
-            # Check for duplicate flow name (case-insensitive)
-            normalized_name = checkpoint.branch_name.lower().strip()
-            for flow_data in self._flow_registry.values():
-                if flow_data.flow_name.lower().strip() == normalized_name:
-                    # Flow with this name already exists - skip duplicate
-                    return None
+            # Check for duplicate flow name (case-insensitive). Only for
+            # NEW branches: a credential/data/approval resume checkpoint
+            # (queue_task=False) is the blocking flow's own continuation and
+            # carries that flow's name by design — rejecting it here made
+            # every such "resume" restart from the homepage with no browser
+            # state or history (the checkpoint was never saved).
+            if queue_task:
+                normalized_name = checkpoint.branch_name.lower().strip()
+                for flow_data in self._flow_registry.values():
+                    if flow_data.flow_name.lower().strip() == normalized_name:
+                        # Flow with this name already exists - skip duplicate
+                        return None
 
             # Check branch limit (prevent infinite branching)
             parent_branches = sum(
@@ -483,6 +554,7 @@ class SharedFlowState:
                 flow_name=flow_task.flow_name,
                 flow_path=flow_task.flow_path,
                 status=FlowStatus.PENDING,
+                description=goal,
                 parent_flow_id=checkpoint.parent_flow_id,
                 checkpoint_id=checkpoint.checkpoint_id,
             )
@@ -524,10 +596,17 @@ class SharedFlowState:
             self._checkpoint_registry[checkpoint.checkpoint_id] = checkpoint
             flow_task = FlowTask.create_from_checkpoint(checkpoint, goal)
 
-            # Propagate is_first_worker from parent flow
+            # Propagate is_first_worker from parent flow. The clone keeps
+            # the parent's human name: it IS the same flow continuing, and
+            # the name is what the UI tree, activity log, issues and the
+            # report show. resumed_from carries the relationship instead.
             parent_is_first_worker = False
+            parent_description = ""
             if checkpoint.parent_flow_id and checkpoint.parent_flow_id in self._flow_registry:
-                parent_is_first_worker = self._flow_registry[checkpoint.parent_flow_id].is_first_worker
+                parent_data = self._flow_registry[checkpoint.parent_flow_id]
+                parent_is_first_worker = parent_data.is_first_worker
+                parent_description = parent_data.description
+                flow_task.flow_name = parent_data.flow_name or flow_task.flow_name
             flow_task.is_first_worker = parent_is_first_worker
 
             self._flow_registry[flow_task.flow_id] = FlowExplorationData(
@@ -535,10 +614,17 @@ class SharedFlowState:
                 flow_name=flow_task.flow_name,
                 flow_path=flow_task.flow_path,
                 status=FlowStatus.BLOCKED_FOR_PAUSE,
+                description=parent_description,
                 parent_flow_id=checkpoint.parent_flow_id,
                 checkpoint_id=checkpoint.checkpoint_id,
-                is_first_worker=parent_is_first_worker  # Propagate first worker flag
+                is_first_worker=parent_is_first_worker,  # Propagate first worker flag
+                resumed_from=checkpoint.parent_flow_id or None,
+                resume_kind="pause",
             )
+            # Link the clone under its original so get_flow_tree (the final
+            # synthesis_complete flow_tree) shows the continuation
+            if checkpoint.parent_flow_id in self._flow_registry:
+                self._flow_registry[checkpoint.parent_flow_id].child_flow_ids.append(flow_task.flow_id)
             self._pause_checkpoints.append(flow_task)
             return flow_task
 
@@ -604,6 +690,7 @@ class SharedFlowState:
                     flow_id=flow_task.flow_id,
                     flow_name=flow_task.flow_name,
                     flow_path=flow_task.flow_path,
+                    description=flow_task.goal,
                     parent_flow_id=flow_task.parent_flow_id,
                     checkpoint_id=flow_task.checkpoint_id,
                 )
@@ -659,6 +746,11 @@ class SharedFlowState:
         "validate", "validates", "validating", "validation",
         "user", "users", "works", "working", "correctly", "properly",
     })
+
+    def is_flow_goal_relevant(self, flow_text: str) -> bool:
+        """Public form of the scheduler's goal-relevance test (used by the
+        supervisor so its skip decisions agree with mark_flow_skip's backstop)."""
+        return self._is_flow_goal_relevant(flow_text)
 
     def _is_flow_goal_relevant(self, flow_text: str) -> bool:
         """Whether a flow's name (or name + description) matches the run's
@@ -792,12 +884,6 @@ class SharedFlowState:
             if flow_id in self._flow_registry:
                 self._flow_registry[flow_id].actions.append(action)
 
-    async def record_issue_for_flow(self, flow_id: str, issue: dict):
-        """Record an issue found during a flow."""
-        async with self._lock:
-            if flow_id in self._flow_registry:
-                self._flow_registry[flow_id].issues.append(issue)
-
     async def record_thinking_for_flow(self, flow_id: str, thinking: str):
         """Record AI thinking for a flow."""
         async with self._lock:
@@ -827,8 +913,10 @@ class SharedFlowState:
         synthesis agent's curation), so a single over-escalated observation can
         turn a clean deploy red. The guard caps well-understood non-regressions
         (the bot's own click-tooling timeouts, third-party OAuth refusing a
-        bare-IP/HTTP staging host, guessed-URL 404s, and worker-tagged
-        ``[KNOWN]`` known-issue observations) so they can never, on
+        bare-IP/HTTP staging host, guessed-URL 404s, signup "already exists"
+        test-data collisions, anti-abuse restrictions on a just-created
+        account, and worker-tagged ``[KNOWN]`` known-issue observations) so
+        they can never, on
         their own, fail a deploy. It only ever lowers severity. Mutating the
         Issue in place means the downstream ``issue`` SSE event, the synthesis
         input, and the deploy gate all see the same corrected severity.
@@ -849,6 +937,14 @@ class SharedFlowState:
                     existing.url == issue.url):
                     return False
             self._all_issues.append(issue)
+            # Attribute the issue to its flow under the same lock so the
+            # synthesis input can tag each finding with its flow and count
+            # per-flow issues. (A separate record_issue_for_flow method
+            # existed with zero call sites — every flow summary read
+            # "Issues Found: 0" while the issue list above it was non-empty.)
+            flow_data = self._flow_registry.get(issue.flow_id)
+            if flow_data is not None:
+                flow_data.issues.append(issue.to_dict())
             return True
 
     async def increment_actions(self, count: int = 1):
@@ -871,8 +967,17 @@ class SharedFlowState:
         leave its name in _skip_set, where is_flow_skipped_by_name would
         suppress every legitimate future flow with that name.
 
-        Returns True if the flow was marked skip, False if it doesn't exist
-        or is no longer pending.
+        Goal backstop: a flow queued at PRIORITY_GOAL or above (its name or
+        description names the testing goal, or it is a retry of such a
+        flow) is refused unless a COMPLETED flow with the same normalized
+        name already covered it. The supervisor's review is an AI call that
+        sees only a name list, and skipping the one flow that names the
+        goal ("Adventure Mode" as a "duplicate" of "Story Mode") turns a
+        deploy-gate report into "goal not tested". Refusing is cheap: the
+        flow just runs.
+
+        Returns True if the flow was marked skip, False if it doesn't exist,
+        is no longer pending, or is protected by the goal backstop.
         """
         async with self._lock:
             if flow_id not in self._flow_registry:
@@ -881,6 +986,25 @@ class SharedFlowState:
             flow_data = self._flow_registry[flow_id]
             if flow_data.status != FlowStatus.PENDING:
                 return False
+
+            queued_task = next(
+                (task for _, task in self._task_queue if task.flow_id == flow_id),
+                None,
+            )
+            if queued_task is not None and queued_task.priority >= PRIORITY_GOAL:
+                normalized_name = flow_data.flow_name.lower().strip()
+                covered = any(
+                    other.status == FlowStatus.COMPLETED
+                    and other.flow_name.lower().strip() == normalized_name
+                    for other in self._flow_registry.values()
+                )
+                if not covered:
+                    logger.info(
+                        "Refusing supervisor skip of goal-relevant flow %r "
+                        "(priority %d, reason: %s) — no completed flow covers it",
+                        flow_data.flow_name, queued_task.priority, reason,
+                    )
+                    return False
 
             self._skip_set.add(flow_id)
             self._skip_reasons[flow_id] = reason
@@ -1206,7 +1330,13 @@ class SharedFlowState:
         return not has_blocked
 
     async def get_progress(self) -> dict:
-        """Get current progress snapshot."""
+        """Get current progress snapshot.
+
+        ``flows.completed`` counts user flows tested to completion — the
+        Root/first-worker flow (flow enumeration only) is excluded so this
+        number agrees with the coordinator's ``flows_explored`` and a run
+        where only flow-mapping finished reports 0, not 1.
+        """
         async with self._lock:
             # Single pass over flow registry to count all statuses
             completed = pending = exploring = failed = skipped = 0
@@ -1214,7 +1344,8 @@ class SharedFlowState:
             for f in self._flow_registry.values():
                 status = f.status
                 if status == FlowStatus.COMPLETED:
-                    completed += 1
+                    if not f.is_first_worker:
+                        completed += 1
                 elif status == FlowStatus.PENDING:
                     pending += 1
                 elif status == FlowStatus.EXPLORING:
@@ -1276,6 +1407,58 @@ class SharedFlowState:
                 "max_duration_minutes": self.max_duration_minutes
             }
 
+    async def get_snapshot(self) -> dict:
+        """Everything a client attaching mid-run needs to rebuild its view.
+
+        Sent as the ``state_snapshot`` SSE event when a tab (re)attaches to a
+        running exploration (page reload, second tab): the flow registry with
+        per-flow counts, every issue found so far, and the same ``progress``
+        payload the periodic ``progress`` event carries — so the tree, issue
+        list and stat cards come from one source instead of restarting at
+        zero. Actions and activity-log lines are not replayed, only counted.
+        ``phase`` is what the shared state knows (``exploring`` / ``paused``
+        / ``stopping``); the coordinator's synthesis phase is layered on by
+        the caller.
+        """
+        progress = await self.get_progress()
+        async with self._lock:
+            flows = [
+                {
+                    "flow_id": f.flow_id,
+                    "flow_name": f.flow_name,
+                    "flow_path": f.flow_path.to_list(),
+                    "parent_flow_id": f.parent_flow_id,
+                    "status": f.status.value,
+                    "worker_id": f.worker_id,
+                    "action_count": len(f.actions),
+                    "issue_count": len(f.issues),
+                    "is_first_worker": f.is_first_worker,
+                    "resumed_from": f.resumed_from,
+                    "resume_kind": f.resume_kind,
+                    "completion_reason": f.completion_reason,
+                }
+                for f in self._flow_registry.values()
+            ]
+            issues = [issue.to_dict() for issue in self._all_issues]
+            if self.paused:
+                phase = "paused"
+            elif self.stop_requested:
+                phase = "stopping"
+            else:
+                phase = "exploring"
+        return {
+            "exploration_id": self.exploration_id,
+            "target_url": self.target_url,
+            "goal": self.goal,
+            "phase": phase,
+            "started_at": self.start_time.isoformat(),
+            "max_duration_minutes": self.max_duration_minutes,
+            "max_cost_usd": self.max_cost_usd,
+            "progress": progress,
+            "flows": flows,
+            "issues": issues,
+        }
+
     async def get_all_issues(self) -> list[Issue]:
         """Get all discovered issues."""
         async with self._lock:
@@ -1311,6 +1494,8 @@ class SharedFlowState:
                     "worker_id": flow_data.worker_id,
                     "action_count": len(flow_data.actions),
                     "issue_count": len(flow_data.issues),
+                    "resumed_from": flow_data.resumed_from,
+                    "resume_kind": flow_data.resume_kind,
                     "children": children
                 }
 
@@ -1416,8 +1601,12 @@ class SharedFlowState:
         """
         Add a new flow task without checkpoint (fresh browser state).
 
-        Returns None if a flow with the same name already exists (duplicate prevention).
+        Returns None if a flow with the same name already exists (duplicate prevention),
+        or always in smoke mode (a smoke run never schedules child flows).
         """
+        if self.smoke:
+            return None
+
         async with self._lock:
             # Check for duplicate flow name (case-insensitive)
             normalized_name = flow_name.lower().strip()
@@ -1455,6 +1644,7 @@ class SharedFlowState:
                 flow_name=flow_name,
                 flow_path=flow_path,
                 status=FlowStatus.PENDING,
+                description=goal,
                 parent_flow_id=parent_flow_id
             )
 
@@ -1485,6 +1675,26 @@ class SharedFlowState:
         async with self._lock:
             self._credentials.update(credentials)
             self._detect_http_auth(credentials)
+            self._remember_secrets(credentials)
+
+    def _remember_secrets(self, data: dict[str, str], password_keys: set[str] = frozenset()):
+        """Track secret values from credentials/user data (call under lock).
+
+        A value is a secret if its key is in ``password_keys`` (password-typed
+        data-request fields) or looks sensitive by name. Non-secret values
+        (usernames, emails) stay visible in logs — they're needed for repro.
+        """
+        for key, value in data.items():
+            if isinstance(value, str) and value and (
+                key in password_keys or is_sensitive_key(key)
+            ):
+                self._secret_values.add(value)
+        if self.chat_logger:
+            self.chat_logger.register_secrets(self._secret_values)
+
+    def get_secret_values(self) -> frozenset[str]:
+        """Snapshot of all known secret values (sync: a lock-free set read)."""
+        return frozenset(self._secret_values)
 
     async def get_credentials(self) -> dict[str, str]:
         """Get all stored credentials."""
@@ -1574,42 +1784,48 @@ class SharedFlowState:
         )
         return True
 
-    async def provide_credentials(self, credentials: dict[str, str]) -> Optional[dict]:
+    async def provide_credentials(self, credentials: dict[str, str]) -> list[dict]:
         """
         User provides credentials via UI/API.
 
-        Stores credentials and creates a retry flow if there were pending requests.
-        Also detects HTTP Basic Auth credentials from key patterns.
-        Returns dict with new flow info if created, or None.
+        Stores the credentials and creates one resume flow per pending
+        credential request — every worker that blocked waiting for
+        credentials gets to continue, not just the first (mirrors
+        provide_user_data). Also detects HTTP Basic Auth credentials from
+        key patterns. Returns the list of new flow info dicts (empty if no
+        request was pending).
         """
         async with self._lock:
             # Store the credentials
             self._credentials.update(credentials)
             self._detect_http_auth(credentials)
+            self._remember_secrets(credentials)
 
-            # If there were pending requests, create a retry flow
-            if self._pending_credential_requests:
-                # Get the first pending request for context
-                request = self._pending_credential_requests[0]
+            pending_requests = list(self._pending_credential_requests)
+            self._pending_credential_requests.clear()
+
+            new_flows = []
+            for request in pending_requests:
                 original_flow_id = request.get("flow_id")
                 checkpoint_id = request.get("checkpoint_id")
-
-                # Clear pending requests
-                self._pending_credential_requests.clear()
 
                 # Get original flow data for better naming and first_worker flag
                 original_flow_name = ""
                 original_flow_path = FlowPath()
                 original_is_first_worker = False
+                original_description = ""
                 if original_flow_id and original_flow_id in self._flow_registry:
                     original_flow_data = self._flow_registry[original_flow_id]
                     original_flow_name = original_flow_data.flow_name
                     original_flow_path = original_flow_data.flow_path
                     original_is_first_worker = original_flow_data.is_first_worker
+                    original_description = original_flow_data.description
 
                 # Create a new flow to retry with credentials
                 flow_id = str(uuid.uuid4())
-                flow_name = f"Resume: {original_flow_name}" if original_flow_name else "Resume with credentials"
+                # Same flow continuing, so same name (the relationship is
+                # resumed_from/resume_kind, not a "Resume:" name prefix)
+                flow_name = original_flow_name or "Resume with credentials"
                 flow_path = original_flow_path if original_flow_path.steps else FlowPath([flow_name])
 
                 flow_task = FlowTask(
@@ -1630,17 +1846,22 @@ class SharedFlowState:
                     flow_name=flow_name,
                     flow_path=flow_path,
                     status=FlowStatus.PENDING,
+                    description=original_description,  # A resume is still the same test
                     parent_flow_id=original_flow_id,
                     checkpoint_id=checkpoint_id,
                     is_first_worker=original_is_first_worker,  # Propagate first worker flag
+                    resumed_from=original_flow_id or None,
+                    resume_kind="credentials",
                 )
+                if original_flow_id in self._flow_registry:
+                    self._flow_registry[original_flow_id].child_flow_ids.append(flow_id)
 
                 # Mark original blocked flow as resumed (continuing via new child flow)
                 if original_flow_id and original_flow_id in self._flow_registry:
                     original_flow = self._flow_registry[original_flow_id]
                     if original_flow.status == FlowStatus.BLOCKED_FOR_CREDENTIALS:
                         original_flow.status = FlowStatus.RESUMED
-                        original_flow.completion_reason = f"Resumed via {flow_name} after credentials provided"
+                        original_flow.completion_reason = "Resumed after credentials provided"
                         original_flow.completed_at = datetime.now()
 
                 # The user may have answered before the blocked worker
@@ -1654,18 +1875,21 @@ class SharedFlowState:
                 # Queue the task
                 self._queue_put(flow_task)
 
-                # Trigger supervisor
-                self._supervisor_trigger.set()
-
-                return {
+                new_flows.append({
                     "flow_id": flow_id,
                     "flow_name": flow_name,
                     "flow_path": [str(s) for s in flow_path.steps] if flow_path.steps else [flow_name],
                     "parent_flow_id": original_flow_id,
+                    "resumed_from": original_flow_id,
+                    "resume_kind": "credentials",
                     "status": "pending"
-                }
+                })
 
-            return None
+            # Trigger supervisor
+            if new_flows:
+                self._supervisor_trigger.set()
+
+            return new_flows
 
     async def set_credential_request_checkpoint(
         self,
@@ -1772,6 +1996,10 @@ class SharedFlowState:
                 r for r in self._pending_data_requests
                 if r.request_name == request_name
             ]
+            self._remember_secrets(data, password_keys={
+                f.key for r in matching_requests for f in r.fields
+                if f.field_type == "password"
+            })
 
             new_flows = []
             for request in matching_requests:
@@ -1783,15 +2011,18 @@ class SharedFlowState:
                 original_flow_name = ""
                 original_flow_path = FlowPath()
                 original_is_first_worker = False
+                original_description = ""
                 if original_flow_id in self._flow_registry:
                     original_flow_data = self._flow_registry[original_flow_id]
                     original_flow_name = original_flow_data.flow_name
                     original_flow_path = original_flow_data.flow_path
                     original_is_first_worker = original_flow_data.is_first_worker
+                    original_description = original_flow_data.description
 
                 # Create a new flow to resume with data
                 flow_id = str(uuid.uuid4())
-                flow_name = f"Resume: {original_flow_name}" if original_flow_name else f"Resume with {request_name}"
+                # Same flow continuing, so same name (see provide_credentials)
+                flow_name = original_flow_name or f"Resume with {request_name}"
                 flow_path = original_flow_path if original_flow_path.steps else FlowPath([flow_name])
 
                 flow_task = FlowTask(
@@ -1812,17 +2043,22 @@ class SharedFlowState:
                     flow_name=flow_name,
                     flow_path=flow_path,
                     status=FlowStatus.PENDING,
+                    description=original_description,  # A resume is still the same test
                     parent_flow_id=original_flow_id,
                     checkpoint_id=request.checkpoint_id,
                     is_first_worker=original_is_first_worker,  # Propagate first worker flag
+                    resumed_from=original_flow_id or None,
+                    resume_kind="data",
                 )
+                if original_flow_id in self._flow_registry:
+                    self._flow_registry[original_flow_id].child_flow_ids.append(flow_id)
 
                 # Mark original blocked flow as resumed
                 if original_flow_id in self._flow_registry:
                     original_flow = self._flow_registry[original_flow_id]
                     if original_flow.status == FlowStatus.BLOCKED_FOR_CREDENTIALS:
                         original_flow.status = FlowStatus.RESUMED
-                        original_flow.completion_reason = f"Resumed via {flow_name} after data provided"
+                        original_flow.completion_reason = "Resumed after data provided"
                         original_flow.completed_at = datetime.now()
 
                 # The user may have answered before the blocked worker
@@ -1841,6 +2077,8 @@ class SharedFlowState:
                     "flow_name": flow_name,
                     "flow_path": [str(s) for s in flow_path.steps] if flow_path.steps else [flow_name],
                     "parent_flow_id": original_flow_id,
+                    "resumed_from": original_flow_id,
+                    "resume_kind": "data",
                     "status": "pending"
                 })
 
@@ -2016,16 +2254,19 @@ class SharedFlowState:
             original_flow_name = ""
             original_flow_path = FlowPath()
             original_is_first_worker = False
+            original_description = ""
             if original_flow_id in self._flow_registry:
                 original_flow_data = self._flow_registry[original_flow_id]
                 original_flow_name = original_flow_data.flow_name
                 original_flow_path = original_flow_data.flow_path
                 original_is_first_worker = original_flow_data.is_first_worker
+                original_description = original_flow_data.description
 
             # Create a new flow to resume with the approval result
             new_flow_id = str(uuid.uuid4())
             approval_status = "approved" if approved else "denied"
-            flow_name = f"Resume ({approval_status}): {original_flow_name}" if original_flow_name else f"Resume after approval ({approval_status})"
+            # Same flow continuing, so same name (see provide_credentials)
+            flow_name = original_flow_name or f"Resume after approval ({approval_status})"
             flow_path = original_flow_path if original_flow_path.steps else FlowPath([flow_name])
 
             goal_suffix = "Proceed with the action." if approved else "Skip the action and continue testing other aspects."
@@ -2047,17 +2288,22 @@ class SharedFlowState:
                 flow_name=flow_name,
                 flow_path=flow_path,
                 status=FlowStatus.PENDING,
+                description=original_description,  # A resume is still the same test
                 parent_flow_id=original_flow_id,
                 checkpoint_id=checkpoint_id,
                 is_first_worker=original_is_first_worker,  # Propagate first worker flag
+                resumed_from=original_flow_id or None,
+                resume_kind="approval",
             )
+            if original_flow_id in self._flow_registry:
+                self._flow_registry[original_flow_id].child_flow_ids.append(new_flow_id)
 
             # Mark original blocked flow as resumed (continuing via new child flow)
             if original_flow_id in self._flow_registry:
                 original_flow = self._flow_registry[original_flow_id]
                 if original_flow.status == FlowStatus.BLOCKED_FOR_APPROVAL:
                     original_flow.status = FlowStatus.RESUMED
-                    original_flow.completion_reason = f"Resumed via {flow_name} after user {approval_status}"
+                    original_flow.completion_reason = f"Resumed after user {approval_status} the action"
                     original_flow.completed_at = datetime.now()
 
             # The user may have responded before the blocked worker finished
@@ -2079,6 +2325,8 @@ class SharedFlowState:
                 "flow_name": flow_name,
                 "flow_path": [str(s) for s in flow_path.steps] if flow_path.steps else [flow_name],
                 "parent_flow_id": original_flow_id,
+                "resumed_from": original_flow_id,
+                "resume_kind": "approval",
                 "status": "pending"
             }
 

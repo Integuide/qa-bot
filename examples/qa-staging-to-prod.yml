@@ -207,6 +207,8 @@ jobs:
           FLOWS: ${{ steps.qa.outputs.flows-explored }}
           ISSUES: ${{ steps.qa.outputs.issues-count }}
           CRITICAL: ${{ steps.qa.outputs.critical-issues }}
+          CURATED: ${{ steps.qa.outputs.curated-critical-issues }}
+          QA_OUTCOME: ${{ steps.qa.outcome }}
         run: |
           echo "### QA Bot Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -214,6 +216,18 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Flows Explored | $FLOWS |" >> $GITHUB_STEP_SUMMARY
-          echo "| Issues Found | $ISSUES |" >> $GITHUB_STEP_SUMMARY
-          echo "| Critical Issues | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| Flows Explored | ${FLOWS:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Issues Found | ${ISSUES:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical (raw worker findings) | ${CRITICAL:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical (after curation) | ${CURATED:-n/a} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          # fail-on-critical gates on the curated count when present, else raw.
+          GATE="${CURATED:-${CRITICAL:-0}}"
+          # A run that tested nothing (or crashed) must not read as a pass.
+          if [ -z "$FLOWS" ] || [ "$FLOWS" = "0" ]; then
+            echo "> [!CAUTION]" >> $GITHUB_STEP_SUMMARY
+            echo "> The target was **NOT tested** — 0 user flows were explored. This deploy has not been verified; see the PR comment and the run logs." >> $GITHUB_STEP_SUMMARY
+          elif [ "$QA_OUTCOME" = "failure" ] && [ "$GATE" -eq 0 ]; then
+            echo "> [!CAUTION]" >> $GITHUB_STEP_SUMMARY
+            echo "> The QA step failed after exploring $FLOWS flow(s) — results are incomplete. See the run logs." >> $GITHUB_STEP_SUMMARY
+          fi

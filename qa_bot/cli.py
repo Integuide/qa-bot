@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from qa_bot.config import LOG_LEVEL, MAX_CONCURRENT_API_CALLS, DEFAULT_MODEL
+from qa_bot.utils.secrets import is_sensitive_field_label
 
 # Configure logging with level from environment
 logging.basicConfig(
@@ -37,6 +38,7 @@ logging.basicConfig(
 
 from qa_bot.ai.claude_provider import ClaudeProvider
 from qa_bot.orchestrator.coordinator import FlowExplorationOrchestrator
+from qa_bot.orchestrator.shared_state import SMOKE_GOAL
 
 
 LogLevel = Literal["quiet", "summary", "full"]
@@ -89,6 +91,23 @@ def parse_inline_credential(credential_str: str) -> tuple[str, str]:
     return key.strip(), value.strip()
 
 
+def _issue_attribution(event: dict) -> str:
+    """" (worker-2, flow: Checkout, turn 12, source: console)" for an issue
+    event — the pointer from a CLI-printed finding to the worker transcript
+    turn that produced it. Empty when the event carries no attribution."""
+    data = event.get("data", {})
+    parts = []
+    if event.get("worker_id"):
+        parts.append(event["worker_id"])
+    if data.get("flow_name"):
+        parts.append(f"flow: {data['flow_name']}")
+    if data.get("turn") is not None:
+        parts.append(f"turn {data['turn']}")
+    if data.get("source"):
+        parts.append(f"source: {data['source']}")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
 def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
     """
     Format an event for CLI logging based on log level.
@@ -134,7 +153,7 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
             # also covers a present-but-null/empty description (slicing None
             # would raise inside the formatter).
             title = data.get("title") or (data.get("description") or "Unknown issue")[:100]
-            return f"[Issue] [{severity}] {title}"
+            return f"[Issue] [{severity}] {title}{_issue_attribution(event)}"
         elif event_type == "exploration_complete":
             flows = data.get("flows_explored", 0)
             issues = data.get("issues_found", 0)
@@ -226,10 +245,18 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
             elif action_type == "type":
                 element = data.get("element", "unknown element")
                 text = data.get("text", "")[:30]  # Truncate long text
+                # CI runs this at --log-level full, so a value typed into a
+                # password-looking field must not reach workflow stdout
+                # (the worker masks known credential values at the source;
+                # this catches passwords the AI invented or was told inline)
+                if is_sensitive_field_label(element):
+                    text = "***"
                 return f"[{timestamp}] [Action] Type: '{text}' into {element}"
             elif action_type == "form_input":
                 element = data.get("element", "unknown element")
                 value = data.get("value", "")
+                if is_sensitive_field_label(element):
+                    value = "***"
                 return f"[{timestamp}] [Action] Form input: {value} into {element}"
             elif action_type == "scroll":
                 direction = data.get("scroll_direction", "down")
@@ -282,7 +309,10 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
             # used to log a literal "Unknown issue" headline
             title = data.get("title") or description or "Unknown issue"
             detail = description if data.get("title") else ""
-            return f"[{timestamp}] [Issue] [{severity.upper()}] {title}" + (f"\n           {detail}" if detail else "")
+            return (
+                f"[{timestamp}] [Issue] [{severity.upper()}] {title}{_issue_attribution(event)}"
+                + (f"\n           {detail}" if detail else "")
+            )
 
         # Checkpoint events
         elif event_type == "checkpoint_created":
@@ -381,7 +411,9 @@ async def run_exploration(
     credentials: Optional[dict[str, str]] = None,
     max_cost_usd: float = 5.0,
     skip_permissions: bool = False,
-    known_issues: str = ""
+    known_issues: str = "",
+    smoke: bool = False,
+    previous_report: str = "",
 ) -> dict:
     """
     Run QA exploration and return results.
@@ -401,6 +433,12 @@ async def run_exploration(
         known_issues: Operator-provided known-issues/environment-caveats text;
             workers skip re-investigating matches and the report lists them as
             one-line "observed again" notes instead of findings
+        smoke: Smoke mode — preflight probe, then one turn-capped worker with
+            the fixed SMOKE_GOAL (``goal`` is ignored), no flow forking, and
+            a report tagged "SMOKE TEST ONLY — not a regression test"
+        previous_report: The previous run's report text for the same target;
+            synthesis labels each finding NEW / recurring against it and
+            lists previous findings not seen again. Never demotes anything.
 
     Returns:
         dict with report, issues, and metadata. ``completed`` is False when the
@@ -424,6 +462,7 @@ async def run_exploration(
 
     events = []
     report = None
+    verdict = None
     issues = []
     flows_explored = 0
     duration_seconds = 0
@@ -432,8 +471,11 @@ async def run_exploration(
     exploration_completed = False
     fatal_error = None
 
+    if smoke:
+        goal = SMOKE_GOAL  # the orchestrator forces this too; keep the result honest
+
     if log_level != "quiet":
-        print(f"Starting exploration of {url}", file=sys.stderr)
+        print(f"Starting {'SMOKE TEST' if smoke else 'exploration'} of {url}", file=sys.stderr)
         print(f"Goal: {goal}", file=sys.stderr)
         limit_info = f"Max agents: {max_agents}, Max duration: {max_duration} min, Max cost: ${max_cost_usd:.2f}"
         print(limit_info, file=sys.stderr)
@@ -445,14 +487,18 @@ async def run_exploration(
         max_agents=max_agents,
         max_duration_minutes=max_duration,
         max_cost_usd=max_cost_usd,
-        known_issues=known_issues
+        known_issues=known_issues,
+        smoke=smoke,
+        previous_report=previous_report,
     ):
         events.append(event)
         event_type = event.get("type", "")
 
-        # Capture synthesis report
+        # Capture synthesis report and its curated verdict (None when
+        # synthesis fell back to a deterministic/non-AI report)
         if event_type == "synthesis_complete":
             report = event.get("data", {}).get("report", "")
+            verdict = event.get("data", {}).get("verdict")
 
         # Capture issues
         if event_type == "issue":
@@ -487,6 +533,20 @@ async def run_exploration(
         "report": report or "No report generated",
         "issues": issues,
         "issues_found": len(issues),
+        # Curated verdict from the synthesis report. The exit code below and
+        # the action's gate use curated_critical_count when it is non-null
+        # (the report is the source of truth) and fall back to the RAW
+        # "issues" list when it is null (no AI verdict: fallback / NOT
+        # TESTED report). Both numbers stay visible side by side.
+        "curated_critical_count": verdict["critical_count"] if verdict else None,
+        "curated_critical_titles": (
+            [c["title"] for c in verdict["critical"]] if verdict else None
+        ),
+        "curated_verdict": verdict,
+        # Run-over-run labels from the verdict (None when no previous report
+        # was supplied, or synthesis produced no verdict).
+        "new_findings_count": verdict.get("new") if verdict else None,
+        "recurring_findings_count": verdict.get("recurring") if verdict else None,
         "flows_explored": flows_explored,
         "duration_seconds": round(duration_seconds, 2),
         "estimated_cost_usd": round(estimated_cost_usd, 4),
@@ -495,8 +555,58 @@ async def run_exploration(
         "error": fatal_error,
         "target_url": url,
         "goal": goal,
+        "mode": "smoke" if smoke else "full",
         "timestamp": datetime.now().isoformat()
     }
+
+
+def load_previous_report(value: str) -> str:
+    """Resolve ``--previous-report``: a path to a report file, or inline text.
+
+    The GitHub Action passes the previous run's report.md inline (the mono
+    wrapper runs the CLI in a container that can't see the runner's files);
+    a local user passes a path. A value naming an existing file is read,
+    anything else is the report itself. Empty in → empty out.
+    """
+    if not value or not value.strip():
+        return ""
+    candidate = value.strip()
+    if "\n" not in candidate and os.path.isfile(candidate):
+        with open(candidate, encoding="utf-8") as f:
+            return f.read()
+    if "\n" not in candidate and (candidate.endswith(".md") or "/" in candidate) and len(candidate) < 512:
+        # Looks like a path that does not exist: a typo or wrong cwd. Do not
+        # feed the path string to synthesis as if it were the previous report.
+        print(
+            f"Warning: --previous-report '{candidate}' is not an existing file; "
+            "ignoring it (pass the report text inline or a valid path).",
+            file=sys.stderr,
+        )
+        return ""
+    return value
+
+
+# Per-mode defaults for the limit flags (None on the argparse side so an
+# explicit value always wins over the mode default).
+LIMIT_DEFAULTS = {
+    "full": {"max_agents": 3, "max_duration": 30, "max_cost": 5.0},
+    "smoke": {"max_agents": 1, "max_duration": 5, "max_cost": 0.75},
+}
+
+
+def resolve_limits(args) -> tuple[int, int, float]:
+    """Return (max_agents, max_duration, max_cost) for the parsed args.
+
+    Each limit is the explicit flag value when given, else the default for
+    the run mode: 3 agents / 30 min / $5.00 for a full run, 1 / 5 / $0.75
+    for ``--smoke``.
+    """
+    defaults = LIMIT_DEFAULTS["smoke" if getattr(args, "smoke", False) else "full"]
+    return (
+        args.max_agents if args.max_agents is not None else defaults["max_agents"],
+        args.max_duration if args.max_duration is not None else defaults["max_duration"],
+        args.max_cost if args.max_cost is not None else defaults["max_cost"],
+    )
 
 
 def main():
@@ -528,6 +638,10 @@ Examples:
 
     # Shorthand for full logging
     python -m qa_bot.cli https://example.com -vv
+
+    # Smoke test only: one worker opens each top-level nav link once
+    # (defaults: 1 agent, 5 min, $0.75; report tagged SMOKE TEST ONLY)
+    python -m qa_bot.cli https://example.com --smoke
         """
     )
 
@@ -551,22 +665,45 @@ Examples:
         )
     )
     parser.add_argument(
+        "--previous-report",
+        default="",
+        help=(
+            "The previous run's report for the same target — a path to its "
+            "report.md, or the markdown itself. The report labels each finding "
+            "NEW or 'recurring (seen in previous run)' and lists previous "
+            "findings not observed this run. Labels only: severity is never "
+            "changed and nothing is suppressed (use --known-issues for that)."
+        )
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help=(
+            "Smoke test only: preflight probe, then a single turn-capped "
+            "worker loads the target and opens each top-level navigation "
+            "link once (no sign-up/login/forms, no flow forking). --goal is "
+            "ignored; the report is tagged 'SMOKE TEST ONLY — not a "
+            "regression test'. Defaults become 1 agent, 5 min, $0.75 "
+            "unless overridden."
+        )
+    )
+    parser.add_argument(
         "--max-agents", "-a",
         type=int,
-        default=3,
-        help="Maximum parallel agents (default: 3)"
+        default=None,
+        help="Maximum parallel agents (default: 3; 1 with --smoke)"
     )
     parser.add_argument(
         "--max-cost",
         type=float,
-        default=5.0,
-        help="Maximum cost in USD (default: $5.00)"
+        default=None,
+        help="Maximum cost in USD (default: $5.00; $0.75 with --smoke)"
     )
     parser.add_argument(
         "--max-duration", "-d",
         type=int,
-        default=30,
-        help="Maximum duration in minutes (default: 30)"
+        default=None,
+        help="Maximum duration in minutes (default: 30; 5 with --smoke)"
     )
     parser.add_argument(
         "--api-key",
@@ -687,21 +824,38 @@ Examples:
     elif testmail_key or testmail_namespace:
         print("Warning: Both --testmail-api-key and --testmail-namespace are required for email testing", file=sys.stderr)
 
+    max_agents, max_duration, max_cost = resolve_limits(args)
+    try:
+        previous_report = load_previous_report(args.previous_report)
+    except OSError as e:
+        print(f"Error reading previous report: {e}", file=sys.stderr)
+        sys.exit(1)
+    if previous_report and log_level != "quiet":
+        print(
+            f"Previous report loaded ({len(previous_report)} chars) — findings "
+            "will be labelled NEW / recurring",
+            file=sys.stderr,
+        )
+    if args.smoke and args.goal != parser.get_default("goal") and log_level != "quiet":
+        print("Note: --smoke uses a fixed smoke goal; --goal is ignored", file=sys.stderr)
+
     # Run exploration
     try:
         result = asyncio.run(run_exploration(
             url=args.url,
             goal=args.goal,
             known_issues=args.known_issues,
-            max_agents=args.max_agents,
-            max_duration=args.max_duration,
+            max_agents=max_agents,
+            max_duration=max_duration,
             api_key=api_key,
             model=args.model,
             headless=not args.headed,
             log_level=log_level,
             credentials=credentials if credentials else None,
-            max_cost_usd=args.max_cost,
-            skip_permissions=args.dangerously_skip_permissions
+            max_cost_usd=max_cost,
+            skip_permissions=args.dangerously_skip_permissions,
+            smoke=args.smoke,
+            previous_report=previous_report,
         ))
     except KeyboardInterrupt:
         print("\nExploration cancelled", file=sys.stderr)
@@ -736,14 +890,42 @@ Examples:
     else:
         print(output)
 
-    # Exit with error code if critical issues found
-    critical_issues = [
-        i for i in result["issues"]
+    # Exit 1 on critical issues. Gate on the CURATED count from the synthesis
+    # verdict when present (the report is the source of truth — a raw worker
+    # critical that synthesis downgraded must not fail the run), else on the
+    # RAW worker-reported count (synthesis fell back to a non-AI report).
+    # Mirrors action/entrypoint.sh so CLI and action agree.
+    raw_critical_count = sum(
+        1 for i in result["issues"]
         if i.get("severity", "").lower() == "critical"
-    ]
-    if critical_issues:
+    )
+    curated = result.get("curated_critical_count")
+    gate_count = curated if curated is not None else raw_critical_count
+    if curated is not None and curated < raw_critical_count and log_level != "quiet":
+        # The curated verdict is AI-written from site-influenced text; a
+        # downgrade must be visible wherever the exit code is read.
+        print(
+            f"Warning: synthesis downgraded {raw_critical_count - curated} of "
+            f"{raw_critical_count} raw critical finding(s); review the report's "
+            "Likely False Positives / Known Issues sections before trusting a pass.",
+            file=sys.stderr,
+        )
+    if gate_count > 0:
         if log_level != "quiet":
-            print(f"Found {len(critical_issues)} critical issues", file=sys.stderr)
+            if curated is not None:
+                titles = result.get("curated_critical_titles") or []
+                titles_note = f": {' | '.join(titles)}" if titles else ""
+                print(
+                    f"Found {curated} critical issue(s) after curation{titles_note} "
+                    f"({raw_critical_count} raw worker finding(s))",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"Found {raw_critical_count} critical issue(s) "
+                    f"(raw worker findings; synthesis produced no curated verdict)",
+                    file=sys.stderr,
+                )
         sys.exit(1)
 
     sys.exit(0)

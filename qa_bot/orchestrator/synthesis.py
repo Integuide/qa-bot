@@ -1,14 +1,268 @@
 """Synthesis agent that generates final QA reports."""
 
+import json
 import logging
 import re
 from datetime import datetime
+from typing import Optional
 
 from qa_bot.ai.base import AIProvider
+from qa_bot.ai.prompts import format_issue_trace
 from qa_bot.orchestrator.shared_state import SharedFlowState
 from qa_bot.orchestrator.flow import FlowStatus
+from qa_bot.utils.secrets import is_sensitive_field_label
 
 logger = logging.getLogger(__name__)
+
+
+# The synthesis prompt asks the model to end its output with a fenced
+# ```qa-verdict block holding a small JSON object (the curated critical list,
+# major count, known-issues-observed-again count). The CI gate (and the CLI
+# exit code) fail on this CURATED verdict when it parses, and fall back to
+# the raw worker counts only when it is absent.
+# Tolerate the block appearing anywhere (a model that adds a trailing
+# sign-off still gets parsed) — the LAST block wins.
+_VERDICT_BLOCK = re.compile(
+    r"[ \t]*```[ \t]*qa-verdict[ \t]*\r?\n(?P<body>.*?)\r?\n[ \t]*```[ \t]*",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _as_count(value) -> int:
+    """Coerce a verdict count to a non-negative int (garbage -> 0)."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_verdict(report: str) -> tuple[str, Optional[dict]]:
+    """Split a synthesis report into (human markdown, machine verdict).
+
+    Returns ``(report_without_block, verdict)`` when a well-formed
+    ``qa-verdict`` block is present, else ``(report_unchanged, None)``. A
+    ``None`` verdict means "no curated verdict available" (fallback report,
+    model ignored the instruction, malformed JSON) — distinct from a verdict
+    with an empty ``critical`` list, which means "curated report has zero
+    criticals". The report is only stripped when parsing succeeds, so a
+    malformed block stays visible to a human reader rather than vanishing.
+
+    The normalized verdict always has the shape::
+
+        {"critical": [{"title": str, "flow": str | None}, ...],
+         "critical_count": int, "major": int, "known_observed_again": int,
+         "new": int | None, "recurring": int | None}
+
+    ``new`` / ``recurring`` are the run-over-run labels (Report Quality
+    Standard 11) and are ``None`` when the block carries no such keys — the
+    run had no previous report to compare against.
+    """
+    if not report:
+        return report, None
+
+    matches = list(_VERDICT_BLOCK.finditer(report))
+    if not matches:
+        return report, None
+    match = matches[-1]
+
+    try:
+        raw = json.loads(match.group("body"))
+    except (ValueError, TypeError):
+        logger.warning("Synthesis qa-verdict block is not valid JSON; ignoring it")
+        return report, None
+    if not isinstance(raw, dict):
+        logger.warning("Synthesis qa-verdict block is not a JSON object; ignoring it")
+        return report, None
+
+    critical_raw = raw.get("critical")
+    if critical_raw is None:
+        critical_raw = []
+    if not isinstance(critical_raw, list):
+        logger.warning("Synthesis qa-verdict 'critical' is not a list; ignoring verdict")
+        return report, None
+
+    critical = []
+    for entry in critical_raw:
+        if isinstance(entry, dict):
+            title = str(entry.get("title") or "").strip()
+            flow = entry.get("flow")
+            flow = str(flow).strip() if flow not in (None, "") else None
+        else:
+            title, flow = str(entry).strip(), None
+        if not title:
+            # A titleless entry still means "the model listed a critical".
+            # Dropping it would silently decrement the count the deploy gate
+            # fails on while the report body still describes the finding —
+            # the gate must never read lower than what the model claimed
+            # (2026-09-03 review). Keep it, named so a reader can tell why.
+            logger.warning(
+                "Synthesis qa-verdict critical entry has no title; "
+                "counting it anyway so the gate is not silently lowered"
+            )
+            title = "(untitled critical finding — see the report body)"
+        critical.append({"title": title, "flow": flow})
+
+    verdict = {
+        "critical": critical,
+        "critical_count": len(critical),
+        "major": _as_count(raw.get("major", 0)),
+        "known_observed_again": _as_count(raw.get("known_observed_again", 0)),
+        "new": _as_count(raw["new"]) if raw.get("new") is not None else None,
+        "recurring": (
+            _as_count(raw["recurring"]) if raw.get("recurring") is not None else None
+        ),
+    }
+
+    stripped = (report[:match.start()] + report[match.end():]).rstrip() + "\n"
+    return stripped, verdict
+
+
+# Prepended to the fallback report persisted before the AI synthesis call.
+# Only ever read if the run died before the AI report overwrote it.
+PROVISIONAL_REPORT_BANNER = (
+    "> **Note:** Provisional report, written before AI synthesis started. "
+    "If you are reading this, the run ended (server restart or crash) before "
+    "the AI-written report could replace it. The findings below are complete "
+    "but unpolished.\n\n"
+)
+
+
+def _plural(n: int, unit: str) -> str:
+    return f"{n} {unit}" if n == 1 else f"{n} {unit}s"
+
+
+def format_duration(seconds: float) -> str:
+    """Human-readable run duration ("1 minute", "45 seconds", "1h 05m")."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return _plural(seconds, "second")
+    if seconds < 3600:
+        return _plural(seconds // 60, "minute")
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+
+
+# Substrings (lower-cased) in a flow's completion reason that mean the run's
+# cost/time budget cut it off, as opposed to a worker error.
+_LIMIT_REASON_MARKERS = ("limit", "cost", "budget", "time", "pause", "duration")
+
+# Smoke mode (SharedFlowState.smoke): every report — AI, fallback, or the
+# deterministic NOT TESTED one — carries this tag in its Goal Assessment /
+# status line so nobody mistakes a smoke pass for regression coverage. The
+# synthesis prompt asks the model for it; apply_smoke_tag() is the
+# deterministic backstop that inserts it when the model didn't.
+SMOKE_REPORT_TAG = "SMOKE TEST ONLY — not a regression test"
+SMOKE_STATUS_LINE = (
+    f"**{SMOKE_REPORT_TAG}.** A single worker loaded the target and "
+    "opened each top-level navigation link once (no sign-up, login, form "
+    "submission or flow exploration). A pass here means only that the "
+    "deployed UI serves without server errors, console exceptions or broken "
+    "layout — it is NOT evidence that the deploy's own changes work."
+)
+
+_GOAL_ASSESSMENT_HEADING = re.compile(r"^##+\s*Goal Assessment\s*$", re.MULTILINE)
+_FIRST_H1 = re.compile(r"^#\s+.+$", re.MULTILINE)
+_ANY_HEADING = re.compile(r"^#{1,6}\s", re.MULTILINE)
+
+
+def strip_smoke_tag(report: str) -> str:
+    """Remove a model-written SMOKE tag from a non-smoke report.
+
+    The tag is only ever true for smoke-mode runs, where apply_smoke_tag adds
+    it deterministically. A model that sees a small goal ("check the homepage
+    loads") can still decide the run was a smoke test and head the report
+    with the tag — which tells the reader the run was "not a regression test"
+    when it was a normal exploration.
+
+    Scoped to the report's STATUS REGION: everything through the title and the
+    Goal Assessment, plus any heading that is itself the tag. That is exactly
+    where apply_smoke_tag puts the status line, and the only place the tag
+    claims *this* run was a smoke test. Past the first ordinary section
+    heading it is context, not a claim: run-over-run memory feeds the previous
+    report into synthesis, so a previous smoke run gets quoted under "Not
+    Observed This Run" — blanking that phrase loses the reason those findings
+    are not comparable. apply_smoke_tag anchors its idempotence check the same
+    way.
+    """
+    if SMOKE_REPORT_TAG not in report:
+        return report
+    first_h1 = _FIRST_H1.search(report)
+    first_h1_line = report[: first_h1.start()].count("\n") if first_h1 else -1
+
+    kept = []
+    in_status_region = True
+    for index, line in enumerate(report.splitlines()):
+        if (
+            in_status_region
+            and index > first_h1_line
+            and _ANY_HEADING.match(line)
+            and SMOKE_REPORT_TAG not in line
+            and not _GOAL_ASSESSMENT_HEADING.match(line)
+        ):
+            # An ordinary section heading — everything below it is report
+            # body, where the tag can only ever be quoted context.
+            in_status_region = False
+        if not in_status_region or SMOKE_REPORT_TAG not in line:
+            kept.append(line)
+            continue
+        remainder = line.replace(SMOKE_REPORT_TAG, "")
+        if re.search(r"[A-Za-z0-9]", remainder):
+            # The tag is embedded in a sentence: drop the phrase, keep the
+            # rest — the report is the gate's source of truth.
+            kept.append(
+                remainder.replace("**.**", "").replace("** **", "").strip()
+                if remainder.strip("*#. ")
+                else remainder
+            )
+        # else: a heading / bold line that is nothing but the tag — drop it
+    cleaned = "\n".join(kept)
+    while "\n\n\n" in cleaned:
+        cleaned = cleaned.replace("\n\n\n", "\n\n")
+    return cleaned + ("\n" if report.endswith("\n") else "")
+
+
+def apply_smoke_tag(report: str) -> str:
+    """Make sure a smoke-mode report says so, deterministically.
+
+    Idempotent: a report that already carries SMOKE_REPORT_TAG (the model
+    followed the prompt) is returned unchanged. Otherwise the status line is
+    inserted right after the "## Goal Assessment" heading when there is one,
+    else after the report's H1 title, else prepended — so the tag is the
+    first thing a reader sees whatever shape the report took.
+    """
+    block = f"\n\n{SMOKE_STATUS_LINE}"
+    match = _GOAL_ASSESSMENT_HEADING.search(report) or _FIRST_H1.search(report)
+    if match:
+        end = match.end()
+        # Idempotence is judged where the tag belongs, not anywhere in the
+        # report: a previous smoke report quoted under "Not Observed This
+        # Run" must not suppress the status line.
+        following = report[end:].lstrip()
+        if following.startswith(SMOKE_STATUS_LINE) or following.startswith(f"**{SMOKE_REPORT_TAG}"):
+            return report
+        return report[:end] + block + report[end:]
+    if report.lstrip().startswith(SMOKE_STATUS_LINE):
+        return report
+    return f"{SMOKE_STATUS_LINE}\n\n{report}"
+
+
+# How a resume clone's FlowExplorationData.resume_kind reads in the report.
+# The clone carries the original flow's name (the original is RESUMED and
+# excluded from every section), so this suffix is the only trace of the
+# interruption: "Checkout: Checkout verified (resumed after pause)".
+_RESUME_KIND_LABELS = {
+    "pause": "pause",
+    "credentials": "credentials were provided",
+    "data": "data was provided",
+    "approval": "the approval prompt was answered",
+}
+
+
+def _with_resume_note(text: str, resume_kind: Optional[str]) -> str:
+    """Append "(resumed after ...)" once to a flow's status text."""
+    if not resume_kind:
+        return text
+    label = _RESUME_KIND_LABELS.get(resume_kind, resume_kind)
+    return f"{text} (resumed after {label})"
 
 
 class SynthesisAgent:
@@ -79,12 +333,7 @@ class SynthesisAgent:
             text = action.get("text", "")
             target = element or ref or "field"
             # Mask sensitive fields (passwords, tokens, etc.)
-            sensitive_keywords = [
-                'password', 'pwd', 'secret', 'token', 'key', 'auth',
-                'credential', 'pin', 'api', 'private', 'ssn', 'cvv'
-            ]
-            target_lower = (element or ref or "").lower()
-            if any(s in target_lower for s in sensitive_keywords):
+            if is_sensitive_field_label(element or ref or ""):
                 text = "***"
             elif len(text) > 30:
                 text = text[:27] + "..."
@@ -201,38 +450,55 @@ class SynthesisAgent:
         return first_line if first_line else "Unknown action"
 
     async def generate_report(self, shared_state: SharedFlowState) -> str:
+        """Generate the final QA synthesis report (markdown only).
+
+        Convenience wrapper over :meth:`generate_report_with_verdict` for
+        callers that don't need the machine-readable verdict.
         """
-        Generate final QA synthesis report.
+        report, _verdict = await self.generate_report_with_verdict(shared_state)
+        return report
+
+    async def generate_report_with_verdict(
+        self, shared_state: SharedFlowState
+    ) -> tuple[str, Optional[dict]]:
+        """Generate the report plus verdict; smoke-mode reports get the SMOKE tag.
+
+        See :meth:`_generate_report_with_verdict` for the body. This wrapper
+        exists so the deterministic smoke tag is applied on every path (AI
+        report, fallback, NOT TESTED) without touching each return.
+        """
+        report, verdict = await self._generate_report_with_verdict(shared_state)
+        if getattr(shared_state, "smoke", False):
+            report = apply_smoke_tag(report)
+        else:
+            report = strip_smoke_tag(report)
+        return report, verdict
+
+    async def _generate_report_with_verdict(
+        self, shared_state: SharedFlowState
+    ) -> tuple[str, Optional[dict]]:
+        """
+        Generate final QA synthesis report plus its curated verdict.
 
         Args:
             shared_state: The shared state containing all exploration data
 
         Returns:
-            Markdown-formatted report
+            ``(report, verdict)`` — the markdown report (with the model's
+            ``qa-verdict`` block stripped) and the parsed verdict dict from
+            :func:`parse_verdict`. ``verdict`` is ``None`` whenever no AI
+            curation happened or its verdict could not be parsed: the
+            deterministic NOT TESTED report, the non-AI fallback report, or
+            an AI report without a well-formed block.
         """
         # Calculate duration
         duration_seconds = (datetime.now() - shared_state.start_time).total_seconds()
-        if duration_seconds < 60:
-            duration = f"{int(duration_seconds)} seconds"
-        elif duration_seconds < 3600:
-            duration = f"{int(duration_seconds / 60)} minutes"
-        else:
-            hours = int(duration_seconds / 3600)
-            minutes = int((duration_seconds % 3600) / 60)
-            duration = f"{hours}h {minutes}m"
+        duration = format_duration(duration_seconds)
 
-        # Get all flows for building issue-flow mapping
         all_flows = await shared_state.get_all_flows()
 
-        # Build issue lookup: (description, url) -> flow_name for efficient mapping
-        issue_to_flow: dict[tuple[str, str], str] = {}
-        for flow in all_flows:
-            for flow_issue in flow.issues:
-                key = (flow_issue.get("description", ""), flow_issue.get("url", ""))
-                if key not in issue_to_flow:  # Keep first match
-                    issue_to_flow[key] = flow.flow_name
-
-        # Get all issues and enrich with flow context
+        # Get all issues, with the trace the report needs to cite them: the
+        # flow, the step in that flow's action summary, and the screenshot.
         all_issues = await shared_state.get_all_issues()
         issues = []
         for issue in all_issues:
@@ -240,18 +506,29 @@ class SynthesisAgent:
                 "description": issue.description,
                 "severity": issue.severity,
                 "url": issue.url,
-                "context": issue.action_context
+                "context": issue.action_context,
+                "source": issue.source,
             }
-            # Look up which flow this issue belongs to
-            flow_name = issue_to_flow.get((issue.description, issue.url))
-            if flow_name:
-                issue_dict["flow_name"] = flow_name
+            if issue.flow_name:
+                issue_dict["flow_name"] = issue.flow_name
+            if issue.turn is not None:
+                # Issue.turn is the worker's 0-based turn (chat transcript
+                # "TURN n"); the flow action summary below is numbered from 1
+                # and the triggering action is already recorded when the
+                # issue is filed, so step = turn + 1 points at that action.
+                issue_dict["step"] = issue.turn + 1
+            if issue.screenshot_path:
+                issue_dict["screenshot"] = issue.screenshot_path
             issues.append(issue_dict)
 
-        # Get completed flows with rich action summaries
+        # Get completed flows with rich action summaries. The Root/first-worker
+        # flow is excluded: its only job is flow enumeration (worker.py
+        # FIRST_WORKER_MAX_TURNS), so listing it under "Flows Tested" let a
+        # run where nothing but flow-mapping finished read as 1 flow tested.
+        # Any issues it reported still arrive via get_all_issues below.
         completed_flows = []
         for flow in all_flows:
-            if flow.status == FlowStatus.COMPLETED:
+            if flow.status == FlowStatus.COMPLETED and not flow.is_first_worker:
                 # Create action summary for reproduction steps
                 action_summary = [
                     self._summarize_action(action)
@@ -260,7 +537,9 @@ class SynthesisAgent:
 
                 flow_summary = {
                     "flow_name": flow.flow_name,
-                    "completion_reason": flow.completion_reason or "Completed",
+                    "completion_reason": _with_resume_note(
+                        flow.completion_reason or "Completed", flow.resume_kind
+                    ),
                     "action_count": len(flow.actions),
                     "issue_count": len(flow.issues),
                     "urls_visited": flow.urls_visited,
@@ -322,7 +601,7 @@ class SynthesisAgent:
             incomplete_flows.append({
                 "flow_name": flow.flow_name,
                 "status": flow.status.value,
-                "reason": reason,
+                "reason": _with_resume_note(reason, flow.resume_kind),
                 "action_count": len(flow.actions),
                 "action_summary": [
                     self._summarize_action(action)
@@ -341,18 +620,40 @@ class SynthesisAgent:
                 blocked_flows=blocked_flows,
                 incomplete_flows=incomplete_flows,
                 goal=shared_state.goal or "",
+                interactive=shared_state.interactive,
             )
             if shared_state.chat_logger:
                 shared_state.chat_logger.log_synthesis_call(
                     context=(
                         "0 flows completed, 0 issues — deterministic "
-                        "NOT TESTED report, no AI synthesis call made"
+                        "NOT TESTED / INCOMPLETE report, no AI synthesis call made"
                     ),
                     report=report,
                     input_tokens=0,
                     output_tokens=0,
                 )
-            return report
+            return report, None
+
+        # Persist a deterministic report before the AI call. Synthesis is the
+        # longest single await of the run, and a server restart or SIGKILL
+        # here used to lose the whole run (mono run 694ba81f: 2 flows, $0.27,
+        # no report.md on disk). Overwritten by the AI report on success, so
+        # /api/flow/{id}/report always has something to serve.
+        if shared_state.chat_logger:
+            provisional = self._generate_fallback_report(
+                    shared_state.target_url,
+                    duration,
+                    issues,
+                    completed_flows,
+                    blocked_flows,
+                    incomplete_flows=incomplete_flows,
+                    goal=shared_state.goal or "",
+                    known_issues=shared_state.known_issues or "",
+                    previous_report=shared_state.previous_report or "",
+            )
+            if getattr(shared_state, "smoke", False):
+                provisional = apply_smoke_tag(provisional)
+            shared_state.chat_logger.write_report(PROVISIONAL_REPORT_BANNER + provisional)
 
         # Call AI to generate report
         try:
@@ -366,6 +667,7 @@ class SynthesisAgent:
                 incomplete_flows=incomplete_flows,
                 goal=shared_state.goal or "",
                 known_issues=shared_state.known_issues or "",
+                previous_report=shared_state.previous_report or "",
             )
 
             # Track token usage by type
@@ -381,9 +683,14 @@ class SynthesisAgent:
                     cache_creation_tokens=cache_creation_tokens,
                 )
 
-            report = result.get("report", "")
+            report, verdict = parse_verdict(result.get("report", ""))
+            if verdict is None:
+                logger.warning(
+                    "Synthesis report carried no parseable qa-verdict block; "
+                    "curated critical count unavailable for this run"
+                )
 
-            # Log the synthesis call
+            # Log the synthesis call (the human report, verdict stripped)
             if shared_state.chat_logger:
                 context_summary = (
                     f"Target URL: {shared_state.target_url}\n"
@@ -398,7 +705,7 @@ class SynthesisAgent:
                     output_tokens=output_tokens
                 )
 
-            return report
+            return report, verdict
         except Exception as e:
             # Fallback to simple report if AI fails
             logger.warning(f"Synthesis AI call failed, using fallback report: {e}")
@@ -412,7 +719,8 @@ class SynthesisAgent:
                 goal=shared_state.goal or "",
                 error=str(e),
                 known_issues=shared_state.known_issues or "",
-            )
+                previous_report=shared_state.previous_report or "",
+            ), None
 
     def generate_not_tested_report(
         self,
@@ -422,20 +730,68 @@ class SynthesisAgent:
         incomplete_flows: list[dict] | None = None,
         goal: str = "",
         reason: str | None = None,
+        interactive: bool = False,
     ) -> str:
-        """Deterministic report for runs where nothing was tested.
+        """Deterministic report for runs where no flow finished and nothing was found.
 
         No AI involved: there are no findings to synthesize, only blockers to
         surface. Keeps the PR comment short and actionable instead of a long
         AI-written report that reads like a test happened.
+
+        The status line and the "How to Fix" advice are derived from what
+        actually happened (flows cut off by the cost/time limit, worker
+        errors, missing credentials, a failed pre-flight probe) rather than a
+        fixed template — a run that took 19 actions before the time limit hit
+        must not claim "no flows were executed" and point at credentials.
+        ``interactive`` selects web-UI wording (Advanced Options) over CI
+        wording (workflow inputs/secrets).
         """
+        blocked_flows = blocked_flows or []
+        incomplete_flows = incomplete_flows or []
+
+        started = [f for f in incomplete_flows if f.get("action_count", 0) > 0]
+        total_actions = sum(f.get("action_count", 0) for f in incomplete_flows)
+
+        # Classify why the flows never finished.
+        limit_hit = failed = interrupted = 0
+        for flow in incomplete_flows:
+            text = (flow.get("reason") or "").lower()
+            # "Failed once (...); automatic retry was queued ..." is a
+            # PENDING flow whose crash reason may mention a timeout.
+            if flow.get("status") == FlowStatus.FAILED.value or text.startswith("failed once"):
+                failed += 1
+            elif any(marker in text for marker in _LIMIT_REASON_MARKERS):
+                limit_hit += 1
+            elif flow.get("action_count", 0) > 0:
+                interrupted += 1  # e.g. user stop while still exploring
+
+        if started:
+            causes = []
+            if limit_hit:
+                causes.append("cost/time limit reached")
+            if failed:
+                causes.append("worker errors")
+            if interrupted:
+                causes.append("run interrupted")
+            cause_text = f" ({', '.join(causes)})" if causes else ""
+            status_line = (
+                f"**Status: INCOMPLETE** — {_plural(len(started), 'flow')} "
+                f"started but none finished{cause_text}. "
+                f"{_plural(total_actions, 'action')} taken, no issues recorded, "
+                "and no flow ran to completion — this deploy has NOT been verified."
+            )
+        else:
+            status_line = (
+                "**Status: NOT TESTED** — no flows were executed and no issues "
+                "were recorded. This deploy has NOT been verified."
+            )
+
         lines = [
             "# QA Test Report",
             "",
             "## Goal Assessment",
             "",
-            "**Status: NOT TESTED** — no flows were executed and no issues "
-            "were recorded. This deploy has NOT been verified.",
+            status_line,
             "",
         ]
         if reason:
@@ -461,21 +817,69 @@ class SynthesisAgent:
         if incomplete_flows:
             lines.append("## Flows That Never Finished")
             for flow in incomplete_flows:
+                count = flow.get("action_count", 0)
+                suffix = f" — {_plural(count, 'action')} taken" if count else ""
                 lines.append(
-                    f"- **{flow['flow_name']}**: {flow.get('reason', 'Incomplete')}"
+                    f"- **{flow['flow_name']}**: {flow.get('reason', 'Incomplete')}{suffix}"
                 )
             lines.append("")
 
-        lines.extend([
-            "## How to Fix",
-            "",
-            "- **Missing credentials**: add the named keys to the QA "
-            "workflow's `credentials` secret (one `KEY=value` per line; "
-            "HTTP Basic Auth uses `HTTP_USERNAME` / `HTTP_PASSWORD`).",
-            "- **Unreachable target or wrong URL**: verify the deployment is "
-            "up and the workflow's `url` input points at it.",
-            "- Then re-run the QA workflow.",
-        ])
+        # How to Fix: only the advice that matches an observed cause.
+        fixes = []
+        if blocked_flows:
+            if interactive:
+                fixes.append(
+                    "- **Missing credentials**: enter the named keys under "
+                    "**Advanced Options → Test Credentials** (one `KEY=value` "
+                    "per line; HTTP Basic Auth uses `HTTP_USERNAME` / "
+                    "`HTTP_PASSWORD`), or answer the credential request while "
+                    "the run is waiting."
+                )
+            else:
+                fixes.append(
+                    "- **Missing credentials**: add the named keys to the QA "
+                    "workflow's `credentials` secret (one `KEY=value` per line; "
+                    "HTTP Basic Auth uses `HTTP_USERNAME` / `HTTP_PASSWORD`)."
+                )
+        if limit_hit:
+            if interactive:
+                fixes.append(
+                    "- **Cost/time limit reached**: raise **Max Cost** / "
+                    "**Max Duration** under Advanced Options, or narrow the "
+                    "testing goal so fewer flows are needed."
+                )
+            else:
+                fixes.append(
+                    "- **Cost/time limit reached**: raise the workflow's "
+                    "`max-cost` / `max-duration` inputs, or narrow the testing "
+                    "goal so fewer flows are needed."
+                )
+        if failed:
+            where = "the run's activity log" if interactive else "the Actions log"
+            fixes.append(
+                f"- **Worker errors**: {_plural(failed, 'flow')} failed before "
+                f"finishing — see {where} for the error and re-run."
+            )
+        if interrupted:
+            fixes.append(
+                "- **Run interrupted**: the run was stopped while flows were "
+                "still exploring — re-run and let it finish."
+            )
+        if reason or not fixes:
+            url_where = (
+                "the URL you entered" if interactive
+                else "the workflow's `url` input"
+            )
+            fixes.append(
+                "- **Unreachable target or wrong URL**: verify the deployment "
+                f"is up and {url_where} points at it."
+            )
+        fixes.append(
+            "- Then start a new run." if interactive
+            else "- Then re-run the QA workflow."
+        )
+
+        lines.extend(["## How to Fix", "", *fixes])
         return "\n".join(lines)
 
     def _generate_fallback_report(
@@ -489,6 +893,7 @@ class SynthesisAgent:
         goal: str = "",
         error: str | None = None,
         known_issues: str = "",
+        previous_report: str = "",
     ) -> str:
         """Generate a simple report without AI."""
         lines = [
@@ -523,10 +928,14 @@ class SynthesisAgent:
         minor = [i for i in issues if i.get("severity") == "minor"]
         cosmetic = [i for i in issues if i.get("severity") == "cosmetic"]
 
+        def issue_bullet(issue: dict) -> str:
+            trace = format_issue_trace(issue)
+            return f"- {issue['description']}" + (f" ({trace})" if trace else "")
+
         if critical:
             lines.append("## Critical Issues")
             for issue in critical:
-                lines.append(f"- {issue['description']}")
+                lines.append(issue_bullet(issue))
                 if issue.get("url"):
                     lines.append(f"  URL: {issue['url']}")
             lines.append("")
@@ -534,7 +943,7 @@ class SynthesisAgent:
         if major:
             lines.append("## Major Issues")
             for issue in major:
-                lines.append(f"- {issue['description']}")
+                lines.append(issue_bullet(issue))
                 if issue.get("url"):
                     lines.append(f"  URL: {issue['url']}")
             lines.append("")
@@ -542,13 +951,13 @@ class SynthesisAgent:
         if minor:
             lines.append("## Minor Issues")
             for issue in minor:
-                lines.append(f"- {issue['description']}")
+                lines.append(issue_bullet(issue))
             lines.append("")
 
         if cosmetic:
             lines.append("## Cosmetic Issues")
             for issue in cosmetic:
-                lines.append(f"- {issue['description']}")
+                lines.append(issue_bullet(issue))
             lines.append("")
 
         if blocked_flows:
@@ -588,6 +997,16 @@ class SynthesisAgent:
                 "was unavailable for this report):",
                 "",
                 known_issues.strip(),
+            ])
+
+        if previous_report and previous_report.strip():
+            # NEW / recurring labelling is done by the AI; say plainly that it
+            # didn't happen rather than let the reader assume everything is new.
+            lines.extend([
+                "",
+                "**Previous run:** a previous report was supplied but findings "
+                "were not compared against it (AI curation was unavailable for "
+                "this report), so nothing above is labelled new or recurring.",
             ])
 
         return "\n".join(lines)

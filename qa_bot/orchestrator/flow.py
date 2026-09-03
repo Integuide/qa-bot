@@ -287,6 +287,12 @@ class FlowExplorationData:
     parent_flow_id: Optional[str] = None
     checkpoint_id: Optional[str] = None
 
+    # What the flow is meant to test (the FlowTask.goal text a worker gave
+    # when creating it). Workers often give flows generic names ("Adventure
+    # Mode") while the description carries the substance ("Test AI story
+    # generation..."), so the supervisor's skip/dedup review reads this too.
+    description: str = ""
+
     # Worker assignment
     worker_id: Optional[str] = None
     started_at: Optional[datetime] = None
@@ -295,6 +301,14 @@ class FlowExplorationData:
 
     # First worker flag - propagated to resume flows
     is_first_worker: bool = False
+
+    # Set on a resume clone: the flow_id it continues (after a pause, or
+    # after credentials/data/approval were provided) and why. The clone
+    # keeps the original's human name — the relationship lives here, not
+    # in a "pause_resume:" / "Resume:" name prefix that would leak into
+    # the UI tree, the activity log, issues and the report.
+    resumed_from: Optional[str] = None
+    resume_kind: Optional[str] = None  # "pause" | "credentials" | "data" | "approval"
 
     # Exploration data
     actions: list[dict] = field(default_factory=list)
@@ -321,6 +335,7 @@ class FlowExplorationData:
             "flow_name": self.flow_name,
             "flow_path": self.flow_path.to_list(),
             "status": self.status.value,
+            "description": self.description,
             "parent_flow_id": self.parent_flow_id,
             "checkpoint_id": self.checkpoint_id,
             "worker_id": self.worker_id,
@@ -328,6 +343,8 @@ class FlowExplorationData:
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "completion_reason": self.completion_reason,
             "is_first_worker": self.is_first_worker,
+            "resumed_from": self.resumed_from,
+            "resume_kind": self.resume_kind,
             "actions": self.actions,
             "issues": self.issues,
             "thinking_history": self.thinking_history,

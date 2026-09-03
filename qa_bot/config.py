@@ -169,6 +169,10 @@ API_HOST = os.getenv("API_HOST", "0.0.0.0")
 # Branch *_claude_N -> Port 81N0 (e.g., 0105_claude_0 -> 8100)
 API_PORT = int(os.getenv("API_PORT", str(_get_port_from_branch())))
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+# /api/flow/start checks the API key against Anthropic before a run starts so
+# a revoked/typo'd key fails in <1s with a clear message. Set to true only
+# where no real key exists (the e2e suite runs the server with a dummy key).
+SKIP_API_KEY_VALIDATION = os.getenv("SKIP_API_KEY_VALIDATION", "false").lower() == "true"
 
 # Email Testing Service (Testmail.app) - for testing email verification flows
 # Get API key and namespace at https://testmail.app

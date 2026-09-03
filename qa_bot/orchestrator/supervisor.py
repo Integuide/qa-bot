@@ -58,24 +58,32 @@ class SupervisorAgent:
         }
 
         while self._running:
-            # Check if we should stop (user requested stop)
-            if self.state.should_stop() and not self.state.is_paused():
-                # If paused, we'll wait for resume below
-                # If not paused but should_stop, check if it's a user-requested stop
-                # or just a limit that might be resumed
-                if self.state.stop_requested:
-                    break
+            # A user stop ends supervision whether or not the run is paused.
+            # "Stop Here" from the pause modal sets stop_requested and sets
+            # the resume event to wake the coordinator WITHOUT un-pausing;
+            # checking the pause first made wait_for_resume() return
+            # instantly forever and this loop spin, yielding a
+            # supervisor_started event per iteration into an event queue
+            # nobody drained during synthesis (gigabytes within seconds,
+            # server unresponsive).
+            if self.state.stop_requested:
+                break
 
             # If paused (cost/time limit reached), wait for resume
             if self.state.is_paused():
                 resumed = await self.state.wait_for_resume(timeout=5.0)
-                if resumed:
+                if resumed and not self.state.is_paused():
                     # Clear the emitted data requests set since we're starting fresh
                     self._emitted_data_requests.clear()
                     yield {
                         "type": "supervisor_started",
                         "data": {"timestamp": datetime.now().isoformat(), "resumed": True}
                     }
+                elif resumed:
+                    # Woken while still paused: a stop, not a resume. Yield to
+                    # the event loop so the next iteration sees stop_requested
+                    # without ever busy-looping here.
+                    await asyncio.sleep(0)
                 continue
 
             # Wait for trigger or timeout
@@ -367,12 +375,9 @@ class SupervisorAgent:
             all_flows = await self.state.get_all_flows()
             all_issues = await self.state.get_all_issues()
 
-            pending_flows = [
-                {"flow_id": f.flow_id[:8], "flow_name": f.flow_name}
-                for f in all_pending[:10]
-            ]
+            pending_flows = [self._flow_context(f, short_id=True) for f in all_pending[:10]]
             completed_flows = [
-                {"flow_id": f.flow_id[:8], "flow_name": f.flow_name}
+                self._flow_context(f, short_id=True)
                 for f in all_flows
                 if f.status == FlowStatus.COMPLETED
             ][:10]
@@ -389,6 +394,7 @@ class SupervisorAgent:
                     pending_flows=pending_flows,
                     completed_flows=completed_flows,
                     issues=issues,
+                    goal=self.state.goal,
                 )
 
                 # Track token usage by type
@@ -526,7 +532,7 @@ class SupervisorAgent:
         all_issues = await self.state.get_all_issues()
 
         completed_flows = [
-            {"flow_id": f.flow_id[:8], "flow_name": f.flow_name}
+            self._flow_context(f, short_id=True)
             for f in all_flows
             if f.status == FlowStatus.COMPLETED
         ][:10]
@@ -535,10 +541,9 @@ class SupervisorAgent:
             for i in all_issues[:5]
         ]
 
-        pending_flow_dicts = [
-            {"flow_id": f.flow_id, "flow_name": f.flow_name}
-            for f in pending_flows[:15]
-        ]
+        # Full flow_id here: the skip_flow response echoes it back and
+        # mark_flow_skip looks it up in the registry.
+        pending_flow_dicts = [self._flow_context(f) for f in pending_flows[:15]]
 
         try:
             response = await self.ai.analyze_for_supervisor(
@@ -547,6 +552,7 @@ class SupervisorAgent:
                 pending_flows=pending_flow_dicts,
                 completed_flows=completed_flows,
                 issues=issues,
+                goal=self.state.goal,
             )
 
             # Track token usage by type
@@ -609,6 +615,26 @@ class SupervisorAgent:
                 "type": "supervisor_error",
                 "data": {"error": str(e)}
             }
+
+    def _flow_context(self, flow_data, short_id: bool = False) -> dict:
+        """Flow summary for the supervisor AI: name plus what the flow is
+        meant to test and whether it names the testing goal.
+
+        Names alone are how goal-relevant flows got skipped as "duplicates"
+        — "Adventure Mode" (desc: AI story generation) vs "Story Mode".
+        goal_relevant uses the same deterministic match the scheduler used
+        to prioritize the flow, so the AI sees the same judgement the
+        mark_flow_skip backstop will enforce.
+        """
+        description = flow_data.description or ""
+        return {
+            "flow_id": flow_data.flow_id[:8] if short_id else flow_data.flow_id,
+            "flow_name": flow_data.flow_name,
+            "description": description[:200],
+            "goal_relevant": self.state.is_flow_goal_relevant(
+                f"{flow_data.flow_name} {description}"
+            ),
+        }
 
     async def _format_active_workers(self) -> list[dict]:
         """Format active workers for AI context."""

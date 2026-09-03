@@ -10,14 +10,33 @@ logger = logging.getLogger(__name__)
 
 from qa_bot.ai.base import AIProvider
 from qa_bot.orchestrator.browser_pool import BrowserPool, BROWSER_USER_AGENT
-from qa_bot.orchestrator.shared_state import SharedFlowState
+from qa_bot.orchestrator.shared_state import SharedFlowState, SMOKE_GOAL
 from qa_bot.orchestrator.worker import FlowExplorationWorker
 from qa_bot.orchestrator.supervisor import SupervisorAgent
-from qa_bot.orchestrator.synthesis import SynthesisAgent
+from qa_bot.orchestrator.synthesis import SynthesisAgent, apply_smoke_tag, format_duration
 from qa_bot.orchestrator.flow import FlowTask, FlowStatus
 from qa_bot.config import VIEWPORT_WIDTH, VIEWPORT_HEIGHT, LOG_CHAT_HISTORY, LOG_DIR, LOG_SCREENSHOTS, LOG_MAX_RUNS, ENVIRONMENT, TESTMAIL_API_KEY, TESTMAIL_NAMESPACE, MAX_COST_CAP_USD, DEFAULT_MODEL
 from qa_bot.utils.chat_logger import ChatLogger
 from qa_bot.services.email_service import EmailService
+
+# summary.json statuses that mean the run has finished. Anything else left on
+# disk ("running", "synthesizing") means the process died mid-run without
+# reaching the code that writes a terminal summary.
+_TERMINAL_SUMMARY_STATUSES = frozenset({"completed", "error", "preflight_failed", "interrupted"})
+
+
+def _count_flows_explored(all_flows) -> int:
+    """Number of user flows actually tested to completion.
+
+    The Root/first-worker flow (and its resume/retry clones, which inherit
+    ``is_first_worker``) is excluded: its only job is flow enumeration, so
+    counting it let a run where nothing but flow-mapping finished report
+    ``flows_explored=1`` and slip past the action's fail-on-zero-flows gate.
+    """
+    return len([
+        f for f in all_flows
+        if f.status == FlowStatus.COMPLETED and not f.is_first_worker
+    ])
 
 
 def _should_save_screenshots() -> bool:
@@ -144,6 +163,10 @@ async def preflight_check(
     return None
 
 
+class FatalExplorationError(RuntimeError):
+    """The run was aborted for a reason no retry can fix (see SharedFlowState.abort)."""
+
+
 class FlowExplorationOrchestrator:
     """
     Coordinates flow-based parallel exploration of a website.
@@ -188,11 +211,25 @@ class FlowExplorationOrchestrator:
         self._supervisor: Optional[SupervisorAgent] = None
         self._supervisor_task: Optional[asyncio.Task] = None
         self._event_queue: Optional[asyncio.Queue] = None
+        # Status of the last summary.json written for the current run (None
+        # until one is written) — lets the finally-block tell an interrupted
+        # run from one that already recorded its outcome.
+        self._last_summary_status: Optional[str] = None
 
     @property
     def shared_state(self) -> Optional[SharedFlowState]:
         """Access to shared state for external credential injection."""
         return self._shared_state
+
+    @property
+    def is_synthesizing(self) -> bool:
+        """True from synthesis_started until the run's outcome is recorded.
+
+        Lets the web server tell a client attaching mid-synthesis that the
+        run is in its (long, quiet) report-generation phase rather than
+        still exploring — the shared state alone can't distinguish them.
+        """
+        return self._last_summary_status == "synthesizing"
 
     async def run_exploration(
         self,
@@ -206,12 +243,29 @@ class FlowExplorationOrchestrator:
         testmail_namespace: Optional[str] = None,
         exploration_id: Optional[str] = None,
         known_issues: str = "",
+        smoke: bool = False,
+        previous_report: str = "",
     ) -> AsyncGenerator[dict, None]:
         """
         Run flow-based parallel exploration of target URL.
 
         Yields unified event stream from all workers.
+
+        ``smoke`` (CLI ``--smoke``, action ``mode: smoke``) turns the run
+        into a bounded smoke pass: the preflight probe, then ONE worker
+        with the fixed SMOKE_GOAL and a hard turn cap, no flow forking, and
+        a report tagged "SMOKE TEST ONLY — not a regression test". The
+        caller's goal is ignored so a smoke run can't be steered into a
+        full exploration.
+
+        ``previous_report`` (CLI ``--previous-report``, action
+        ``previous-report``) is the previous run's report for the same
+        target; synthesis labels findings NEW / recurring against it. It is
+        deliberately NOT merged into ``known_issues`` — a regression found in
+        the previous run must not be demoted on this one.
         """
+        if smoke:
+            goal = SMOKE_GOAL
         num_agents = max_agents or self.max_agents
         # Clamp to the same 1-20 range config.py enforces on the MAX_AGENTS env
         # var (defense-in-depth): the CLI --max-agents flag and the GitHub
@@ -235,6 +289,8 @@ class FlowExplorationOrchestrator:
         # Get model from AI provider for cost tracking
         model = getattr(self.ai, 'model', DEFAULT_MODEL)
 
+        self._last_summary_status = None
+
         # Initialize shared flow state
         self._shared_state = SharedFlowState.create(
             target_url=target_url,
@@ -247,13 +303,12 @@ class FlowExplorationOrchestrator:
             interactive=self._interactive,
             exploration_id=exploration_id,
             known_issues=known_issues,
+            smoke=smoke,
+            previous_report=previous_report,
         )
 
-        # Set initial credentials if provided
-        if self._initial_credentials:
-            await self._shared_state.set_credentials(self._initial_credentials)
-
-        # Initialize chat logger if enabled
+        # Initialize chat logger if enabled (before credentials are set, so
+        # set_credentials can register their values for by-value redaction)
         if LOG_CHAT_HISTORY:
             self._shared_state.chat_logger = ChatLogger(
                 log_dir=LOG_DIR,
@@ -261,6 +316,14 @@ class FlowExplorationOrchestrator:
                 save_screenshots=_should_save_screenshots(),
                 max_logs=LOG_MAX_RUNS
             )
+            # Every run directory carries a machine-readable state from the
+            # start: a summary.json still at "running" is how an operator tells
+            # a run the process died under from one that is still going.
+            await self._write_provisional_summary("running")
+
+        # Set initial credentials if provided
+        if self._initial_credentials:
+            await self._shared_state.set_credentials(self._initial_credentials)
 
         # Initialize email service if Testmail.app credentials are provided or configured
         email_key = testmail_api_key or TESTMAIL_API_KEY
@@ -285,6 +348,8 @@ class FlowExplorationOrchestrator:
                 "max_cost_usd": max_cost_usd,
                 "has_credentials": bool(self._initial_credentials),
                 "has_known_issues": bool(known_issues),
+                "has_previous_report": bool(previous_report),
+                "mode": "smoke" if smoke else "full",
                 "credential_keys": list(self._initial_credentials.keys()) if self._initial_credentials else [],
                 "timestamp": datetime.now().isoformat()
             }
@@ -329,9 +394,13 @@ class FlowExplorationOrchestrator:
             )
 
             # Get the root flow and spawn first worker
+            # In smoke mode the root flow IS the smoke pass (no enumeration
+            # step, no children), so it runs as a normal, counted worker.
             root_flow = await self._shared_state.claim_pending_flow()
             if root_flow:
-                await self._spawn_worker_for_flow(root_flow, is_first_worker=True)
+                await self._spawn_worker_for_flow(
+                    root_flow, is_first_worker=not smoke
+                )
 
             # Main event loop
             last_progress_time = datetime.now()
@@ -339,6 +408,22 @@ class FlowExplorationOrchestrator:
             report = None  # Will hold synthesis report
 
             while True:
+                # A worker hit an error no retry can fix (rejected API key,
+                # no credit). Surface what the workers already reported, then
+                # route through the fatal-error path below: salvage whatever
+                # was found and end with a fatal `error` event — the web UI
+                # shows the reason instead of a green "Complete", the CLI
+                # exits non-zero, and no further flow is attempted.
+                if self._shared_state.fatal_error:
+                    while not self._event_queue.empty():
+                        try:
+                            queued_event = self._event_queue.get_nowait()
+                            _log_event(queued_event)
+                            yield queued_event
+                        except asyncio.QueueEmpty:
+                            break
+                    raise FatalExplorationError(self._shared_state.fatal_error)
+
                 # Check if we should stop
                 if self._shared_state.should_stop():
                     stop_reason = self._shared_state.get_stop_reason()
@@ -530,7 +615,25 @@ class FlowExplorationOrchestrator:
                 except asyncio.QueueEmpty:
                     break
 
+            # Final progress before synthesis: every worker has exited, so
+            # this is the first progress payload with active_workers == 0
+            # (the periodic one above may be up to progress_interval stale).
+            # The web UI's stat cards read progress payloads, not their own
+            # increments, so without it "Active Workers: 3" would persist
+            # through synthesis.
+            event = {
+                "type": "progress",
+                "data": await self._shared_state.get_progress()
+            }
+            _log_event(event)
+            yield event
+
             # Generate synthesis report
+            # The main loop is the only consumer of _event_queue; once it has
+            # exited, anything still producing (the supervisor) would fill the
+            # queue unbounded for the whole synthesis await. Stop it first.
+            await self._stop_supervisor()
+
             event = {
                 "type": "synthesis_started",
                 "data": {"timestamp": datetime.now().isoformat()}
@@ -538,14 +641,30 @@ class FlowExplorationOrchestrator:
             _log_event(event)
             yield event
 
+            # Synthesis is the longest single await of the run and used to be
+            # the point where a server restart lost everything — nothing was
+            # on disk until the AI call returned. Persist what is known now
+            # (SynthesisAgent likewise writes a provisional report.md before
+            # its AI call); both are overwritten on success.
+            await self._write_provisional_summary("synthesizing")
+
             synthesis = SynthesisAgent(self.ai)
+            verdict = None
             try:
-                report = await synthesis.generate_report(self._shared_state)
+                report, verdict = await synthesis.generate_report_with_verdict(
+                    self._shared_state
+                )
                 self._persist_report(report)
                 event = {
                     "type": "synthesis_complete",
                     "data": {
                         "report": report,
+                        # Curated verdict parsed from the AI report (None when
+                        # synthesis fell back to a deterministic report or the
+                        # block was unparseable). The deploy gate still counts
+                        # RAW worker criticals — this is surfaced alongside so
+                        # both numbers are visible.
+                        "verdict": verdict,
                         "timestamp": datetime.now().isoformat()
                     }
                 }
@@ -573,10 +692,7 @@ class FlowExplorationOrchestrator:
                     "target_url": target_url,
                     "issues_found": len(all_issues),
                     "issues": [issue.to_dict() for issue in all_issues],
-                    "flows_explored": len([
-                        f for f in all_flows
-                        if f.status == FlowStatus.COMPLETED
-                    ]),
+                    "flows_explored": _count_flows_explored(all_flows),
                     "total_flows": len(all_flows),
                     "flow_tree": flow_tree,
                     "total_actions": self._shared_state.total_actions,
@@ -593,17 +709,27 @@ class FlowExplorationOrchestrator:
                 final_progress,
                 status="completed",
                 issues=[issue.to_dict() for issue in all_issues],
+                verdict=verdict,
             )
 
             yield event
 
         except Exception as e:
-            logger.exception("Fatal error in exploration main loop")
+            if isinstance(e, FatalExplorationError):
+                logger.error(f"Exploration aborted: {e}")  # expected, no traceback
+            else:
+                logger.exception("Fatal error in exploration main loop")
 
             # Salvage whatever the workers already found: a late crash must
             # not discard an entire run's findings. Synthesize a report from
             # collected state and emit exploration_complete so the CLI and
             # the GitHub Action PR comment still receive the results.
+            # The main loop (sole consumer of _event_queue) is gone: stop the
+            # supervisor first so it cannot fill the queue during synthesis.
+            try:
+                await self._stop_supervisor()
+            except Exception:
+                logger.exception("Failed to stop supervisor before salvage")
             try:
                 salvage_events = await self._build_salvage_events(target_url, str(e))
             except Exception:
@@ -637,6 +763,19 @@ class FlowExplorationOrchestrator:
             _log_event(event)
             yield event
         finally:
+            if self._last_summary_status not in _TERMINAL_SUMMARY_STATUSES:
+                # Cancelled (Ctrl-C, SIGTERM from a server restart, runner
+                # timeout, consumer stopped iterating): CancelledError and
+                # GeneratorExit are not Exceptions, so the except-path summary
+                # never ran. Record that — and where — the run died.
+                await self._write_provisional_summary(
+                    "interrupted",
+                    error=(
+                        "Run interrupted during synthesis"
+                        if self._last_summary_status == "synthesizing"
+                        else "Run interrupted before exploration finished"
+                    ),
+                )
             await self._cleanup()
 
     async def _spawn_worker_for_flow(self, flow_task: FlowTask, is_first_worker: bool = False):
@@ -830,15 +969,19 @@ class FlowExplorationOrchestrator:
         ).total_seconds()
         report = SynthesisAgent(self.ai).generate_not_tested_report(
             target_url=target_url,
-            duration=f"{int(duration_seconds)} seconds",
+            duration=format_duration(duration_seconds),
             goal=self._shared_state.goal or "",
             reason=reason,
+            interactive=self._interactive,
         )
+        if self._shared_state.smoke:
+            report = apply_smoke_tag(report)
         self._persist_report(report)
         event = {
             "type": "synthesis_complete",
             "data": {
                 "report": report,
+                "verdict": None,
                 "timestamp": datetime.now().isoformat(),
             },
         }
@@ -888,9 +1031,12 @@ class FlowExplorationOrchestrator:
         # generate_report falls back to a simple non-AI report internally if
         # the AI call fails, so this only raises on unexpected state errors.
         report = None
+        verdict = None
         try:
             synthesis = SynthesisAgent(self.ai)
-            report = await synthesis.generate_report(self._shared_state)
+            report, verdict = await synthesis.generate_report_with_verdict(
+                self._shared_state
+            )
         except Exception as synth_error:
             logger.warning(f"Salvage synthesis failed: {synth_error}")
 
@@ -908,6 +1054,7 @@ class FlowExplorationOrchestrator:
                 "type": "synthesis_complete",
                 "data": {
                     "report": report,
+                    "verdict": verdict,
                     "timestamp": datetime.now().isoformat()
                 }
             })
@@ -927,10 +1074,7 @@ class FlowExplorationOrchestrator:
                 "error": error,
                 "issues_found": len(all_issues),
                 "issues": [issue.to_dict() for issue in all_issues],
-                "flows_explored": len([
-                    f for f in all_flows
-                    if f.status == FlowStatus.COMPLETED
-                ]),
+                "flows_explored": _count_flows_explored(all_flows),
                 "total_flows": len(all_flows),
                 "flow_tree": flow_tree,
                 "total_actions": self._shared_state.total_actions,
@@ -952,8 +1096,14 @@ class FlowExplorationOrchestrator:
         status: str = "completed",
         error: Optional[str] = None,
         issues: Optional[list[dict]] = None,
+        verdict: Optional[dict] = None,
     ):
-        """Write summary.json to the log directory for monitoring."""
+        """Write summary.json to the log directory for monitoring.
+
+        ``verdict`` is the curated synthesis verdict (see
+        ``synthesis.parse_verdict``); its critical count/titles are recorded
+        next to the raw issue list so the two can be compared per run.
+        """
         if not self._shared_state or not self._shared_state.chat_logger:
             return
 
@@ -961,6 +1111,7 @@ class FlowExplorationOrchestrator:
             "exploration_id": progress.get("exploration_id", ""),
             "url": progress.get("target_url", ""),
             "goal": self._shared_state.goal or "",
+            "mode": "smoke" if self._shared_state.smoke else "full",
             "started": self._shared_state.start_time.isoformat(),
             "duration_seconds": round(progress.get("elapsed_seconds", 0), 1),
             "model": self._shared_state.model,
@@ -972,6 +1123,17 @@ class FlowExplorationOrchestrator:
             },
             "issues_found": progress.get("issues_found", 0),
             "issues": issues if issues is not None else [],
+            # Curated (post-synthesis) criticals — what the deploy gate
+            # fails on when present; None when no AI verdict was available
+            # (the gate then falls back to the raw criticals in "issues").
+            "curated_critical_count": verdict["critical_count"] if verdict else None,
+            "curated_critical_titles": (
+                [c["title"] for c in verdict["critical"]] if verdict else None
+            ),
+            # Run-over-run labelling from the verdict (None when no previous
+            # report was supplied or the verdict carried no counts).
+            "new_findings_count": verdict.get("new") if verdict else None,
+            "recurring_findings_count": verdict.get("recurring") if verdict else None,
             "total_actions": progress.get("total_actions", 0),
             "status": status,
         }
@@ -979,10 +1141,31 @@ class FlowExplorationOrchestrator:
             summary["error"] = error
 
         self._shared_state.chat_logger.write_summary(summary)
+        self._last_summary_status = status
 
-    async def _cleanup(self):
-        """Clean up all resources."""
-        # Stop supervisor
+    async def _write_provisional_summary(self, status: str, error: Optional[str] = None):
+        """Best-effort summary.json for a run that has not reached its outcome yet.
+
+        Used for the "running" / "synthesizing" checkpoints and the
+        "interrupted" record written from the finally block, so it must never
+        raise — it runs on the cancellation path.
+        """
+        if not self._shared_state or not self._shared_state.chat_logger:
+            return
+        try:
+            progress = await self._shared_state.get_progress()
+            issues = await self._shared_state.get_all_issues()
+            self._write_summary(
+                progress,
+                status=status,
+                error=error,
+                issues=[issue.to_dict() for issue in issues],
+            )
+        except Exception:
+            logger.warning(f"Failed to write {status} summary.json", exc_info=True)
+
+    async def _stop_supervisor(self):
+        """Stop the supervisor and await its task (idempotent)."""
         if self._supervisor:
             self._supervisor.stop()
         if self._supervisor_task and not self._supervisor_task.done():
@@ -991,8 +1174,12 @@ class FlowExplorationOrchestrator:
                 await asyncio.wait_for(self._supervisor_task, timeout=5.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
-        self._supervisor = None
         self._supervisor_task = None
+
+    async def _cleanup(self):
+        """Clean up all resources."""
+        await self._stop_supervisor()
+        self._supervisor = None
 
         # Cancel any remaining worker tasks (with timeout to prevent hanging)
         remaining = [t for t in self._active_worker_tasks if not t.done()]

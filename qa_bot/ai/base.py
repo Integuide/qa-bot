@@ -191,6 +191,7 @@ class AIProvider(ABC):
         pending_flows: list[dict],
         completed_flows: list[dict],
         issues: list[dict],
+        goal: str = "",
     ) -> dict:
         """
         Call AI for supervisor decisions.
@@ -211,6 +212,7 @@ class AIProvider(ABC):
         incomplete_flows: list[dict] | None = None,
         goal: str = "",
         known_issues: str = "",
+        previous_report: str = "",
     ) -> dict:
         """
         Generate final QA synthesis report.
