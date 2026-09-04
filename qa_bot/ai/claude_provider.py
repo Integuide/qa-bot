@@ -493,6 +493,7 @@ class ClaudeProvider(AIProvider):
                 full_response = ""
                 thinking_signature = ""
                 in_thinking_block = False
+                stop_reason = None
                 wait_time = None
 
                 # Acquire semaphore only for the API call, not during sleep
@@ -547,9 +548,12 @@ class ClaudeProvider(AIProvider):
                                         yield {"type": "thinking_complete", "text": full_thinking}
                                         in_thinking_block = False
 
-                            # Get final message for token usage
+                            # Get final message for token usage and the
+                            # stop reason (``refusal`` needs its own path —
+                            # see the refusal branch below).
                             final_message = await stream.get_final_message()
                             token_usage = _extract_token_usage(final_message.usage)
+                            stop_reason = getattr(final_message, "stop_reason", None)
 
                         # Stream completed successfully
                         stream_completed = True
@@ -611,6 +615,49 @@ class ClaudeProvider(AIProvider):
                     "error": f"API error after {MAX_RETRIES} retries: {last_exception}",
                     "thinking": "",
                     "raw_response": "",
+                    **cumulative_usage,
+                }
+                return
+
+            # A safety classifier declined the turn. This is NOT the
+            # intermittent "thinking but no text" failure below, and it must
+            # not be treated as one: that path re-sends the *identical*
+            # request, which for a classifier decision is deterministic waste
+            # (up to 3 billed vision calls that all refuse the same way) and
+            # then reports the misleading "No text response from AI".
+            #
+            # Fail the turn immediately with an honest reason instead. Flow-
+            # level retry still applies (``MAX_FLOW_ATTEMPTS``), and for a
+            # root/add_flow flow that is a recovery path that can actually
+            # work: it restarts with empty history, so the model re-derives
+            # its test content from the goal and may pick something the
+            # classifier accepts. A *checkpoint continuation* retry does not
+            # get that — fail_flow keeps the checkpoint and the worker
+            # restores ``checkpoint.conversation_history``, so a refusal on a
+            # forked flow replays the refused content and burns its second
+            # attempt too. Prompt-side, the "Test Data" section tells workers
+            # to keep free text they type into a site mundane precisely so
+            # this branch stays rare.
+            #
+            # Seen live in the onlinestoryservices PR #1067 deploy run: the
+            # "Permanent 4xx Errors Surface Immediately" flow burned both of
+            # its attempts on a content-filter rejection and reached none of
+            # its goal.
+            if stop_reason == "refusal":
+                logger.warning(
+                    "Worker stream: response declined by a safety classifier "
+                    "(stop_reason=refusal); not retrying the identical request"
+                )
+                yield {
+                    "type": "error",
+                    "error": (
+                        "Claude declined to generate this turn (stop_reason="
+                        "refusal) — the test content most likely tripped a "
+                        "safety classifier. Retry with mundane, inoffensive "
+                        "free text."
+                    ),
+                    "thinking": full_thinking,
+                    "raw_response": full_response,
                     **cumulative_usage,
                 }
                 return
@@ -1088,6 +1135,25 @@ class ClaudeProvider(AIProvider):
         # thinking the response can lead with a thinking block, and content[0]
         # would then be a ThinkingBlock (no .text) — losing the whole report.
         report = next((b.text for b in response.content if b.type == "text"), "")
+        if getattr(response, "stop_reason", None) == "refusal":
+            # A safety classifier declined the synthesis call itself. The
+            # caller then falls back to the non-AI report, which carries no
+            # ```qa-verdict``` block, so the deploy gate silently reverts to
+            # the RAW worker critical count — a safe fallback, but an
+            # invisible one. Name the cause so the null verdict is
+            # diagnosable instead of looking like an unexplained fallback.
+            #
+            # Plausible on a target whose findings text is itself the
+            # sensitive content synthesis has to read back. Unlike the worker
+            # loop there is nothing useful to retry here (the input is the
+            # run's own findings, not something the model can rephrase), so
+            # this logs rather than changing control flow.
+            logger.warning(
+                "Synthesis was declined by a safety classifier "
+                "(stop_reason=refusal) — falling back to the non-AI report, "
+                "so there will be no curated verdict and the gate will use "
+                "the raw worker critical count"
+            )
         if response.stop_reason == "max_tokens":
             # Surface truncation instead of silently delivering a report that
             # ends mid-sentence with its tail sections missing.

@@ -17,6 +17,7 @@ from qa_bot.browser.controller import (
     BrowserController,
     BENIGN_FAILURE_REASONS,
     DuplicateRefError,
+    FillVerificationError,
     NativeSelectClickError,
     SelectOptionNotFoundError,
     StaleRefError,
@@ -334,6 +335,47 @@ def _first_worker_turn_note(is_first_worker: bool, action_count: int) -> str:
         f"is to enumerate flows — do not test or explore. Use your remaining "
         f"~{remaining} turn(s) for add_flow actions covering anything "
         f"important not yet listed, then call done."
+    )
+
+
+def _new_tab_note(browser: BrowserController) -> str:
+    """Tell the AI when this turn's screenshot/URL belong to a NEW tab.
+
+    ``active_page`` silently follows a popup (and a ``target="_blank"`` link
+    opens one), so from the model's side the URL simply changed and the
+    screenshot shows a different site — exactly what a same-tab navigation
+    looks like. The mono PR #592 QA run reported a correct
+    ``target="_blank"`` link as "navigates the entire page away ... losing
+    in-progress form data" for want of this one fact.
+
+    Empty string whenever the AI is looking at the main page.
+    """
+    try:
+        context = browser.active_page_context
+    except Exception:  # a note must never break a turn
+        return ""
+    if not context:
+        return ""
+    opener = context.get("opener_url") or "the previous page"
+    note = (
+        "**NEW TAB: the screenshot, URL and element list above are a NEW "
+        f"browser tab, opened from {opener} (a `target=\"_blank\"` link or "
+        "`window.open`).** "
+    )
+    if context.get("opener_intact"):
+        # Only claimed when the controller has actually checked it: a page
+        # can open a tab AND navigate itself, and denying that would talk the
+        # model out of a real finding.
+        return note + (
+            "That page is still open in the background, still showing "
+            f"{opener} — it did NOT navigate away and no form data on it was "
+            "lost, so do not report it as having done so. Use close_popup "
+            "when you are finished here to return to it."
+        )
+    return note + (
+        "Whatever you now see belongs to the new tab, not to the page you "
+        "came from — judge it as a separate page. Use close_popup when you "
+        "are finished here to go back."
     )
 
 
@@ -1050,6 +1092,7 @@ class FlowExplorationWorker:
                                 self.is_first_worker, action_count
                             ),
                             _smoke_mode_note(self.state.smoke, action_count),
+                            _new_tab_note(browser),
                         ) if note),
                         is_first_worker=self.is_first_worker,
                         worker_number=self.worker_number,
@@ -2532,6 +2575,18 @@ class FlowExplorationWorker:
             return ActionResult(
                 success=False,
                 message=f"No matching option on {e.ref}",
+                corrective_error=True,
+                error=str(e)
+            )
+
+        except FillVerificationError as e:
+            # The text did not land. Message is already corrective and says
+            # explicitly that this is a tester-side failure, not a site bug —
+            # without that, "I typed into the field and nothing happened" is
+            # a very natural (and false) thing for the AI to report.
+            return ActionResult(
+                success=False,
+                message=f"Text did not land in {e.ref}",
                 corrective_error=True,
                 error=str(e)
             )

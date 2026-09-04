@@ -909,9 +909,11 @@ class SharedFlowState:
 
         Before storing, the issue's severity is passed through the deterministic
         severity guard (``cap_severity``). The GitHub Action fails a deploy on
-        any raw worker-reported ``critical`` issue (it does not wait for the
-        synthesis agent's curation), so a single over-escalated observation can
-        turn a clean deploy red. The guard caps well-understood non-regressions
+        the CURATED ``critical`` count when synthesis produced a verdict, and
+        falls back to this raw, worker-reported count when it did not
+        (deterministic NOT TESTED report, non-AI fallback, unparseable
+        verdict block). On that fallback path a single over-escalated
+        observation can turn a clean deploy red. The guard caps well-understood non-regressions
         (the bot's own click-tooling timeouts, third-party OAuth refusing a
         bare-IP/HTTP staging host, guessed-URL 404s, signup "already exists"
         test-data collisions, anti-abuse restrictions on a just-created

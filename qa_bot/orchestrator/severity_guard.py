@@ -68,6 +68,32 @@ intentionally conservative: it matches specific, high-confidence phrases so it
 won't mask genuine app regressions (a real broken click that surfaces a JS
 error, a real 5xx, a real broken link the bot actually followed, etc.). Genuine
 issues keep whatever severity the worker assigned.
+
+There is deliberately **NO** signature for the mono PR #592 class -- "field X
+has no client-side validation", "this link opens in the same tab instead of a
+new one". Those read *identically* whether they are true or false; what
+separates them is EVIDENCE, which this module cannot see. Two attempts at a
+signature masked, between them, every one of ten plausible real-bug
+descriptions an LLM worker would write ("the checkout endpoint has no input
+validation -- it silently accepts a negative quantity and issues a refund",
+"the Terms link opens in the same tab during checkout, wiping the order
+form"), because the true and the false finding share their whole vocabulary.
+The right fix is upstream and is what this class of false positive actually
+got: the ref list now carries the attributes (browser/controller.py) so the
+model can check instead of guess, and the worker/synthesis prompts tell it to.
+See docs/troubleshooting.md, "Bot Reports a Missing HTML Attribute That Is
+Actually There".
+
+For the same reason there is **NO** signature for data-loss claims
+(onlinestoryservices PR #1067): "reloading destroyed previously-saved chapter
+content" is word-for-word what a REAL data-loss regression reads like. What
+separates the true finding from the false one is whether the worker ever saved
+the content -- evidence that lives in the flow's action history, which this
+module cannot see. That class is handled upstream too: the worker prompt
+section "Data-Loss Claims Require a Verified Save First" and synthesis Report
+Quality Standard 12 / "Likely False Positives" #7 make the save an explicit,
+checkable precondition. See docs/troubleshooting.md, "Bot Reports Data Loss It
+Never Established Was Saved".
 """
 
 from __future__ import annotations
@@ -262,7 +288,6 @@ _FRESH_ACCOUNT_PATTERNS = [
     re.compile(r"\baccount\s+(?:that\s+)?(?:was\s+)?just\s+(?:created|registered|signed\s+up)\b", re.IGNORECASE),
     re.compile(r"\bimmediately\s+after\s+(?:creating|registering|signing\s+up)\b", re.IGNORECASE),
 ]
-
 
 # 4. Worker-tagged known issues ----------------------------------------------
 # The tag must sit at the START of the description -- that anchor is what makes

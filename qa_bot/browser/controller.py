@@ -48,6 +48,14 @@ DUPLICATE_REF_PREFIX = "[duplicate-ref] "
 # burning 10s per doomed attempt.
 REF_ACTION_TIMEOUT_MS = 5_000
 
+# Read-back budget for _verify_fill. Much shorter than a normal ref action:
+# the fill has ALREADY succeeded microseconds earlier, so reading the value is
+# one round trip against an element known to exist. The only way to reach the
+# ceiling is a page that navigated or tore the node down in between — the
+# lenient outcome there is to skip verification, and we should reach it fast
+# rather than pay 5s per fill for it.
+FILL_VERIFY_TIMEOUT_MS = 2_000
+
 # _pending_requests pruning: entries whose response/failure event never fired
 # (page closed mid-flight) are dropped once the dict grows past the prune
 # size and they are older than the max age.
@@ -91,6 +99,80 @@ class DuplicateRefError(Exception):
             f"{summary}. "
             f"Look at the screenshot and element list to pick the correct one."
         )
+
+
+class FillVerificationError(Exception):
+    """Raised when text typed into a field is not there afterwards.
+
+    Playwright's ``fill()`` on a ``<textarea>``/text ``<input>`` is a
+    two-round-trip operation: the injected script focuses and selects the
+    element, then the driver sends the text with CDP ``Input.insertText``,
+    which goes to **whatever has focus at that moment**. If the page moves
+    focus in between — an HTMX/partial swap replacing the node, a re-render,
+    a late ``autofocus``, a modal — the keystrokes land nowhere, and
+    ``fill()`` still returns cleanly. Without a read-back the worker is told
+    "Typed into ref_3" and reasons on from a premise that is false; the
+    downstream finding ("the form silently ignored my input") is then a
+    false positive attributed to the site.
+
+    Seen live in the onlinestoryservices PR #1067 deploy run, where a flow
+    crashed on "typed input into the prompt textarea did not register".
+
+    Raised in two shapes:
+
+    * ``element_gone`` — the ref matches nothing afterwards, because the page
+      replaced or removed the node mid-fill. This is the partial-swap case,
+      and it is unambiguous: whatever was typed is not on the page.
+    * otherwise — the node survived but the field is **empty**. A field
+      holding some other value received the keystrokes (an input mask, a
+      ``maxlength``, the app reformatting what was typed), which is the app's
+      own doing; failing on those would break every masked phone and card
+      field the bot has to fill.
+
+    The empty-field message deliberately does NOT assert a cause. A focus race
+    and a page that clears the field on every keystroke are indistinguishable
+    from here, and the second is a real, reportable bug — on a guard whose
+    whole point is "don't claim more than the evidence supports", telling the
+    model "this is definitely not the site" would be the same mistake. It says
+    *usually* tester-side, caps the retry at one more attempt, and names what
+    to record if the field is still empty after that. (There is no
+    consecutive-failure guard in the worker, so an uncapped "try again" invites
+    the same unbounded replay of a deterministic failure that the refusal
+    branch in ``ai/claude_provider.py`` exists to prevent.)
+
+    Note the message reports the **length, never the text**: fills carry
+    credentials, and this string goes into the action history the AI and the
+    report see (see ``utils/secrets.py``, tests/test_secret_masking).
+
+    Attributes:
+        ref: The ref string (e.g. "ref_5").
+        expected_len: Number of characters the worker asked to type.
+        element_gone: True when the ref matched no element after the fill.
+    """
+
+    def __init__(self, ref: str, expected_len: int, element_gone: bool = False):
+        self.ref = ref
+        self.expected_len = expected_len
+        self.element_gone = element_gone
+        if element_gone:
+            message = (
+                f"{ref} no longer exists after typing {expected_len} "
+                f"characters — the page replaced or removed the element "
+                f"mid-fill, so the text is not on the page. Re-observe the "
+                f"fresh screenshot and pick a ref from the new element list."
+            )
+        else:
+            message = (
+                f"{ref} is still empty after typing {expected_len} characters "
+                f"— the text did not land. This is usually a tester-side "
+                f"problem (a re-render or a focus change mid-fill), so "
+                f"re-observe the fresh screenshot, pick a current ref, and try "
+                f"once more. If the same field is still empty after that "
+                f"second attempt, stop retrying and record it as an "
+                f"observation — \"the field did not retain typed text\" — "
+                f"rather than as a tester failure."
+            )
+        super().__init__(message)
 
 
 # Cap on option labels echoed back in select-related corrective errors —
@@ -295,6 +377,14 @@ class BrowserController:
         self._popups: list[CapturedPopup] = []
         self._popup_pages: list[Page] = []  # Track actual popup Page objects
         self._active_popup: Page | None = None  # Currently active popup (if any)
+        # Opener (page, url-at-open-time) per live popup Page. `_popups`
+        # records are cleared every turn once reported, but the AI needs the
+        # opener for as long as it is LOOKING at the popup (see
+        # active_page_context), so keep it here and drop the entry when the
+        # popup closes. The Page is kept so we can tell whether the opener has
+        # since navigated -- a page CAN open a tab and navigate itself, and
+        # the new-tab note must not deny a real finding.
+        self._popup_openers: dict[Page, tuple[Page, str]] = {}
         self._pinned_page: Page | None = None  # Turn pin (see pin_active_page)
         self._downloads: list[CapturedDownload] = []
         # Refs injected into subframes (iframes) can't be found via
@@ -577,6 +667,7 @@ class BrowserController:
             )
             self._popups.append(popup_record)
             self._popup_pages.append(popup)
+            self._popup_openers[popup] = (page, popup_record.opener_url)
             # Auto-switch to popup when it opens
             self._active_popup = popup
 
@@ -595,6 +686,7 @@ class BrowserController:
                 # Remove from active pages
                 if popup in self._popup_pages:
                     self._popup_pages.remove(popup)
+                self._popup_openers.pop(popup, None)
                 # If active popup was closed, switch back to main
                 if self._active_popup == popup:
                     self._active_popup = None
@@ -792,6 +884,43 @@ class BrowserController:
     def has_active_popup(self) -> bool:
         """Check if there's an active popup window."""
         return self._active_popup is not None and not self._active_popup.is_closed()
+
+    @property
+    def active_page_context(self) -> dict[str, str] | None:
+        """Identify the page the AI is looking at, when it is NOT the main one.
+
+        Returns ``{"url": ..., "opener_url": ..., "opener_intact": ...}``
+        while ``active_page`` resolves to a popup / ``target="_blank"`` tab,
+        else ``None`` (``_new_tab_note`` branches on ``opener_intact``).
+
+        Without this the AI only sees "the URL changed and the screenshot
+        shows a different site", which is indistinguishable from a same-tab
+        navigation — the mono PR #592 QA run reported a working
+        ``target="_blank"`` link as "navigates the entire page away, losing
+        in-progress form data". Resolving through ``active_page`` (not
+        ``_active_popup``) keeps this consistent with the turn pin: it
+        describes the page the screenshot and ref list actually came from.
+        """
+        page = self.active_page
+        if page is self._page:
+            return None
+        opener_page, opener_url = self._popup_openers.get(page, (None, ""))
+        if not opener_url:
+            opener_page = self._page
+            opener_url = self._page.url if self._page else ""
+        # "The opener is untouched" is an assertion, so check it rather than
+        # asserting it: a page can open a tab AND navigate itself, and the
+        # note must not talk the model out of a real finding.
+        opener_intact = bool(
+            opener_page is not None
+            and not opener_page.is_closed()
+            and opener_page.url == opener_url
+        )
+        return {
+            "url": page.url or "about:blank",
+            "opener_url": opener_url,
+            "opener_intact": opener_intact,
+        }
 
     def get_popups(self, clear: bool = False) -> list[CapturedPopup]:
         """
@@ -1026,13 +1155,117 @@ class BrowserController:
 
                 // Build description
                 const role = el.getAttribute('role') || el.tagName.toLowerCase();
-                const name = el.getAttribute('aria-label') ||
-                            el.textContent?.trim().slice(0, 50) ||
-                            el.getAttribute('placeholder') ||
-                            el.getAttribute('name') || '';
+                const tag = el.tagName.toLowerCase();
+                const isFormControl = tag === 'input' || tag === 'select'
+                                   || tag === 'textarea';
+                // The associated <label> is the string the AI can actually SEE
+                // next to the control, so for form controls it outranks both
+                // the `name` attribute and textContent (which for a <select>
+                // is the concatenated option list, and for an <input> is
+                // always empty). Value-only controls -- the QA Bot's own Max
+                // Duration / Max Cost inputs have no aria-label, text,
+                // placeholder or name -- fall through to the id rather than
+                // listing as a bare "input:" the AI can't tie to anything.
+                // innerText, not textContent: a label often wraps hidden
+                // marker spans (a required "*" and an "(optional)" hint, only
+                // one of which is shown) and textContent concatenates both.
+                const labelEl = (el.labels && el.labels[0]) || null;
+                const label = labelEl
+                    ? (labelEl.innerText || labelEl.textContent || '')
+                        .trim().slice(0, 50)
+                    : '';
+                // A <select>'s textContent is its whole option list, which
+                // is noise; the SELECTED option is what the AI sees rendered.
+                const selected = (tag === 'select' && el.selectedOptions
+                                  && el.selectedOptions[0])
+                    ? el.selectedOptions[0].textContent?.trim().slice(0, 50)
+                    : '';
+                const name = (isFormControl
+                    ? (el.getAttribute('aria-label') || label ||
+                       el.getAttribute('placeholder') ||
+                       el.getAttribute('name') || selected ||
+                       el.id?.slice(0, 50))
+                    : (el.getAttribute('aria-label') ||
+                       el.textContent?.trim().slice(0, 50) ||
+                       el.getAttribute('placeholder') ||
+                       el.getAttribute('name') || el.id?.slice(0, 50))
+                ) || '';
+
+                // Verification attributes. A screenshot cannot show whether an
+                // input carries `required`/`min`/`max` or a link carries
+                // `target="_blank"`, so every "this attribute is missing"
+                // finding used to be a guess from pixels (mono PR #592 QA run:
+                // three of four findings were exactly that). Listing the
+                // attributes that ARE present makes their absence checkable.
+                // Only present attributes are emitted, and each value is
+                // truncated, so the token cost is small.
+                const attrs = [];
+                // A value is quoted when it contains a comma or a bracket, so
+                // the "[a=b, c=d]" grouping stays parseable, and truncation is
+                // marked so a cut-off value can't read as a whole token.
+                const fmt = (v) => {
+                    let out = String(v);
+                    if (out.length > 40) out = out.slice(0, 40) + '...';
+                    return (out.indexOf(',') >= 0 || out.indexOf(']') >= 0)
+                        ? '"' + out + '"' : out;
+                };
+                const attr = (a) => {
+                    const v = el.getAttribute(a);
+                    if (v === null || v === '') return;
+                    attrs.push(a + '=' + fmt(v));
+                };
+                if (isFormControl) {
+                    // The IDL `type`, not the content attribute: an <input>
+                    // with no type= is a text input, and the prompt promises
+                    // that a listed attribute is authoritative.
+                    if (tag === 'input') attrs.push('type=' + fmt(el.type));
+                    // `required` set via the IDL property (el.required = true)
+                    // reflects to the content attribute, so this one check
+                    // finds statically- and dynamically-required fields alike.
+                    if (el.required === true) attrs.push('required');
+                    ['min', 'max', 'minlength', 'maxlength', 'step', 'pattern']
+                        .forEach(attr);
+                    if (el.hasAttribute('readonly')) attrs.push('readonly');
+                } else if (tag === 'a') {
+                    attr('target');
+                    attr('rel');
+                    // Only for something that reads as a real link. The
+                    // `<a role="button" onclick=...>` idiom is a scripted
+                    // control, and flagging it "no-href" invites exactly the
+                    // kind of false finding this list exists to prevent.
+                    if (!el.hasAttribute('href') &&
+                        !el.ownerSVGElement &&
+                        !el.hasAttribute('role') &&
+                        !el.hasAttribute('onclick') &&
+                        !el.hasAttribute('tabindex')) {
+                        attrs.push('no-href');
+                    }
+                }
+                // A form with `novalidate` suppresses native constraint
+                // validation for every control it owns, so `required`/`min`
+                // on those controls never fires — surface it on the control
+                // itself (<form> elements get no ref of their own).
+                if (el.form && el.form.hasAttribute('novalidate')) {
+                    attrs.push('form-novalidate');
+                }
+                // Same effect from the submit button's side.
+                if (el.hasAttribute('formnovalidate')) {
+                    attrs.push('formnovalidate');
+                }
+                // `:disabled`, not `el.disabled`: the IDL property reflects
+                // only the element's OWN attribute, so every control inside a
+                // <fieldset disabled> reported as enabled -- the exact "the
+                // list says it isn't there, so it isn't" trap this whole
+                // annotation exists to close.
+                if (el.matches(':disabled') ||
+                    el.getAttribute('aria-disabled') === 'true') {
+                    attrs.push('disabled');
+                }
+                const attrSuffix = attrs.length ? ' [' + attrs.join(', ') + ']' : '';
 
                 // Use string key format: "ref_1", "ref_2", etc.
-                refMap['ref_' + ref] = role + ': ' + name.replace(/\\s+/g, ' ');
+                refMap['ref_' + ref] =
+                    role + ': ' + name.replace(/\\s+/g, ' ') + attrSuffix;
             });
             root.querySelectorAll('*').forEach(el => {
                 if (el.shadowRoot) visit(el.shadowRoot);
@@ -1427,6 +1660,112 @@ class BrowserController:
         """
         locator = await self.get_element_by_ref(ref)
         await locator.fill(text, timeout=REF_ACTION_TIMEOUT_MS)
+        await self._verify_fill(locator, ref, text)
+
+    async def _verify_fill(self, locator, ref: str, expected: str) -> None:
+        """Read a filled value back and raise if it isn't there.
+
+        ``fill()`` returning is not evidence the text landed — see
+        ``FillVerificationError``. Reading the value back turns a silent
+        corruption into a corrective the AI can act on.
+
+        Fails on two conditions — the ref matches nothing afterwards, or the
+        field is empty after a non-empty fill — and lets everything else
+        through:
+
+        * An empty ``expected`` is a deliberate clear. Nothing to verify.
+        * A field holding some *other* non-empty value received the
+          keystrokes; ``maxlength`` truncation, an input mask and the app
+          reformatting the value are all the app's own doing, and the premise
+          being checked ("did the text reach the element") holds. Logged, not
+          raised — failing here would break every masked phone/card field.
+        * A field whose value cannot be read at all (a custom widget where
+          neither ``input_value()`` nor ``el.value``/``textContent`` applies)
+          passes. No read-back means no evidence, not a failure.
+        """
+        if not expected:
+            return
+
+        # The element is GONE. Refs are attributes stamped on the nodes that
+        # existed when they were injected, so an HTMX/partial swap or a
+        # re-render mid-fill leaves this locator matching nothing — the very
+        # case the docstring leads with. Check it first and check it with
+        # count(), which resolves immediately: letting input_value() and then
+        # evaluate() auto-wait for a node that is never coming back costs
+        # their full timeouts (measured at 12s) and then reports NOTHING,
+        # handing the worker the same false "typed successfully" premise this
+        # guard exists to remove.
+        #
+        # Zero matches is not "no read-back, so no evidence" — it is positive
+        # evidence that the element the worker aimed at no longer exists.
+        if await locator.count() == 0:
+            # Confirm through the canonical ref lookup before declaring the
+            # element gone. get_element_by_ref may have handed us a
+            # ``visible=true`` narrowing of a duplicate ref, and that reports
+            # zero when the element merely became HIDDEN — which is not a
+            # swap. Re-resolving gives a usable locator in that case and
+            # raises StaleRefError only when the ref truly matches nothing.
+            try:
+                locator = await self.get_element_by_ref(ref)
+            except StaleRefError:
+                logger.warning(
+                    "fill verification failed on %s: element gone after typing "
+                    "%d chars (page replaced or removed it mid-fill)",
+                    ref, len(expected),
+                )
+                raise FillVerificationError(
+                    ref, len(expected), element_gone=True
+                )
+            except Exception:
+                # Duplicates that can no longer be narrowed, a detached
+                # frame: ambiguous, so no evidence either way.
+                logger.debug(
+                    "fill verification: %s no longer resolves uniquely; "
+                    "skipping", ref
+                )
+                return
+
+        try:
+            actual = await locator.input_value(timeout=FILL_VERIFY_TIMEOUT_MS)
+        except Exception:
+            # input_value() only works on <input>/<textarea>/<select>;
+            # contenteditable and custom widgets need the DOM read. Bounded by
+            # the same budget — without an explicit timeout it inherits the
+            # 10s context default.
+            try:
+                actual = await locator.evaluate(
+                    "el => el.value ?? el.textContent ?? ''",
+                    timeout=FILL_VERIFY_TIMEOUT_MS,
+                )
+            except Exception:
+                logger.debug(
+                    "fill verification: could not read %s back; skipping", ref
+                )
+                return
+
+        # A custom element's ``value`` need not be a string (a number is
+        # legal), and len() on one would raise out of fill_ref into the
+        # worker's generic handler.
+        actual = "" if actual is None else str(actual)
+        if actual == expected:
+            return
+
+        if actual:
+            # Truncation, an input mask, or the app reformatting the value.
+            # The keystrokes reached the element, which is what is being
+            # verified here.
+            logger.debug(
+                "fill verification: %s holds %d chars after typing %d "
+                "(truncated or transformed by the page)",
+                ref, len(actual), len(expected),
+            )
+            return
+
+        logger.warning(
+            "fill verification failed on %s: typed %d chars, field is empty",
+            ref, len(expected),
+        )
+        raise FillVerificationError(ref, len(expected))
 
     def _parse_and_format_date(self, value: str, target_format: str) -> str:
         """
@@ -1598,8 +1937,12 @@ class BrowserController:
                 except ValueError:
                     await locator.fill(str_value)
         else:
-            # For text inputs, textareas, etc., use fill
-            await locator.fill(str(value))
+            # For text inputs, textareas, etc., use fill. Verified like
+            # fill_ref — this branch is the one a <textarea> takes, and a
+            # silently-dropped fill is exactly as misleading here.
+            text_value = str(value)
+            await locator.fill(text_value)
+            await self._verify_fill(locator, ref, text_value)
 
     async def _select_dropdown_option(
         self, locator, ref: str, value: str
