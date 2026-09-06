@@ -815,8 +815,10 @@ class ClaudeProvider(AIProvider):
             note = action.get("note", "")
             if note:
                 # e.g. "Triggered file download: report.pdf" — without this
-                # the AI never learns why the screenshot didn't change
-                line += f"\n   Note: {note[:150]}"
+                # the AI never learns why the screenshot didn't change. The
+                # cap fits the longest crafted note (a typed field whose
+                # first line is hidden, naming what covers it).
+                line += f"\n   Note: {note[:240]}"
 
             lines.append(line)
 

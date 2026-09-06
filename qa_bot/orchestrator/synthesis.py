@@ -117,6 +117,32 @@ def parse_verdict(report: str) -> tuple[str, Optional[dict]]:
     return stripped, verdict
 
 
+def drop_unfounded_run_over_run_labels(
+    verdict: Optional[dict], previous_report: str
+) -> Optional[dict]:
+    """Null the verdict's ``new``/``recurring`` when no previous report was given.
+
+    The prompt says to omit both keys without a "Previous Run Findings"
+    section, and the model writes ``"new": 0, "recurring": 0`` anyway — the
+    onlinestoryservices PR #1080 run had no previous report and its PR
+    footer still read "Since previous run: 0 new, 0 recurring" under a
+    critical that was, by any reading, new. Labels the model had nothing to
+    compare against are not labels; ``None`` is what every consumer
+    (``cli.py`` counts, action outputs, the footer) already treats as "no
+    previous report".
+    """
+    if verdict is None or (previous_report or "").strip():
+        return verdict
+    if verdict.get("new") is None and verdict.get("recurring") is None:
+        return verdict
+    logger.info(
+        "Synthesis qa-verdict carried new/recurring counts (%s/%s) but no "
+        "previous report was supplied; dropping them",
+        verdict.get("new"), verdict.get("recurring"),
+    )
+    return {**verdict, "new": None, "recurring": None}
+
+
 # Prepended to the fallback report persisted before the AI synthesis call.
 # Only ever read if the run died before the AI report overwrote it.
 PROVISIONAL_REPORT_BANNER = (
@@ -289,6 +315,19 @@ class SynthesisAgent:
         url = action.get("page_url", action.get("url", ""))
 
         description = self._describe_action(action)
+        # The worker's crafted note ("Field holds 68 chars (DOM-verified), but
+        # its first text line is NOT visible…", "Triggered file download:
+        # report.pdf") is evidence the synthesis prompt's quality standards
+        # tell the model to look for in the flow's action history. Without
+        # this it was visible to the worker only, and a standard that cites
+        # it in synthesis was a standard about evidence synthesis never saw
+        # (PR #607 review).
+        # Capped like the worker's history line (claude_provider._format_history):
+        # the download note is joined over site-controlled filenames, and one
+        # pathological name must not bloat or steer the flow summary.
+        note = action.get("note")
+        if note:
+            description = f"{description} [{str(note)[:240]}]"
 
         return {
             "description": description,
@@ -684,6 +723,9 @@ class SynthesisAgent:
                 )
 
             report, verdict = parse_verdict(result.get("report", ""))
+            verdict = drop_unfounded_run_over_run_labels(
+                verdict, shared_state.previous_report or ""
+            )
             if verdict is None:
                 logger.warning(
                     "Synthesis report carried no parseable qa-verdict block; "

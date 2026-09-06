@@ -62,6 +62,68 @@ FILL_VERIFY_TIMEOUT_MS = 2_000
 _PENDING_REQUESTS_PRUNE_SIZE = 512
 _PENDING_REQUESTS_MAX_AGE_S = 120.0
 
+# Runs inside the page against one element. The screenshot is the model's
+# main evidence, and for a text field the pixels that matter are its FIRST
+# line: that is where the placeholder and the start of the value render. A
+# tall editor (onlinestoryservices' 700px chapter body) that Playwright has
+# scrolled into view sits with that line under the site's sticky navbar, so
+# the box in the screenshot is blank while the DOM holds the text — the
+# 2026-09-05 deploy-gate false CRITICAL ("editor does not render typed
+# text"). ``hidden`` is decided by a hit test at the first line's position,
+# which catches "above/below the viewport" and "under another element" alike.
+_TEXT_FIELD_STATE_FN = """
+(el) => {
+    const tag = el.tagName.toLowerCase();
+    const textTypes = ['text', 'search', 'url', 'tel', 'email', 'number', 'password'];
+    const textLike = tag === 'textarea'
+        || (tag === 'input' && textTypes.includes(el.type));
+    if (!textLike) return null;
+
+    const rect = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    const px = (v) => parseFloat(v) || 0;
+    const lineHeight = px(cs.lineHeight) || px(cs.fontSize) * 1.2 || 16;
+    const x = rect.left + px(cs.borderLeftWidth) + px(cs.paddingLeft) + 2;
+    // The first line's vertical centre, clamped inside the box for a
+    // control whose padding exceeds its height.
+    const y = rect.top + Math.min(
+        px(cs.borderTopWidth) + px(cs.paddingTop) + lineHeight / 2,
+        rect.height / 2);
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const intersects = rect.bottom > 0 && rect.top < vh
+        && rect.right > 0 && rect.left < vw;
+
+    let hidden = false, coveredBy = null;
+    if (x < 0 || y < 0 || x >= vw || y >= vh) {
+        hidden = true;
+    } else {
+        // The element's own root, so a field inside an open shadow root
+        // resolves to itself rather than to its host.
+        const root = el.getRootNode();
+        const hit = (root && root.elementFromPoint ? root : document)
+            .elementFromPoint(x, y);
+        if (hit !== el) {
+            hidden = true;
+            if (hit) {
+                const cls = (typeof hit.className === 'string')
+                    ? hit.className.trim().split(/\\s+/).filter(Boolean).slice(0, 2)
+                    : [];
+                // tag#id when there is an id, else tag.class.class — short
+                // enough to survive the history note's cap intact.
+                coveredBy = hit.tagName.toLowerCase()
+                    + (hit.id ? '#' + hit.id
+                       : (cls.length ? '.' + cls.join('.') : ''));
+            }
+        }
+    }
+    // Length only, never the text: this reaches the action history and the
+    // report. A password's length is withheld too.
+    const chars = el.type === 'password'
+        ? null : String(el.value == null ? '' : el.value).length;
+    return {chars, hidden, coveredBy, intersects};
+}
+"""
+
 
 class StaleRefError(Exception):
     """Raised when a ref matches zero DOM elements (ref map is stale).
@@ -1110,6 +1172,7 @@ class BrowserController:
     # visible to the caller.
     _INJECT_REFS_SCRIPT = """
     ({startCounter, maxRefs}) => {
+        const textFieldState = __TEXT_FIELD_STATE_FN__;
         // Select interactive elements
         const selectors = [
             'a', 'button', 'input', 'select', 'textarea', 'summary',
@@ -1226,6 +1289,19 @@ class BrowserController:
                     ['min', 'max', 'minlength', 'maxlength', 'step', 'pattern']
                         .forEach(attr);
                     if (el.hasAttribute('readonly')) attrs.push('readonly');
+                    // Text fields: how much they hold (a tall editor scrolled
+                    // under a sticky header shows a blank box in the
+                    // screenshot while the DOM holds the text) and whether
+                    // their first line -- placeholder and start of value --
+                    // is actually visible. Only for fields at least partly
+                    // in the viewport: a field wholly off-screen is not in
+                    // the screenshot to be misjudged, and marking every
+                    // below-the-fold input would be noise.
+                    const state = textFieldState(el);
+                    if (state && state.intersects) {
+                        if (state.chars) attrs.push('chars=' + state.chars);
+                        if (state.hidden) attrs.push('first-line-hidden');
+                    }
                 } else if (tag === 'a') {
                     attr('target');
                     attr('rel');
@@ -1275,7 +1351,7 @@ class BrowserController:
 
         return {refMap, skipped};
     }
-    """
+    """.replace("__TEXT_FIELD_STATE_FN__", _TEXT_FIELD_STATE_FN)
 
     async def inject_refs(self) -> dict[str, str]:
         """
@@ -1649,6 +1725,30 @@ class BrowserController:
         """
         locator = await self.get_element_by_ref(ref)
         await locator.scroll_into_view_if_needed()
+
+    async def text_field_state(self, ref: str) -> dict | None:
+        """Describe what a text field holds and whether its first line is visible.
+
+        ``None`` for anything that is not a text field (a button, a checkbox);
+        else ``{"chars", "hidden", "coveredBy", "intersects"}``. ``chars`` is
+        the value's length (``None`` for a password); ``hidden`` says the
+        field's first text line is outside the viewport or under another
+        element, decided by a hit test at that line's position so a sticky
+        navbar counts; ``coveredBy`` names that element (``tag#id.class``)
+        when there is one; ``intersects`` says whether any part of the field
+        is in the viewport at all.
+
+        The worker attaches this to every ``type`` action's history note: a
+        screenshot cannot show a line that is not in it, and a tall editor
+        Playwright scrolled into view typically has exactly that line under
+        the site's header, so a blank-looking box must never be read as
+        "the text did not render".
+        """
+        locator = await self.get_element_by_ref(ref)
+        state = await locator.evaluate(
+            _TEXT_FIELD_STATE_FN, timeout=FILL_VERIFY_TIMEOUT_MS
+        )
+        return state if isinstance(state, dict) else None
 
     async def fill_ref(self, ref: str, text: str) -> None:
         """

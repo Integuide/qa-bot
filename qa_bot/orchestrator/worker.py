@@ -379,6 +379,52 @@ def _new_tab_note(browser: BrowserController) -> str:
     )
 
 
+def format_typed_text_note(state: dict) -> str:
+    """Turn ``BrowserController.text_field_state`` into the type action's note.
+
+    The note is the only DOM evidence about a typed field that reaches the
+    model, and it has to defeat one specific misreading: a tall editor whose
+    first line — placeholder and start of the value — sits under the site's
+    sticky navbar (or above the viewport) after Playwright scrolled it into
+    view. The screenshot then shows a blank box while the DOM holds the
+    text, and "the editor does not render typed text" reads as a plausible
+    CRITICAL (onlinestoryservices PR #1080, 2026-09-05). So the note always
+    states the verified length, and when the first line is not visible it
+    says so, names what covers it, and says what to do instead of reporting.
+    """
+    chars = state.get("chars")
+    base = (
+        f"Field holds {chars} chars (DOM-verified)"
+        if isinstance(chars, int) and not isinstance(chars, bool)
+        else "Text landed in the field (DOM-verified)"
+    )
+    if not state.get("hidden"):
+        return base + "."
+    covered_by = state.get("coveredBy")
+    where = f"under {str(covered_by)[:40]}" if covered_by else "outside the viewport"
+    return (
+        f"{base}, but its first text line is NOT visible in the screenshot "
+        f"({where}) — scroll until the field's top edge is in clear view "
+        "before judging what it displays."
+    )
+
+
+async def _typed_text_note(browser: BrowserController, ref: str) -> str:
+    """Note for a successful ``type``/``form_input``; empty when unreadable.
+
+    Best-effort by design: the fill itself was already verified, so a
+    failure here must cost nothing but the note.
+    """
+    try:
+        state = await browser.text_field_state(ref)
+    except Exception as e:  # a note must never fail a verified fill
+        logger.debug("text field state unavailable for %s: %s", ref, e)
+        return ""
+    if not isinstance(state, dict):
+        return ""
+    return format_typed_text_note(state)
+
+
 def _smoke_mode_note(smoke: bool, action_count: int) -> str:
     """Per-turn smoke-mode instruction (SharedFlowState.smoke).
 
@@ -548,6 +594,10 @@ class ActionResult:
     screenshot: bytes = None  # Unused: no action captures a screenshot (kept for compatibility)
     data_request: "UserDataRequest" = None  # For request_data action
     needs_context_rebuild: bool = False  # For set_http_auth: recreate browser context
+    # Rides into the action history as "Note: ..." (the AI never sees
+    # `message`). For evidence the screenshot cannot carry — what a typed
+    # field now holds, and whether its first line is even visible.
+    note: str = ""
     # True when `error` is a crafted corrective instruction for the AI (not a
     # raw exception string). Corrective errors are kept intact in the action
     # history shown to the model instead of the tight raw-error truncation.
@@ -1735,13 +1785,19 @@ class FlowExplorationWorker:
                 action_dict["target_url"] = action.url  # Target URL for navigate action
             if action.reason:
                 action_dict["reason"] = action.reason
+            # The crafted note goes first: the history formatter caps the
+            # line, and the typed-field note's remedy sentence is the part
+            # that must not be the one cut off.
+            notes = [exec_result.note] if exec_result.note else []
             if downloads:
                 # Surface the download in action history so the next AI turn
                 # knows the action worked (the screenshot won't show it).
                 filenames = ", ".join(
                     d.suggested_filename or d.url for d in downloads
                 )
-                action_dict["note"] = f"Triggered file download: {filenames}"
+                notes.append(f"Triggered file download: {filenames}")
+            if notes:
+                action_dict["note"] = " ".join(notes)
 
             if exec_result.error:
                 action_dict["error"] = exec_result.error
@@ -2228,7 +2284,11 @@ class FlowExplorationWorker:
                         error="Missing ref or text"
                     )
                 await browser.fill_ref(action.ref, action.text)
-                return ActionResult(success=True, message=f"Typed into {action.ref}")
+                return ActionResult(
+                    success=True,
+                    message=f"Typed into {action.ref}",
+                    note=await _typed_text_note(browser, action.ref),
+                )
 
             elif action.action_type == "form_input":
                 if action.ref is None or action.value is None:
@@ -2238,7 +2298,14 @@ class FlowExplorationWorker:
                         error="Missing ref or value"
                     )
                 await browser.set_form_value(action.ref, action.value)
-                return ActionResult(success=True, message=f"Set form value on {action.ref}")
+                # A text field driven through form_input takes the same
+                # fill path as `type`, so it gets the same note; for a
+                # checkbox/select/date the state is None and there is none.
+                return ActionResult(
+                    success=True,
+                    message=f"Set form value on {action.ref}",
+                    note=await _typed_text_note(browser, action.ref),
+                )
 
             elif action.action_type == "scroll":
                 direction = action.scroll_direction or "down"
