@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from qa_bot.ai.base import AIProvider, AgentAction
-from qa_bot.ai.claude_provider import fatal_api_error_reason
+from qa_bot.ai.claude_provider import NOTE_MAX_CHARS, fatal_api_error_reason
 from qa_bot.agent.state import Issue
 from qa_bot.browser.controller import (
     BrowserController,
@@ -425,6 +425,113 @@ async def _typed_text_note(browser: BrowserController, ref: str) -> str:
     return format_typed_text_note(state)
 
 
+# NOTE_MAX_CHARS (imported above from the history formatter that applies
+# it): every crafted note below is built to fit so its remedy sentence is
+# never the part cut.
+
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def format_find_text_note(needle: str, result: dict | None) -> str:
+    """The `find_text` action's history note — the only channel to the model.
+
+    Three shapes. A rendered match: the count, a snippet, and that it was
+    scrolled into view. Only hidden matches: the text is on the page in a
+    collapsed/hidden section — expand it, do not call it absent. No match:
+    spelled out as evidence for "not on THIS page", and nothing more.
+    """
+    shown = _clip(needle, 40)
+    visible = int((result or {}).get("visible") or 0)
+    hidden = int((result or {}).get("hidden") or 0)
+    chars = int((result or {}).get("chars") or 0)
+    # No result, or a result that read nothing (no body yet, an empty
+    # document): "could not read", never a confident no-match.
+    if not result or not (visible or hidden or chars):
+        return (
+            f'find_text "{shown}": could not read this page\'s text — '
+            f"scroll to the bottom instead before judging."
+        )
+    if visible:
+        snippet = _clip(result.get("snippet") or "", 100)
+        where = (
+            "scrolled into view; read it in the screenshot"
+            if result.get("scrolled") else "on this page"
+        )
+        plural = "es" if visible != 1 else ""
+        return (
+            f'find_text "{shown}": {visible} rendered match{plural} — '
+            f'"{snippet}" — {where}.'
+        )
+    if hidden:
+        return (
+            f'find_text "{shown}": 0 rendered matches, but {hidden} in a '
+            f"hidden/collapsed section of this page — expand the section "
+            f"that holds it and look again; the text is here, not absent."
+        )
+    frames = int(result.get("frames") or 1)
+    skipped = int(result.get("frames_skipped") or 0)
+    searched = f"{chars:,} chars" + (f" in {frames} frames" if frames > 1 else "")
+    # A subframe that was not read is a hole in the evidence — say so, or
+    # "no match" quietly covers an iframe the search never reached.
+    unread = f"; {skipped} subframe{'s' if skipped != 1 else ''} unsearched" if skipped else ""
+    return (
+        f'find_text "{shown}": no match in this page\'s text '
+        f"({searched} searched) or its hidden markup{unread}. Evidence for "
+        f'"not on THIS page" only — other pages remain unread.'
+    )
+
+
+def format_page_extent_note(extent: dict | None) -> str:
+    """Per-turn note saying how much of the page the screenshot shows.
+
+    Empty when the page fits the viewport (nothing unseen) or the extent is
+    unreadable. Otherwise names the pixel band on screen and what lies above
+    or below it, so "not on this page" is never concluded from the top
+    screen of a page four screens tall — the onlinestoryservices PR #1090
+    run's false "no model name anywhere in the UI".
+    """
+    if not extent:
+        return ""
+    try:
+        top = int(extent.get("scrollY") or 0)
+        vh = int(extent.get("viewportHeight") or 0)
+        total = int(extent.get("scrollHeight") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if vh <= 0 or total <= vh + 8:
+        return ""
+    bottom = min(top + vh, total)
+    below = total - bottom
+    band = f"px {top:,}–{bottom:,} of this {total:,}px-tall page"
+    if below <= 8:
+        return (
+            f"**Page extent**: the screenshot shows {band} — the bottom of "
+            f"the page. Everything above it that you did not scroll past "
+            f"is still unread."
+        )
+    parts = [f"{below:,}px of content continue BELOW it"]
+    if top > 8:
+        parts.insert(0, f"{top:,}px lie above it")
+    return (
+        f"**Page extent**: the screenshot shows {band}; {' and '.join(parts)}. "
+        f"Nothing you have not scrolled to or searched with find_text has "
+        f"been read — do not say something is not on this page until you "
+        f"have."
+    )
+
+
+async def _page_extent_note(browser: BrowserController) -> str:
+    """Best-effort: a failure to read the extent costs the note, not the turn."""
+    try:
+        return format_page_extent_note(await browser.page_extent())
+    except Exception as e:
+        logger.debug(f"page extent unavailable: {e}")
+        return ""
+
+
 def _smoke_mode_note(smoke: bool, action_count: int) -> str:
     """Per-turn smoke-mode instruction (SharedFlowState.smoke).
 
@@ -651,6 +758,7 @@ class FlowExplorationWorker:
     - wait: Wait/pause
     - navigate: Go to URL or back/forward
     - resize: Resize viewport
+    - find_text: Search the whole page's text for a phrase
 
     QA-specific actions (extensions):
     - report_issue: Report a QA issue found
@@ -1093,6 +1201,7 @@ class FlowExplorationWorker:
                 # Get ref list and viewport size
                 ref_list = await browser.get_ref_list()
                 viewport_size = await browser.get_viewport_size()
+                page_extent_note = await _page_extent_note(browser)
 
                 # Save screenshot to disk if enabled
                 if self.state.chat_logger:
@@ -1143,6 +1252,7 @@ class FlowExplorationWorker:
                             ),
                             _smoke_mode_note(self.state.smoke, action_count),
                             _new_tab_note(browser),
+                            page_extent_note,
                         ) if note),
                         is_first_worker=self.is_first_worker,
                         worker_number=self.worker_number,
@@ -2384,6 +2494,42 @@ class FlowExplorationWorker:
                 return ActionResult(
                     success=True,
                     message=f"Dragged from {action.start_coordinate} to {action.coordinate}"
+                )
+
+            elif action.action_type == "find_text":
+                needle = (action.text or "").strip()
+                if not needle:
+                    return ActionResult(
+                        success=False,
+                        message="find_text requires text",
+                        corrective_error=True,
+                        error=(
+                            'find_text needs "text": the exact phrase to look '
+                            'for on this page (e.g. "text": "DeepSeek V4.1 Flash").'
+                        ),
+                    )
+                try:
+                    result = await browser.find_text(needle)
+                except Exception as e:
+                    logger.warning(f"{self.worker_id}: find_text failed: {e}")
+                    result = None
+                if result is None:
+                    # Tester-side: the page could not be read. Say so as a
+                    # corrective error rather than a "success" with no
+                    # evidence, so the model falls back to scrolling.
+                    return ActionResult(
+                        success=False,
+                        message=f"find_text could not read the page for {needle[:40]!r}",
+                        corrective_error=True,
+                        error=format_find_text_note(needle, None),
+                    )
+                # The result is evidence, so it travels as the note (the AI
+                # never sees `message`) and on into the flow summary that
+                # synthesis reads.
+                return ActionResult(
+                    success=True,
+                    message=f"Searched page text for {needle[:40]!r}",
+                    note=format_find_text_note(needle, result),
                 )
 
             elif action.action_type in ("screenshot", "zoom"):

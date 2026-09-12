@@ -62,6 +62,105 @@ FILL_VERIFY_TIMEOUT_MS = 2_000
 _PENDING_REQUESTS_PRUNE_SIZE = 512
 _PENDING_REQUESTS_MAX_AGE_S = 120.0
 
+# Runs inside the page. The model's evidence is one viewport screenshot plus
+# a list of INTERACTIVE elements; static copy (headings, paragraphs, FAQ
+# answers, prices) never reaches it as text, and nothing below the fold
+# reaches it at all. In the onlinestoryservices PR #1090 deploy run two
+# workers judged /premium/ from its top screen and reported the model name
+# as "not displayed anywhere in the UI" while the FAQ further down named it
+# verbatim. `find_text` gives the model a whole-page read: matches in the
+# RENDERED text (innerText, so a collapsed/hidden section does not count as
+# visible), matches present in the DOM but not rendered (so the model is
+# told to expand a section rather than call the text absent), and a scroll
+# that brings the first rendered match into the next screenshot.
+_FIND_TEXT_FN = """
+({needle, scroll}) => {
+    const collapse = (s) => (s || '').replace(/\\s+/g, ' ');
+    const words = collapse(needle).trim().split(' ').filter(Boolean);
+    if (!words.length) return null;
+    const escaped = words.map((w) => w.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'));
+    // Whitespace-tolerant, case-insensitive: "DeepSeek  V4.1\\nFlash" matches.
+    const source = escaped.join('\\\\s+');
+    const one = new RegExp(source, 'i');
+    const all = new RegExp(source, 'gi');
+    const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE']);
+    const body = document.body;
+    if (!body) return {visible: 0, hidden: 0, snippet: null, scrolled: false, chars: 0};
+
+    const rendered = collapse(body.innerText);
+    let visible = 0, snippet = null;
+    for (const m of rendered.matchAll(all)) {
+        if (visible === 0) {
+            const start = Math.max(0, m.index - 40);
+            const end = Math.min(rendered.length, m.index + m[0].length + 40);
+            snippet = (start > 0 ? '…' : '') + rendered.slice(start, end).trim()
+                + (end < rendered.length ? '…' : '');
+        }
+        visible++;
+    }
+
+    // Text that is in the markup but not rendered: display:none, a closed
+    // <details>, a collapsed accordion panel. Counted per text node.
+    const isRendered = (el) => el.checkVisibility
+        ? el.checkVisibility({visibilityProperty: true, contentVisibilityAuto: true})
+        : el.getClientRects().length > 0;
+    let hidden = 0;
+    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
+        acceptNode: (node) => {
+            const parent = node.parentElement;
+            if (!parent || parent.closest('script, style, noscript, template')) {
+                return NodeFilter.FILTER_REJECT;
+            }
+            return NodeFilter.FILTER_ACCEPT;
+        },
+    });
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (isRendered(node.parentElement)) continue;
+        const hits = collapse(node.data).match(all);
+        if (hits) hidden += hits.length;
+    }
+
+    // Bring the first rendered match into view: descend to the deepest
+    // element whose rendered text still contains the phrase, so a match
+    // split across inline tags ("<b>DeepSeek</b> V4.1 Flash") is found too.
+    let scrolled = false;
+    if (visible > 0 && scroll) {
+        let el = body, descended = true;
+        while (descended) {
+            descended = false;
+            for (const child of el.children) {
+                if (SKIP.has(child.tagName) || !isRendered(child)) continue;
+                if (one.test(collapse(child.innerText))) {
+                    el = child;
+                    descended = true;
+                    break;
+                }
+            }
+        }
+        if (el !== body) {
+            el.scrollIntoView({block: 'center', behavior: 'instant'});
+            scrolled = true;
+        }
+    }
+    return {visible, hidden, snippet, scrolled, chars: rendered.length};
+}
+"""
+
+# Runs inside the page. How much of the page the viewport screenshot shows,
+# so the worker can tell the model every turn that content continues below
+# (or above) what it is looking at. A page that scrolls inside an inner
+# container instead of the document reports no extent; the note is then
+# simply absent, and find_text still covers it.
+_PAGE_EXTENT_FN = """
+() => ({
+    scrollY: Math.round(window.scrollY),
+    viewportHeight: window.innerHeight,
+    scrollHeight: Math.max(
+        document.documentElement ? document.documentElement.scrollHeight : 0,
+        document.body ? document.body.scrollHeight : 0),
+})
+"""
+
 # Runs inside the page against one element. The screenshot is the model's
 # main evidence, and for a text field the pixels that matter are its FIRST
 # line: that is where the placeholder and the start of the value render. A
@@ -1749,6 +1848,93 @@ class BrowserController:
             _TEXT_FIELD_STATE_FN, timeout=FILL_VERIFY_TIMEOUT_MS
         )
         return state if isinstance(state, dict) else None
+
+    async def find_text(self, needle: str) -> dict | None:
+        """Search the active page's whole text for ``needle``.
+
+        ``None`` for a blank needle; else ``{"visible", "hidden", "snippet",
+        "scrolled", "chars"}``. ``visible`` counts matches in the rendered
+        text (``innerText`` — collapsed/hidden sections do not count),
+        ``hidden`` counts matches in text nodes that are in the markup but
+        not rendered, ``snippet`` is the rendered context around the first
+        match, ``scrolled`` says the first rendered match was scrolled into
+        view for the next screenshot, and ``chars`` is how much rendered
+        text was searched. Case- and whitespace-insensitive.
+
+        Every frame is searched — the main document plus up to
+        ``MAX_REF_SUBFRAMES`` subframes, the same cap and best-effort
+        semantics as ``get_ref_list`` — and the counts are summed:
+        ``frames`` says how many were read and ``frames_skipped`` how many
+        were not (over the cap, detached, or wedged). A main-frame-only
+        search would report "no match" for text sitting in an embedded
+        checkout or help widget, which is the false absence claim this
+        action exists to prevent. ``None`` also when no frame had readable
+        text (no ``document.body`` yet, an empty document): that is "could
+        not read", not evidence of absence.
+
+        The model sees one viewport and a list of interactive elements, so
+        static copy below the fold is invisible to it; this is its way to
+        read a whole page before claiming something is not on it.
+        """
+        page = self.active_page
+        if not page:
+            raise RuntimeError("No page available")
+        if not needle.strip():
+            return None
+        subframes = [
+            f for f in page.frames
+            if f is not page.main_frame and not f.is_detached()
+        ]
+        total = {
+            "visible": 0, "hidden": 0, "snippet": None, "scrolled": False,
+            "chars": 0, "frames": 0,
+            "frames_skipped": max(0, len(subframes) - MAX_REF_SUBFRAMES),
+        }
+        for frame in [page.main_frame, *subframes[:MAX_REF_SUBFRAMES]]:
+            # Scroll the first rendered match into view once, in whichever
+            # frame holds it; a later frame's match must not steal the
+            # viewport from it.
+            args = {"needle": needle, "scroll": total["visible"] == 0}
+            try:
+                if frame is page.main_frame:
+                    result = await frame.evaluate(_FIND_TEXT_FN, args)
+                else:
+                    result = await asyncio.wait_for(
+                        frame.evaluate(_FIND_TEXT_FN, args),
+                        timeout=REF_INJECTION_TIMEOUT_S,
+                    )
+            except (asyncio.TimeoutError, PlaywrightError):
+                if frame is page.main_frame:
+                    raise  # the worker turns this into "could not read"
+                total["frames_skipped"] += 1  # detached mid-search / wedged
+                continue
+            if not isinstance(result, dict):
+                continue
+            total["visible"] += int(result.get("visible") or 0)
+            total["hidden"] += int(result.get("hidden") or 0)
+            total["chars"] += int(result.get("chars") or 0)
+            total["frames"] += 1
+            total["scrolled"] = total["scrolled"] or bool(result.get("scrolled"))
+            if total["snippet"] is None and result.get("snippet"):
+                total["snippet"] = result["snippet"]
+        if not (total["chars"] or total["visible"] or total["hidden"]):
+            return None  # nothing readable anywhere — not a "no match"
+        return total
+
+    async def page_extent(self) -> dict | None:
+        """``{"scrollY", "viewportHeight", "scrollHeight"}`` of the active page.
+
+        Best-effort: ``None`` when it cannot be read (no page, navigation in
+        flight). The worker turns it into the per-turn "Page extent" note.
+        """
+        page = self.active_page
+        if not page:
+            return None
+        try:
+            result = await page.evaluate(_PAGE_EXTENT_FN)
+        except Exception:
+            return None
+        return result if isinstance(result, dict) else None
 
     async def fill_ref(self, ref: str, text: str) -> None:
         """

@@ -394,6 +394,8 @@ class ChatLogger:
             elif action == "scroll_to":
                 target = element or ref or "element"
                 return f"{worker}: scroll_to {target}"
+            elif action == "find_text":
+                return f"{worker}: find_text '{text[:40]}'"
             elif action == "key":
                 key = data.get("key", "")
                 modifiers = data.get("modifiers", [])

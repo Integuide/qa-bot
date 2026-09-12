@@ -395,6 +395,11 @@ class SynthesisAgent:
             target = element or ref or "element"
             return f"Scroll to {target}"
 
+        # Whole-page text search — its note carries the result
+        if action_type == "find_text":
+            needle = action.get("text", "")
+            return f"Find text '{needle[:40]}' on the page"
+
         # Key press
         if action_type == "key":
             key = action.get("key", "")

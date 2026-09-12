@@ -43,6 +43,7 @@ class AgentAction(BaseModel):
         "form_input",      # Set form value (form_input tool)
         "navigate",        # Go to URL (navigate tool)
         "resize",          # Resize viewport (resize_window tool)
+        "find_text",       # Search the whole page's text for a phrase
         # QA-specific actions (extensions)
         "done",            # Mark flow complete
         "block",           # Request supervisor help
@@ -65,7 +66,7 @@ class AgentAction(BaseModel):
     # For zoom action
     region: Optional[tuple[int, int, int, int]] = None  # [x0, y0, x1, y1] rectangle
 
-    # For type action
+    # For type action; for find_text it is the phrase to search for
     text: Optional[str] = None
 
     # For form_input action - flexible value type

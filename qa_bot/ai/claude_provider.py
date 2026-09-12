@@ -32,6 +32,12 @@ from .prompts import (
     format_synthesis_context
 )
 
+# The action-history formatter caps a note at this many characters (the
+# truncation site is the `Note:` line in the history block below). The
+# worker's crafted notes (find_text, typed-text) are built to fit it, and its
+# test guards against this constant — so the literal lives here, once.
+NOTE_MAX_CHARS = 240
+
 logger = logging.getLogger(__name__)
 
 # Retry configuration
@@ -818,7 +824,7 @@ class ClaudeProvider(AIProvider):
                 # the AI never learns why the screenshot didn't change. The
                 # cap fits the longest crafted note (a typed field whose
                 # first line is hidden, naming what covers it).
-                line += f"\n   Note: {note[:240]}"
+                line += f"\n   Note: {note[:NOTE_MAX_CHARS]}"
 
             lines.append(line)
 

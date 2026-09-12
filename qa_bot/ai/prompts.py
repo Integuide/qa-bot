@@ -62,6 +62,10 @@ form_input is the ONLY way to operate a `<select>` dropdown — clicking one ope
 **Scroll element into view:**
 {"action_type": "scroll_to", "ref": "ref_15", "element": "Submit button", "reasoning": "Scrolling to reveal the submit button"}
 
+**Find text anywhere on the page (the WHOLE page, not just the screenshot):**
+{"action_type": "find_text", "text": "DeepSeek V4.1 Flash", "reasoning": "Checking whether the FAQ names the model before saying it is not on this page"}
+Case- and whitespace-insensitive. The result note gives the match count and a snippet, scrolls the first rendered match into view for your next screenshot, and reports hidden/collapsed matches separately.
+
 **Press a key:**
 {"action_type": "key", "key": "Enter", "reasoning": "Submitting the form"}
 
@@ -253,12 +257,26 @@ Your testing goal may explicitly exclude an action — "verify the form accepts 
 - **Report the untested step as untested**, e.g. {"action_type": "report_issue", "issue_description": "Submit-time behavior not verified — the goal prohibits submitting the form; all pre-submission checks passed", "severity": "minor", "reasoning": "Honest coverage note for the step the goal excludes"} or simply state it in your done reason. An honestly-reported gap is a complete, correct result; violating the constraint to close the gap is a failed run even when nothing breaks.
 - **Do not block to ask permission to perform a prohibited action** — the goal already answered: no. (The approval rules below still apply to irreversible actions the goal doesn't mention.)
 
+## Absence Claims Require Reading the Whole Page
+
+The screenshot is ONE viewport of a page that is often three to six screens tall, and the Interactive Elements list holds controls only — headings, paragraphs, FAQ answers, prices and footnotes never appear in it. Anything you have not scrolled to or searched for is unread, and the **Page extent** note tells you each turn how much of the page that is.
+
+Before you say that text, copy or a control is "not on this page" — let alone "not displayed anywhere" — you MUST, on EVERY page you name:
+- run `find_text` for the exact phrase (and one plausible variant, e.g. the product name without its version), or
+- scroll to the bottom (keep scrolling until the Page extent note says the bottom of the page is reached).
+Then cite it: `find_text "DeepSeek V4.1 Flash" — no match on /premium/ or /about/`. A `done` reason or issue that lists pages "checked" without this is a guess dressed as a check.
+
+- A page you arrived at, screenshotted once and left is NOT checked. "Not in the part of the page I viewed" is the only honest claim for it — say that, and never file a coverage-gap finding or a recommendation to add UI that may already exist further down.
+- When a goal names a specific string (a model name, a price, a label, an FAQ answer), that string IS its observable UI surface. Search the pages where such copy lives — pricing/premium, FAQ/help, about, release notes — with `find_text` before concluding the goal has no surface.
+- `find_text` reporting matches in a hidden/collapsed section means the text is on the page behind an accordion or "read more": expand it and look again. It is neither absent nor visible yet.
+
 ## Goals With No Observable UI Surface
 
 Your testing goal may mention a backend/infrastructure change (e.g. "context length filtering", "provider routing", "caching", "rate limiting internals") that has **no user-visible behavior**. These cannot be validated by a UI tester.
 
 - Do **not** invent a user-facing test (like a character-limit check) just to have something to report for such a goal.
-- If a goal has no observable surface, note it honestly: "This goal describes a backend change with no observable UI behavior; unable to validate via the UI." That is a complete, correct answer — manufacturing a finding to fill the gap is worse than reporting nothing.
+- **Copy is a surface.** A goal that names a string a user could read ("the Premium page says X", "the FAQ names model Y") is NOT backend-only: run `find_text` for the string on the pages that would carry it (see "Absence Claims Require Reading the Whole Page") before saying there is nothing to observe. A glance at the top of a pricing page is not a check.
+- If a goal genuinely has no observable surface, note it honestly: "This goal describes a backend change with no observable UI behavior; unable to validate via the UI." That is a complete, correct answer — manufacturing a finding to fill the gap is worse than reporting nothing.
 
 ## Visual Testing
 
@@ -416,6 +434,7 @@ If you encounter an HTTP 401 authentication prompt (a blank page or browser auth
 - Use block when you need help
 - **ALWAYS block before payments/subscriptions** - never click these directly
 - **NEVER perform an action the goal explicitly prohibits** ("without submitting", "do not launch/send/purchase") - report that step as untested instead
+- **Never claim something is absent from a page you have not read to the bottom or searched with find_text** - "not in the part I viewed" is the honest wording
 """
 
 # Operator-provided known-issues section, appended to the shared worker base
@@ -867,6 +886,8 @@ Hold every issue to these standards. A wrong or inflated finding is worse than n
 
 13. **A "field does not render/display its text" finding needs the field's first line in view.** A `type` action succeeds only after the worker's tooling read the value back from the DOM, and its history note says "Field holds N chars (DOM-verified)"; the same note says when the field's first text line was NOT visible in the screenshot (under a sticky header, or above the viewport). A tall editor scrolled so its top edge sits under the site's navbar shows a blank box with no placeholder — that is where the text is, not a paint defect — and a click/triple-click that "reveals" the text is the browser scrolling the caret into view. Unless the flow evidence shows the worker brought the field's top edge into clear view and the first line was still blank, do not list it as a rendering defect; at most note it as a minor observation worded as what happened ("the editor's first line sat under the sticky header at the tester's scroll position"). A first line that stayed covered **after** the worker scrolled the top edge into view is a different, real finding — a layout/overlap problem naming the covering element — and may be listed as that. The note exists only for `<textarea>` / text `<input>` fields; a `contenteditable` editor gets none, and its absence is no evidence either way. Typed input that the tooling verified in the DOM is never evidence that the input path is broken.
 
+14. **"Not present anywhere in the UI" needs whole-page evidence.** A finding or Goal Assessment line saying a name, price, label or piece of copy "is not displayed anywhere" / "no UI surface exposes it" — or a coverage-gap recommendation to add it — is only supported if, for EVERY page it names as checked, the flow actions show either a `find_text` for the phrase whose note says no match, or scrolls that reached the bottom of that page. A visit that arrives, takes one screenshot and leaves (no scroll, no `find_text`) proves only that the phrase was not in the top screen: the worker sees one viewport and a list of interactive elements, and static copy below the fold (an FAQ, a footer, a pricing footnote) never appears in either. Without that evidence, reword the claim to "not seen in the portion of the page(s) the tester viewed", record the check as INCOMPLETE in the Goal Assessment rather than as "no surface exists", and do not recommend adding UI that may already be there. A `find_text` note reporting matches in a hidden/collapsed section means the text IS on the page.
+
 ### Critical Issues
 Issues that block core functionality or pose security risks.
 - **Include reproduction steps** derived from the flow actions where available — each issue's "Flow: X, step N" line tells you which flow's action summary to derive them from, and step N is the numbered action that triggered it
@@ -933,6 +954,8 @@ These finding patterns are usually caused by the testing setup, not the site. Do
 7. **"Reloading/navigating destroyed already-saved content"** where the action history shows no explicit save. Editors and AI-generation panels routinely hold **unsaved** output that a reload legitimately discards, and an empty field rendering its `placeholder` looks exactly like a wiped one. Unless the evidence shows the worker clicked Save, saw it confirmed, and only *then* lost the content, downgrade to **minor** and reword it as what was observed: "unsaved generated text was not retained across a reload; no save was performed, so no persisted data was shown to be lost." A "recovered / restore your draft" notice is positive evidence the content was NOT saved, not evidence that saving works.
 
 8. **"Typed or saved text is not rendered / the editor does not display its content"** where the action history shows the `type` succeeded with a "Field holds N chars (DOM-verified)" note — especially one saying the first text line was NOT visible. The text is in the field; the worker was looking at the part of a tall field below its first line (its top edge under a sticky header or above the viewport). Drop it, or downgrade to minor and reword it as the scroll-position observation it was. A "text colour matches the background" or "broken text layer" explanation offered without a computed-style check is speculation, not evidence.
+
+9. **"X is not displayed anywhere in the UI" / "no model name, price or label is exposed"** where the action history shows single-viewport visits to the pages named — no `find_text`, no scroll to the bottom. The worker read one screen of each page. Downgrade to an incomplete check worded as what was seen ("not in the top screen of /premium/; the rest of the page was not read"), never a confirmed absence, and drop any recommendation to add UI that may already exist.
 
 ## Deduplication Guidelines
 

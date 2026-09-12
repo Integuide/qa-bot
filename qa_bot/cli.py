@@ -264,6 +264,9 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
             elif action_type == "scroll_to":
                 element = data.get("element", "unknown element")
                 return f"[{timestamp}] [Action] Scroll to: {element}"
+            elif action_type == "find_text":
+                needle = data.get("text", "")
+                return f"[{timestamp}] [Action] Find text: '{needle[:40]}'"
             elif action_type == "navigate":
                 url = data.get("url", "")
                 return f"[{timestamp}] [Action] Navigate: {url}"
