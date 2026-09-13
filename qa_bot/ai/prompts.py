@@ -213,6 +213,20 @@ Before reporting that a failure is CAUSED by a specific feature, parameter, or i
 
 This distinction steers real deploy decisions: "the discount feature is broken" reads as a code regression and can block a release, while "checkout fails on this environment regardless of discount" points at environment/config. A wrong causal claim in a major/critical finding is worse than reporting the raw observation.
 
+## Leak / Isolation Claims Need a Planted Canary
+
+"Context A can see content it must not" (a sibling story branch, an unchosen variant, another user's data) is a claim about what went INTO a generation, and matching what came OUT cannot establish it. Two AI generations from the same premise routinely invent the same names, places and turns of phrase, so a detail that first appeared in B and later shows up in A proves only that A and B share an origin — not that A's prompt contained B. `find_text` showing the phrase in B and not in the shared ancestor tells you where it first appeared, nothing more.
+
+Test isolation with evidence the model cannot invent:
+
+1. **Plant a canary in the source.** Before A exists — before you create A's chat, chapter or variant, not just before you generate in it, since context is often seeded at creation — put a unique nonsense token into the content B that A must not see: edit your own test chapter/segment/notes (create B yourself if the existing one is not yours) to mention e.g. a well named "Vorlith-{run_nonce}-4471". Build it from your run ID plus extra random digits, fresh for this flow — other workers and retried attempts of this flow plant too, and test content persists on the site — and keep it mundane. Only a match for the token YOU planted in THIS flow counts.
+2. **Create and generate in A**, then search for the canary in A's output and notes. `find_text` reads rendered page text, not the contents of editor fields: where A's output sits in a `<textarea>` / `<input>` (the ref list shows `chars=N`), scroll the field's first line into view and read it yourself — a `find_text` no-match against an editor field is not evidence of isolation. A clear paraphrase of the fact you planted with it ("the well with the strange name") counts; a generic detail both could invent ("the town is walled") does not.
+3. **Report only what the canary shows.** The canary in A is a leak: cite the plant and the match. A shared-premise name in both ("Cass's Row" in a story whose cartographer is named Cass) is not.
+
+Where the page shows what A was seeded with (a chat's imported history, a "continuing from chapter X" header), read it — direct evidence of A's context beats any output match.
+
+If you cannot plant a canary (the goal forbids creating or editing content, no edit surface, budget gone), report the overlap at **minor** as an observation — "detail X appears in both A and B; A was never shown to contain B's content and X could have been generated independently" — never as a confirmed or reproducible isolation failure.
+
 ## Data-Loss Claims Require a Verified Save First
 
 "The site destroyed content the user had already saved" is the highest-consequence thing you can report and the easiest to get wrong from the outside. **Before you may claim that saved data was lost, you must have saved it yourself and confirmed the save.** A save you assumed happened is not a baseline.
@@ -435,6 +449,7 @@ If you encounter an HTTP 401 authentication prompt (a blank page or browser auth
 - **ALWAYS block before payments/subscriptions** - never click these directly
 - **NEVER perform an action the goal explicitly prohibits** ("without submitting", "do not launch/send/purchase") - report that step as untested instead
 - **Never claim something is absent from a page you have not read to the bottom or searched with find_text** - "not in the part I viewed" is the honest wording
+- **Never report a leak between contexts from a phrase match alone** - plant a canary token in the source first (see "Leak / Isolation Claims Need a Planted Canary")
 """
 
 # Operator-provided known-issues section, appended to the shared worker base
@@ -465,7 +480,7 @@ Your ONLY job is to create flows - do NOT test anything yourself. Do NOT log in,
 
 **Order flows by relevance to the testing goal — goal-critical flows FIRST.** Flows are tested in the order you create them, and the run can hit its cost/time budget before the list is finished, so whatever you create last may never run:
 
-1. Read the Goal in your prompt. If it names specific features, changes, or focus areas (e.g. a pull request's changes), create the flows that directly exercise those FIRST — one flow per named target, most important first. Do this even if you haven't seen those features on the page yet; describe where to find them if you can tell.
+1. Read the Goal in your prompt. If it names specific features, changes, or focus areas (e.g. a pull request's changes), create the flows that directly exercise those FIRST — one flow per named target, most important first. Do this even if you haven't seen those features on the page yet; describe where to find them if you can tell. For a goal about isolation or leaks between contexts (branches, variants, users), the flow_description must say to plant a unique canary token in the source content BEFORE creating or generating in the target and to search for it afterwards (unless the goal forbids creating or editing content) — a phrase two generations could both invent is not leak evidence (see "Leak / Isolation Claims Need a Planted Canary").
 2. Only then add the generic site-wide flows (login, signup, navigation, content browsing).
 3. Name each goal-driven flow using the goal's own key words (goal says "subscription gating and trial-ending emails" → flow names "Subscription Gating" and "Trial Ending Emails", not "Premium Area"), and repeat the relevant goal phrase in the flow_description. The scheduler matches flow names/descriptions against the goal text to keep goal-critical flows at the front of the queue.
 
@@ -888,6 +903,8 @@ Hold every issue to these standards. A wrong or inflated finding is worse than n
 
 14. **"Not present anywhere in the UI" needs whole-page evidence.** A finding or Goal Assessment line saying a name, price, label or piece of copy "is not displayed anywhere" / "no UI surface exposes it" — or a coverage-gap recommendation to add it — is only supported if, for EVERY page it names as checked, the flow actions show either a `find_text` for the phrase whose note says no match, or scrolls that reached the bottom of that page. A visit that arrives, takes one screenshot and leaves (no scroll, no `find_text`) proves only that the phrase was not in the top screen: the worker sees one viewport and a list of interactive elements, and static copy below the fold (an FAQ, a footer, a pricing footnote) never appears in either. Without that evidence, reword the claim to "not seen in the portion of the page(s) the tester viewed", record the check as INCOMPLETE in the Goal Assessment rather than as "no surface exists", and do not recommend adding UI that may already be there. A `find_text` note reporting matches in a hidden/collapsed section means the text IS on the page.
 
+15. **A leak / isolation finding needs a planted canary in the action history.** "Context A saw content from B" (a sibling story branch, an unchosen variant, another user's data) is a claim about A's *input*, and matching a phrase in A's AI *output* against B cannot establish it: two generations from a shared premise routinely invent the same names, places and plot turns, and a `find_text` showing the phrase in B but not in the shared ancestor proves only where it first appeared. The finding is supported when the flow actions show a `type` into B's content carrying a unique run-ID token — its line reads `(text contains run-ID token '…')` and/or `searched at step N`, since typed text is otherwise truncated — BEFORE A was created or generated in, followed by that same token (or a clear paraphrase of the planted fact) found in A: a matched `find_text`, or the worker reading it in A's editor field. A page that displayed A's seeded context containing B's content also supports it. Without that, downgrade to **minor**, reword as "detail X appears in both A and B; A was never shown to contain B's content, and X could have been generated independently from the shared premise", and never call it confirmed, reproducible or verified.
+
 ### Critical Issues
 Issues that block core functionality or pose security risks.
 - **Include reproduction steps** derived from the flow actions where available — each issue's "Flow: X, step N" line tells you which flow's action summary to derive them from, and step N is the numbered action that triggered it
@@ -956,6 +973,8 @@ These finding patterns are usually caused by the testing setup, not the site. Do
 8. **"Typed or saved text is not rendered / the editor does not display its content"** where the action history shows the `type` succeeded with a "Field holds N chars (DOM-verified)" note — especially one saying the first text line was NOT visible. The text is in the field; the worker was looking at the part of a tall field below its first line (its top edge under a sticky header or above the viewport). Drop it, or downgrade to minor and reword it as the scroll-position observation it was. A "text colour matches the background" or "broken text layer" explanation offered without a computed-style check is speculation, not evidence.
 
 9. **"X is not displayed anywhere in the UI" / "no model name, price or label is exposed"** where the action history shows single-viewport visits to the pages named — no `find_text`, no scroll to the bottom. The worker read one screen of each page. Downgrade to an incomplete check worded as what was seen ("not in the top screen of /premium/; the rest of the page was not read"), never a confirmed absence, and drop any recommendation to add UI that may already exist.
+
+10. **"Context A leaked content from B"** (branch / variant / user isolation) where the evidence is a phrase that appears in A's AI output and in B, with no planted canary in the action history. Same-premise generations converge on the same inventions, and a phrase-match shows where a detail first appeared, not what A was given. Downgrade to minor and reword as an unverified overlap that could have been generated independently — never a confirmed isolation failure.
 
 ## Deduplication Guidelines
 
@@ -1060,7 +1079,12 @@ _SUMMARY_HEAD_ACTIONS = 10
 
 
 def _format_action_summary_lines(action_summary: list[dict], indent: str = "  ") -> list[str]:
-    """Render flow actions one numbered line each, preserving original indices."""
+    """Render flow actions one numbered line each, preserving original indices.
+
+    Long flows are windowed head+tail; an action flagged `pinned` by
+    `SynthesisAgent._summarize_actions` (a typed canary that later evidence
+    keys on) is rendered even when it falls in the omitted middle.
+    """
 
     def render(idx: int, action: dict) -> str:
         action_desc = action.get('description', action.get('code', 'Unknown action')[:80])
@@ -1074,7 +1098,18 @@ def _format_action_summary_lines(action_summary: list[dict], indent: str = "  ")
     head = _SUMMARY_HEAD_ACTIONS
     tail = MAX_ACTIONS_PER_FLOW_SUMMARY - head
     lines = [render(idx, action) for idx, action in enumerate(action_summary[:head], 1)]
-    lines.append(f"{indent}... {total - head - tail} actions omitted ...")
+    omitted = 0
+    for idx in range(head, total - tail):
+        action = action_summary[idx]
+        if action.get("pinned"):
+            if omitted:
+                lines.append(f"{indent}... {omitted} actions omitted ...")
+                omitted = 0
+            lines.append(render(idx + 1, action))
+        else:
+            omitted += 1
+    if omitted:
+        lines.append(f"{indent}... {omitted} actions omitted ...")
     lines.extend(
         render(idx, action)
         for idx, action in enumerate(action_summary[-tail:], total - tail + 1)

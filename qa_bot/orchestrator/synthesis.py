@@ -305,16 +305,81 @@ class SynthesisAgent:
     def __init__(self, ai_provider: AIProvider):
         self.ai = ai_provider
 
-    def _summarize_action(self, action: dict) -> dict:
+    def _summarize_actions(self, actions: list) -> list[dict]:
+        """Summarize a flow's actions in order, carrying planted-canary evidence.
+
+        `_describe_action` cuts a `type` text to 27 chars, and a long flow is
+        windowed head+tail — so a canary the worker planted in a sentence
+        ("…a well named Vorlith-ab12cd-4471…") vanished from the history
+        synthesis reads while the later `find_text` match survived, and
+        Report Quality Standard 15 then downgraded a PROVEN leak (PR #636
+        review). A non-sensitive `type` whose text contains the run nonce,
+        or a substring a later `find_text` in the same flow searched for, is
+        annotated with that token (and the search step) and flagged
+        `pinned` so the windowing keeps it.
+        """
+        searches = []
+        for step, action in enumerate(actions, 1):
+            if action.get("action_type") == "find_text":
+                needle = str(action.get("text") or "").strip()
+                if needle:
+                    searches.append((step, needle))
+        nonce = str(getattr(self.ai, "run_nonce", "") or "")
+        return [
+            self._summarize_action(
+                action,
+                later_searches=[(s, n) for s, n in searches if s > step],
+                run_nonce=nonce,
+            )
+            for step, action in enumerate(actions, 1)
+        ]
+
+    @staticmethod
+    def _carried_tokens(text: str, later_searches: list, run_nonce: str) -> list[str]:
+        """Phrases of a typed text that later evidence keys on, as annotations."""
+        lowered = text.lower()
+        found: dict[str, dict] = {}
+        if run_nonce and run_nonce.lower() in lowered:
+            for word in text.split():
+                if run_nonce.lower() in word.lower():
+                    token = word.strip("\"'.,;:!?()[]{}<>")
+                    found.setdefault(token.lower(), {"token": token, "run_id": True, "step": None})
+        for step, needle in later_searches:
+            if needle.lower() in lowered:
+                entry = found.setdefault(needle.lower(), {"token": needle, "run_id": False, "step": None})
+                if entry["step"] is None:
+                    entry["step"] = step
+        out = []
+        for entry in found.values():
+            label = f"run-ID token '{entry['token'][:40]}'" if entry["run_id"] else f"'{entry['token'][:40]}'"
+            if entry["step"] is not None:
+                label += f", searched at step {entry['step']}"
+            out.append(label)
+        return out
+
+    def _summarize_action(
+        self, action: dict, later_searches: list | None = None, run_nonce: str = ""
+    ) -> dict:
         """
         Create a human-readable summary of an action.
 
         Handles the current JSON action format with action_type, ref, text, etc.
+        `later_searches` / `run_nonce` come from `_summarize_actions` (see there).
         """
         success = action.get("success", True)
         url = action.get("page_url", action.get("url", ""))
 
         description = self._describe_action(action)
+        pinned = False
+        if action.get("action_type") == "type" and not is_sensitive_field_label(
+            action.get("element") or action.get("ref") or ""
+        ):
+            tokens = self._carried_tokens(
+                str(action.get("text") or ""), later_searches or [], run_nonce
+            )
+            if tokens:
+                description = f"{description} (text contains {'; '.join(tokens)})"
+                pinned = True
         # The worker's crafted note ("Field holds 68 chars (DOM-verified), but
         # its first text line is NOT visible…", "Triggered file download:
         # report.pdf") is evidence the synthesis prompt's quality standards
@@ -329,11 +394,14 @@ class SynthesisAgent:
         if note:
             description = f"{description} [{str(note)[:240]}]"
 
-        return {
+        summary = {
             "description": description,
             "success": success,
             "url": url,
         }
+        if pinned:
+            summary["pinned"] = True
+        return summary
 
     def _describe_action(self, action: dict) -> str:
         """
@@ -574,10 +642,7 @@ class SynthesisAgent:
         for flow in all_flows:
             if flow.status == FlowStatus.COMPLETED and not flow.is_first_worker:
                 # Create action summary for reproduction steps
-                action_summary = [
-                    self._summarize_action(action)
-                    for action in flow.actions
-                ]
+                action_summary = self._summarize_actions(flow.actions)
 
                 flow_summary = {
                     "flow_name": flow.flow_name,
@@ -647,10 +712,7 @@ class SynthesisAgent:
                 "status": flow.status.value,
                 "reason": _with_resume_note(reason, flow.resume_kind),
                 "action_count": len(flow.actions),
-                "action_summary": [
-                    self._summarize_action(action)
-                    for action in flow.actions
-                ],
+                "action_summary": self._summarize_actions(flow.actions),
             })
 
         # Nothing ran and nothing was found: skip the AI call entirely.
