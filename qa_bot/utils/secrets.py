@@ -91,3 +91,16 @@ def redact_values(text: str, secrets: Iterable[str]) -> str:
         if looks_like_secret_value(secret) and secret in text:
             text = text.replace(secret, mask_value(secret))
     return text
+
+
+def redact_obj(obj, secrets: Iterable[str]):
+    """``redact_values`` over every string inside a nested dict/list (keys
+    are left alone). Redact before JSON-encoding, so a secret containing
+    quotes or non-ASCII isn't hidden from the match by escaping."""
+    if isinstance(obj, str):
+        return redact_values(obj, secrets)
+    if isinstance(obj, dict):
+        return {k: redact_obj(v, secrets) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact_obj(v, secrets) for v in obj]
+    return obj

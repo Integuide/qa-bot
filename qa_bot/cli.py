@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -36,12 +37,41 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
-from qa_bot.ai.claude_provider import ClaudeProvider
+from qa_bot.ai import MissingAPIKeyError, create_provider
 from qa_bot.orchestrator.coordinator import FlowExplorationOrchestrator
 from qa_bot.orchestrator.shared_state import SMOKE_GOAL
 
 
 LogLevel = Literal["quiet", "summary", "full"]
+
+
+# The GitHub Actions runner runs any output line that starts with "::"
+# (after leading whitespace) as a workflow command: ::add-mask::,
+# ::stop-commands::, a fake ::error::. Issue descriptions, verdict titles,
+# flow names and errors are model output from site-influenced text.
+_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+
+
+def _neutralise_command_line(line: str) -> str:
+    stripped = line.lstrip()
+    if stripped.startswith("::"):
+        return line[: len(line) - len(stripped)] + ": :" + stripped[2:]
+    return line
+
+
+def log_safe(text) -> str:
+    """Model- or site-influenced text made safe to embed in ONE CI log line:
+    CR/LF flattened to a space (as entrypoint.sh flattens its copy of the
+    verdict titles) so it cannot start a line of its own, and a leading
+    ``::`` broken up in case the text opens the line."""
+    return _neutralise_command_line(" ".join(_LINE_BREAK.split(str(text or ""))))
+
+
+def ci_log_lines(text: str) -> str:
+    """A formatted log entry with every physical line's leading ``::``
+    broken up — the backstop for fields not flattened by log_safe (flow
+    names, errors, element labels, reasons)."""
+    return "\n".join(_neutralise_command_line(line) for line in _LINE_BREAK.split(text))
 
 
 def parse_credentials_file(file_path: str) -> dict[str, str]:
@@ -108,6 +138,66 @@ def _issue_attribution(event: dict) -> str:
     return f" ({', '.join(parts)})" if parts else ""
 
 
+def _issue_label(data: dict, severity: str) -> str:
+    """"[severity]" for a new finding. A dedup repeat (``is_new`` False: the
+    same text on the same page filed again) is not counted anywhere and
+    carries the severity the AI re-filed — printed as "[CRITICAL]" right
+    after "[Re-check] NOT REPRODUCED (demoted ...)" it read as a live
+    critical — so it is labelled as a repeat, with no bare severity tag."""
+    if data.get("is_new") is False:
+        return f"(repeat, not counted — filed again as {severity.lower()})"
+    return f"[{severity}]"
+
+
+def _recheck_log_line(event_type: str, data: dict) -> str | None:
+    """The CI-log line for an independent re-check event (summary and full)."""
+    title = log_safe(data.get("title") or "critical finding")
+    if event_type == "recheck_scheduled":
+        if data.get("linked"):
+            return f"[Re-check] Critical joins a re-check already scheduled: {title}"
+        return f"[Re-check] Re-checking critical: {title}"
+    if event_type == "recheck_skipped":
+        return f"[Re-check] Not re-checked ({log_safe(data.get('reason', ''))}): {title}"
+    if event_type == "recheck_started":
+        return f"[Re-check] Verifier {data.get('worker_id', '')} started: {title}"
+    if event_type == "recheck_result":
+        outcome = (data.get("outcome") or "inconclusive").upper().replace("_", " ")
+        effect = {
+            "NOT REPRODUCED": "demoted to major, tagged UNCONFIRMED",
+            "REPRODUCED": "stays critical",
+        }.get(outcome, "stays critical")
+        reason = log_safe(data.get("reason") or "")[:200]
+        return f"[Re-check] {outcome} ({effect}): {title}" + (f" — {reason}" if reason else "")
+    return None
+
+
+def _apply_recheck_result(issues: list[dict], data: dict) -> None:
+    """Update the CLI's copies of the issues a re-check settled.
+
+    The result's ``issues`` list (and the gate's raw-count fallback) is
+    built from ``issue`` events, which fire before the re-check ends; match
+    each settled issue on (original description, url) and take its final
+    severity/description, so a not-reproduced critical stops counting.
+
+    An entry below the settled issue's original severity that does not
+    already carry its final text is a separate, earlier filing of the same
+    text (``SharedFlowState.add_issue`` keeps a critical that raises a
+    major one as its own issue); the re-check never covered it.
+    """
+    for settled in data.get("issues") or []:
+        texts = {settled.get("original_description"), settled.get("description")}
+        original_severity = (settled.get("recheck") or {}).get("original_severity")
+        for entry in issues:
+            if entry.get("url") != settled.get("url") or entry.get("description") not in texts:
+                continue
+            if (original_severity and entry.get("severity") != original_severity
+                    and entry.get("description") != settled.get("description")):
+                continue
+            entry["severity"] = settled.get("severity", entry.get("severity"))
+            entry["description"] = settled.get("description", entry.get("description"))
+            entry["recheck"] = settled.get("recheck")
+
+
 def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
     """
     Format an event for CLI logging based on log level.
@@ -124,6 +214,12 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
 
     if log_level == "quiet":
         return None
+
+    recheck_line = _recheck_log_line(event_type, data)
+    if recheck_line:
+        if log_level == "summary":
+            return None if event_type == "recheck_started" else recheck_line
+        return f"[{datetime.now().strftime('%H:%M:%S')}] {recheck_line}"
 
     # Summary level: flow lifecycle and issues only
     if log_level == "summary":
@@ -152,8 +248,8 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
             # used to log as "Unknown issue" at summary level. The `or` chain
             # also covers a present-but-null/empty description (slicing None
             # would raise inside the formatter).
-            title = data.get("title") or (data.get("description") or "Unknown issue")[:100]
-            return f"[Issue] [{severity}] {title}{_issue_attribution(event)}"
+            title = log_safe(data.get("title") or (data.get("description") or "Unknown issue"))[:100]
+            return f"[Issue] {_issue_label(data, severity)} {title}{_issue_attribution(event)}"
         elif event_type == "exploration_complete":
             flows = data.get("flows_explored", 0)
             issues = data.get("issues_found", 0)
@@ -268,7 +364,9 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
                 needle = data.get("text", "")
                 return f"[{timestamp}] [Action] Find text: '{needle[:40]}'"
             elif action_type == "navigate":
-                url = data.get("url", "")
+                # The worker's action event carries the destination as
+                # target_url (worker.py); "url" is kept as a fallback
+                url = data.get("target_url") or data.get("url", "")
                 return f"[{timestamp}] [Action] Navigate: {url}"
             elif action_type == "wait":
                 duration = data.get("duration", 0)
@@ -307,13 +405,13 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
         # Issue events
         elif event_type == "issue":
             severity = data.get("severity", "unknown")
-            description = (data.get("description") or "")[:100]  # Truncate; tolerate null
+            description = log_safe(data.get("description") or "")[:100]  # Truncate; tolerate null
             # Issue events carry "description", not "title" — every issue
             # used to log a literal "Unknown issue" headline
-            title = data.get("title") or description or "Unknown issue"
+            title = log_safe(data.get("title")) or description or "Unknown issue"
             detail = description if data.get("title") else ""
             return (
-                f"[{timestamp}] [Issue] [{severity.upper()}] {title}{_issue_attribution(event)}"
+                f"[{timestamp}] [Issue] {_issue_label(data, severity.upper())} {title}{_issue_attribution(event)}"
                 + (f"\n           {detail}" if detail else "")
             )
 
@@ -407,7 +505,7 @@ async def run_exploration(
     goal: str,
     max_agents: int,
     max_duration: int,
-    api_key: str,
+    api_key: Optional[str],
     model: str,
     headless: bool = True,
     log_level: LogLevel = "quiet",
@@ -417,6 +515,8 @@ async def run_exploration(
     known_issues: str = "",
     smoke: bool = False,
     previous_report: str = "",
+    openrouter_api_key: Optional[str] = None,
+    recheck_criticals: Optional[bool] = None,
 ) -> dict:
     """
     Run QA exploration and return results.
@@ -426,8 +526,9 @@ async def run_exploration(
         goal: Testing goal/focus
         max_agents: Maximum parallel agents
         max_duration: Maximum duration in minutes
-        api_key: Anthropic API key
-        model: Claude model to use
+        api_key: Anthropic API key (needed for Claude models)
+        model: Model id — a Claude id, or an OpenRouter "vendor/slug" id
+            such as openai/gpt-6-luna (see qa_bot.ai.create_provider)
         headless: Run browser in headless mode
         log_level: One of 'quiet', 'summary', or 'full'
         credentials: Optional dict of credentials (e.g., {"USERNAME": "user", "PASSWORD": "pass"})
@@ -442,17 +543,27 @@ async def run_exploration(
         previous_report: The previous run's report text for the same target;
             synthesis labels each finding NEW / recurring against it and
             lists previous findings not seen again. Never demotes anything.
+        openrouter_api_key: OpenRouter API key (needed for "vendor/slug" models)
+        recheck_criticals: Independent re-check of CRITICAL findings; None =
+            default (``RECHECK_CRITICALS`` env, else on — the CLI is
+            non-interactive). A not-reproduced critical arrives as major.
 
     Returns:
         dict with report, issues, and metadata. ``completed`` is False when the
         run ended without an exploration_complete event (startup failure or a
         fatal crash with nothing salvaged); ``error`` carries the fatal error
         message when one occurred (including salvaged runs).
+        ``charged_cost_usd`` is what the provider's API reported charging
+        (OpenRouter's usage.cost); None for Claude, which reports no charge.
+
+    Raises:
+        MissingAPIKeyError: the chosen model's provider has no key.
     """
-    ai_provider = ClaudeProvider(
-        api_key=api_key,
-        model=model,
-        max_concurrent_calls=MAX_CONCURRENT_API_CALLS
+    ai_provider = create_provider(
+        model,
+        anthropic_api_key=api_key,
+        openrouter_api_key=openrouter_api_key,
+        max_concurrent_calls=MAX_CONCURRENT_API_CALLS,
     )
     orchestrator = FlowExplorationOrchestrator(
         ai_provider=ai_provider,
@@ -473,13 +584,14 @@ async def run_exploration(
     token_breakdown = {}
     exploration_completed = False
     fatal_error = None
+    recheck_summary = None
 
     if smoke:
         goal = SMOKE_GOAL  # the orchestrator forces this too; keep the result honest
 
     if log_level != "quiet":
         print(f"Starting {'SMOKE TEST' if smoke else 'exploration'} of {url}", file=sys.stderr)
-        print(f"Goal: {goal}", file=sys.stderr)
+        print(f"Goal: {log_safe(goal)}", file=sys.stderr)
         limit_info = f"Max agents: {max_agents}, Max duration: {max_duration} min, Max cost: ${max_cost_usd:.2f}"
         print(limit_info, file=sys.stderr)
         print("-" * 70, file=sys.stderr)
@@ -493,6 +605,7 @@ async def run_exploration(
         known_issues=known_issues,
         smoke=smoke,
         previous_report=previous_report,
+        recheck_criticals=recheck_criticals,
     ):
         events.append(event)
         event_type = event.get("type", "")
@@ -503,9 +616,17 @@ async def run_exploration(
             report = event.get("data", {}).get("report", "")
             verdict = event.get("data", {}).get("verdict")
 
-        # Capture issues
+        # Capture issues. A dedup repeat (is_new False: the same description
+        # on the same page, filed again) is not a new finding: counting it
+        # double-counted repeats in issues_found and the raw-count gate, and
+        # it carries the severity the AI re-filed, so a repeat arriving after
+        # its re-check demoted the original re-counted it as critical.
         if event_type == "issue":
-            issues.append(event.get("data", {}))
+            data = event.get("data", {})
+            if data.get("is_new") is not False:
+                issues.append(data)
+        elif event_type == "recheck_result":
+            _apply_recheck_result(issues, event.get("data", {}))
 
         # Capture final summary
         if event_type == "exploration_complete":
@@ -516,6 +637,7 @@ async def run_exploration(
             final_progress = data.get("final_progress") or {}
             estimated_cost_usd = final_progress.get("cost_usd", 0)
             token_breakdown = final_progress.get("token_breakdown", {})
+            recheck_summary = data.get("recheck_summary")
 
         # Capture fatal errors. The orchestrator yields these instead of
         # raising (so SSE/CLI consumers get a structured event), which means
@@ -527,10 +649,12 @@ async def run_exploration(
         # Log event based on log level
         log_line = format_event_for_log(event, log_level)
         if log_line:
-            print(log_line, file=sys.stderr)
+            print(ci_log_lines(log_line), file=sys.stderr)
 
     if log_level != "quiet":
         print("-" * 70, file=sys.stderr)
+
+    charged_cost_usd = getattr(ai_provider, "charged_cost_usd", None)
 
     return {
         "report": report or "No report generated",
@@ -550,9 +674,18 @@ async def run_exploration(
         # was supplied, or synthesis produced no verdict).
         "new_findings_count": verdict.get("new") if verdict else None,
         "recurring_findings_count": verdict.get("recurring") if verdict else None,
+        # Independent re-check of criticals: per-issue outcome counts
+        # ({"reproduced", "not_reproduced", "inconclusive", "not_rechecked"}),
+        # None when no critical was a candidate. `issues` above already
+        # carries each settled issue's final severity.
+        "recheck_summary": recheck_summary,
         "flows_explored": flows_explored,
         "duration_seconds": round(duration_seconds, 2),
         "estimated_cost_usd": round(estimated_cost_usd, 4),
+        "charged_cost_usd": (
+            round(charged_cost_usd, 4)
+            if isinstance(charged_cost_usd, (int, float)) else None
+        ),
         "tokens": token_breakdown,
         "completed": exploration_completed,
         "error": fatal_error,
@@ -561,6 +694,27 @@ async def run_exploration(
         "mode": "smoke" if smoke else "full",
         "timestamp": datetime.now().isoformat()
     }
+
+
+def curated_excess_warning(curated: Optional[int], still_critical: int) -> Optional[str]:
+    """A ``::warning::`` line (a GitHub Actions annotation) when the curated
+    verdict lists more criticals than the run has issues still critical
+    after the severity guard and the independent re-check, else None.
+
+    Synthesis may legitimately merge majors into one critical, but a
+    finding the re-check did not reproduce, re-titled so the verdict
+    backstop could not match it, looks exactly the same — and fails the
+    gate. Numbers only: titles are model output and stay out of a
+    workflow-command line.
+    """
+    if curated is None or curated <= still_critical:
+        return None
+    return (
+        f"::warning::The curated report lists {curated} critical finding(s) but only "
+        f"{still_critical} worker finding(s) are still critical after the severity "
+        "guard and the independent re-check; check that no Critical Issues entry "
+        "is a finding the re-check did not reproduce (tagged UNCONFIRMED) under a new title"
+    )
 
 
 def load_previous_report(value: str) -> str:
@@ -691,6 +845,18 @@ Examples:
         )
     )
     parser.add_argument(
+        "--no-recheck-criticals",
+        dest="recheck_criticals",
+        action="store_false",
+        default=None,
+        help=(
+            "Disable the independent re-check of CRITICAL findings. By "
+            "default each new critical gets a short verification flow in a "
+            "fresh browser; one it does not reproduce is demoted to major "
+            "and tagged UNCONFIRMED (also: RECHECK_CRITICALS=false)."
+        )
+    )
+    parser.add_argument(
         "--max-agents", "-a",
         type=int,
         default=None,
@@ -714,9 +880,22 @@ Examples:
         help="Anthropic API key (or set ANTHROPIC_API_KEY env var)"
     )
     parser.add_argument(
+        "--openrouter-api-key",
+        default=None,
+        help=(
+            "OpenRouter API key, needed only for an OpenRouter model id "
+            "(or set OPENROUTER_API_KEY env var)"
+        )
+    )
+    parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
-        help=f"Claude model to use (default: {DEFAULT_MODEL})"
+        help=(
+            f"Model to use (default: {DEFAULT_MODEL}). A 'vendor/slug' id "
+            "such as openai/gpt-6-luna runs on OpenRouter and needs "
+            "--openrouter-api-key; screenshots and prompts then go to "
+            "OpenRouter and the model vendor"
+        )
     )
     parser.add_argument(
         "--testmail-api-key",
@@ -784,12 +963,10 @@ Examples:
     else:
         log_level = "quiet"
 
-    # Get API key from arg or environment
+    # API keys from args or environment; only the chosen model's provider
+    # needs one (create_provider raises MissingAPIKeyError otherwise).
     api_key = args.api_key or os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("Error: ANTHROPIC_API_KEY not set", file=sys.stderr)
-        print("Set it via --api-key or ANTHROPIC_API_KEY environment variable", file=sys.stderr)
-        sys.exit(1)
+    openrouter_api_key = args.openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
 
     # Parse credentials
     credentials = {}
@@ -859,7 +1036,14 @@ Examples:
             skip_permissions=args.dangerously_skip_permissions,
             smoke=args.smoke,
             previous_report=previous_report,
+            openrouter_api_key=openrouter_api_key,
+            recheck_criticals=args.recheck_criticals,
         ))
+    except MissingAPIKeyError as e:
+        flag = "--openrouter-api-key" if e.env_var == "OPENROUTER_API_KEY" else "--api-key"
+        print(f"Error: {e}", file=sys.stderr)
+        print(f"Set it via {flag} or the {e.env_var} environment variable", file=sys.stderr)
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\nExploration cancelled", file=sys.stderr)
         sys.exit(130)
@@ -913,11 +1097,14 @@ Examples:
             "Likely False Positives / Known Issues sections before trusting a pass.",
             file=sys.stderr,
         )
+    warning = curated_excess_warning(curated, raw_critical_count)
+    if warning and log_level != "quiet":
+        print(warning, file=sys.stderr)
     if gate_count > 0:
         if log_level != "quiet":
             if curated is not None:
                 titles = result.get("curated_critical_titles") or []
-                titles_note = f": {' | '.join(titles)}" if titles else ""
+                titles_note = f": {' | '.join(log_safe(t) for t in titles)}" if titles else ""
                 print(
                     f"Found {curated} critical issue(s) after curation{titles_note} "
                     f"({raw_critical_count} raw worker finding(s))",

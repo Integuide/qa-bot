@@ -7,9 +7,10 @@ from datetime import datetime
 from typing import Optional
 
 from qa_bot.ai.base import AIProvider
-from qa_bot.ai.prompts import format_issue_trace
+from qa_bot.ai.prompts import format_issue_trace, format_recheck_line
 from qa_bot.orchestrator.shared_state import SharedFlowState
 from qa_bot.orchestrator.flow import FlowStatus
+from qa_bot.orchestrator.recheck import drop_unconfirmed_criticals
 from qa_bot.utils.secrets import is_sensitive_field_label
 
 logger = logging.getLogger(__name__)
@@ -139,6 +140,42 @@ def drop_unfounded_run_over_run_labels(
         "Synthesis qa-verdict carried new/recurring counts (%s/%s) but no "
         "previous report was supplied; dropping them",
         verdict.get("new"), verdict.get("recurring"),
+    )
+    return {**verdict, "new": None, "recurring": None}
+
+
+def drop_overcounted_run_over_run_labels(
+    verdict: Optional[dict], raw_issue_count: int
+) -> Optional[dict]:
+    """Null the verdict's ``new``/``recurring`` when they outnumber the findings.
+
+    The labels count findings in the report's severity sections, so
+    ``new + recurring`` can't exceed how many it lists. The verdict carries
+    the critical and major counts exactly; minor/cosmetic live only in the
+    prose, but every listed finding comes from at least one raw worker issue
+    (dedup merges them), so ``max(raw issues, critical + major)`` bounds the
+    total. Mono smoke run 35308751586 found 0 issues and its verdict still
+    said 3 new / 2 recurring — synthesis had labelled Test Coverage bullets —
+    so the PR footer read "Since previous run: 3 new, 2 recurring" over an
+    empty report. Counts that can't be right are dropped, not trimmed to fit
+    (there is no telling which part is wrong); ``None`` renders as n/a.
+    """
+    if verdict is None:
+        return verdict
+    new, recurring = verdict.get("new"), verdict.get("recurring")
+    if new is None and recurring is None:
+        return verdict
+    listed_max = max(
+        raw_issue_count, verdict.get("critical_count", 0) + verdict.get("major", 0)
+    )
+    if (new or 0) + (recurring or 0) <= listed_max:
+        return verdict
+    logger.warning(
+        "Synthesis qa-verdict labelled %s new / %s recurring but the report can "
+        "list at most %d finding(s) (%d raw issue(s), %d critical + %d major "
+        "curated); dropping the labels",
+        new, recurring, listed_max, raw_issue_count,
+        verdict.get("critical_count", 0), verdict.get("major", 0),
     )
     return {**verdict, "new": None, "recurring": None}
 
@@ -577,9 +614,15 @@ class SynthesisAgent:
 
         See :meth:`_generate_report_with_verdict` for the body. This wrapper
         exists so the deterministic smoke tag is applied on every path (AI
-        report, fallback, NOT TESTED) without touching each return.
+        report, fallback, NOT TESTED) without touching each return. It also
+        holds the verdict backstop for Report Quality Standard 16: a critical
+        entry that is a finding the independent re-check did not reproduce —
+        tagged UNCONFIRMED, or re-titled without the tag — never reaches the
+        gate.
         """
         report, verdict = await self._generate_report_with_verdict(shared_state)
+        if verdict:
+            verdict = drop_unconfirmed_criticals(verdict, await shared_state.get_all_issues())
         if getattr(shared_state, "smoke", False):
             report = apply_smoke_tag(report)
         else:
@@ -623,15 +666,25 @@ class SynthesisAgent:
             }
             if issue.flow_name:
                 issue_dict["flow_name"] = issue.flow_name
-            if issue.turn is not None:
-                # Issue.turn is the worker's 0-based turn (chat transcript
-                # "TURN n"); the flow action summary below is numbered from 1
-                # and the triggering action is already recorded when the
-                # issue is filed, so step = turn + 1 points at that action.
-                issue_dict["step"] = issue.turn + 1
+            if issue.flow_step is not None:
+                # The reporting action's place in the flow's recorded
+                # actions, which the action summary below numbers from 1.
+                # Not issue.turn + 1: turn is the worker's per-run count and
+                # restarts when a retry or a resumed flow appends to the
+                # same actions list, pointing at an earlier attempt's step.
+                issue_dict["step"] = issue.flow_step
             if issue.screenshot_path:
                 issue_dict["screenshot"] = issue.screenshot_path
+            if issue.recheck:
+                # Independent re-check outcome (Report Quality Standard 16);
+                # the tag is already on the description
+                issue_dict["recheck"] = dict(issue.recheck)
             issues.append(issue_dict)
+
+        # Independent re-check flows verify one finding; their verdict rides
+        # on that issue ("Re-check:" line), so they appear in no flow section
+        # — not as tested coverage, not as a coverage gap.
+        all_flows = [flow for flow in all_flows if not flow.recheck_of]
 
         # Get completed flows with rich action summaries. The Root/first-worker
         # flow is excluded: its only job is flow enumeration (worker.py
@@ -793,6 +846,7 @@ class SynthesisAgent:
             verdict = drop_unfounded_run_over_run_labels(
                 verdict, shared_state.previous_report or ""
             )
+            verdict = drop_overcounted_run_over_run_labels(verdict, len(issues))
             if verdict is None:
                 logger.warning(
                     "Synthesis report carried no parseable qa-verdict block; "
@@ -1039,7 +1093,11 @@ class SynthesisAgent:
 
         def issue_bullet(issue: dict) -> str:
             trace = format_issue_trace(issue)
-            return f"- {issue['description']}" + (f" ({trace})" if trace else "")
+            recheck = format_recheck_line(issue.get("recheck"))
+            return (
+                f"- {issue['description']}" + (f" ({trace})" if trace else "")
+                + (f"\n  {recheck}" if recheck else "")
+            )
 
         if critical:
             lines.append("## Critical Issues")

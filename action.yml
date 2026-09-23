@@ -47,11 +47,17 @@ inputs:
     default: ''
 
   anthropic-api-key:
-    description: 'Anthropic API key for Claude'
-    required: true
+    description: 'Anthropic API key — required for Claude models (every `model` id without a slash, including the default)'
+    required: false
+    default: ''
+
+  openrouter-api-key:
+    description: 'OpenRouter API key — required only when `model` is an OpenRouter "vendor/slug" id such as openai/gpt-6-luna. Screenshots, page text and test credentials then go to OpenRouter and the model vendor instead of Anthropic.'
+    required: false
+    default: ''
 
   model:
-    description: 'Claude model to use (claude-sonnet-5, claude-haiku-4-5, claude-opus-4-8)'
+    description: 'Model to use: a Claude model (claude-sonnet-5, claude-haiku-4-5, claude-opus-4-8, claude-opus-5-5, claude-fable-5-1) or an OpenRouter "vendor/slug" id such as openai/gpt-6-luna (needs openrouter-api-key)'
     required: false
     default: 'claude-sonnet-5'
 
@@ -115,22 +121,23 @@ outputs:
     description: 'Number of user flows tested to completion (flow enumeration is not counted)'
 
   cost-usd:
-    description: 'Estimated Claude API cost of the run in USD'
+    description: 'Estimated model API cost of the run in USD (token-priced; for an OpenRouter model the PR footer and summary.json also show the charge OpenRouter reported)'
 
   mode:
     description: 'The run mode that produced this report: `full` or `smoke` (a smoke pass is not regression coverage)'
 
   new-findings:
-    description: 'Findings labelled NEW against `previous-report`. Empty when no previous report was supplied or synthesis produced no curated verdict'
+    description: 'Findings labelled NEW against `previous-report`. Empty when no previous report was supplied, synthesis produced no curated verdict, or the new/recurring counts exceeded the findings the report lists'
 
   recurring-findings:
-    description: 'Findings labelled recurring (seen in previous run) against `previous-report`. Empty when no previous report was supplied or synthesis produced no curated verdict'
+    description: 'Findings labelled recurring (seen in previous run) against `previous-report`. Empty when no previous report was supplied, synthesis produced no curated verdict, or the new/recurring counts exceeded the findings the report lists'
 
 runs:
   using: 'docker'
   image: 'Dockerfile'
   env:
     ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+    OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
     INPUT_URL: ${{ inputs.url }}
     INPUT_GOAL: ${{ inputs.goal }}
     INPUT_KNOWN_ISSUES: ${{ inputs.known-issues }}

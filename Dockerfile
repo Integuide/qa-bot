@@ -1,11 +1,17 @@
 # QA Bot GitHub Action - Docker Container
 #
 # Based on Microsoft's Playwright Python image which includes:
-# - Python 3.x
-# - Playwright with browser dependencies
+# - Python 3.10 (Ubuntu Jammy's python3)
+# - Playwright's browsers (in /ms-playwright) and their OS dependencies
 # - Ubuntu Jammy base
+#
+# The tag must match the playwright pin in action-constraints.txt: the
+# browsers baked into the image belong to that Playwright release, so a
+# matching tag makes `playwright install chromium` below a no-op instead of a
+# ~300 MB download per build. Bump both together (docs/github-action.md,
+# "Action image dependencies").
 
-FROM mcr.microsoft.com/playwright/python:v1.49.1-jammy
+FROM mcr.microsoft.com/playwright/python:v1.63.0-jammy
 
 LABEL org.opencontainers.image.title="QA Bot"
 LABEL org.opencontainers.image.description="AI-powered website QA testing using Claude"
@@ -20,11 +26,16 @@ RUN apt-get update && apt-get install -y \
     jq \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy requirements and install Python dependencies. The image is rebuilt on
+# every run, so requirements.txt's ranges alone let the anthropic/playwright
+# versions change between two runs of the same code; the constraints file
+# pins the exact set the last verified gate ran with (dev keeps the ranges).
+COPY requirements.txt action-constraints.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -c action-constraints.txt
 
-# Install Playwright browsers (Chromium only for CI efficiency)
+# Install Playwright browsers (Chromium only for CI efficiency). Already
+# present when the base tag matches the pinned playwright; this stays as the
+# safety net that downloads them if the two ever diverge.
 RUN playwright install chromium
 
 # Copy application code (qa_bot package and action files)

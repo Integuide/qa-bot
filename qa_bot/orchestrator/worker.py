@@ -12,6 +12,8 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from qa_bot.ai.base import AIProvider, AgentAction
 from qa_bot.ai.claude_provider import NOTE_MAX_CHARS, fatal_api_error_reason
+from qa_bot.config import HISTORY_COMPACTION
+from qa_bot.ai.prompts import format_recheck_context
 from qa_bot.agent.state import Issue
 from qa_bot.browser.controller import (
     BrowserController,
@@ -27,6 +29,7 @@ from qa_bot.orchestrator.browser_pool import BrowserPool, strip_url_credentials
 from qa_bot.orchestrator.shared_state import SharedFlowState, UserDataField, UserDataRequest, format_user_data_for_prompt
 from qa_bot.utils.secrets import mask_value, redact_values
 from qa_bot.orchestrator.flow import FlowTask, FlowCheckpoint, FlowStatus
+from qa_bot.orchestrator import recheck as rc
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +248,38 @@ def _strip_old_screenshots(history: list[dict]) -> None:
                     content[j] = {"type": "text", "text": "[Screenshot of page]"}
 
 
+# A past turn's prompt is stored in conversation history as this stub, not the
+# full action prompt (HISTORY_COMPACTION). Everything else that prompt carried
+# is either repeated in every new prompt (goal, credentials/user data, current
+# notes, the Recent Actions recap of the last 10 actions with results and
+# URLs) or explicitly stale (the ref list — refs are renumbered every turn).
+# The exception is prior_context (flow path, a supervisor's unblock message):
+# only the turn it arrived on carries it, so the stub keeps it verbatim. Built
+# once when stored and never rewritten, so the cached prefix stays stable.
+# The recap is the only record of how a stubbed turn's action turned out, so
+# it must span the same turns as the history: every FlowCheckpoint carries
+# action_history next to conversation_history, and a fork child or resumed
+# flow seeds its recap from it.
+HISTORY_TURN_STUB = (
+    "[Turn {turn} — {url}] [Screenshot of page] "
+    "[Element list and recap omitted — see the current prompt]"
+)
+HISTORY_STUB_URL_MAX_CHARS = 200
+
+
+def _history_turn_stub(history: list[dict], url: str, prior_context: str = "") -> list[dict]:
+    """Compact stand-in for this turn's prompt in ``history``.
+
+    The turn number counts the assistant turns already stored, so it keeps
+    counting across checkpoint forks and resumes (one-off user notes don't
+    count)."""
+    turn = sum(1 for msg in history if msg.get("role") == "assistant") + 1
+    text = HISTORY_TURN_STUB.format(turn=turn, url=_clip(url, HISTORY_STUB_URL_MAX_CHARS))
+    if prior_context.strip():
+        text += "\n\n" + prior_context.strip()
+    return [{"type": "text", "text": text}]
+
+
 # Returned for the `screenshot` / `zoom` action types, which are accepted by
 # the parser (older prompts advertised them) but have no implementation.
 NOOP_CAPTURE_ERROR = (
@@ -296,6 +331,16 @@ FIRST_WORKER_MAX_TURNS = 15
 SMOKE_NUDGE_TURNS = 18
 SMOKE_MAX_TURNS = 25
 
+# Actions an independent re-check flow may not take: it only verifies one
+# finding and ends with recheck_result (see orchestrator/recheck.py).
+RECHECK_DISABLED_ACTIONS = frozenset({"report_issue", "add_flow", "done"})
+RECHECK_DISABLED_ERROR = (
+    "{action} is disabled in a re-check. Finish with ONE recheck_result "
+    'action: {{"action_type": "recheck_result", "recheck_outcome": '
+    '"reproduced" | "not_reproduced" | "inconclusive", "reason": "<the '
+    'evidence you saw>"}}.'
+)
+
 
 def _budget_wrap_up_note(state: "SharedFlowState") -> str:
     """Wrap-up instruction for the AI once the run's budget is nearly spent.
@@ -335,6 +380,23 @@ def _first_worker_turn_note(is_first_worker: bool, action_count: int) -> str:
         f"is to enumerate flows — do not test or explore. Use your remaining "
         f"~{remaining} turn(s) for add_flow actions covering anything "
         f"important not yet listed, then call done."
+    )
+
+
+def _recheck_turn_note(action_count: int) -> str:
+    """Turn-cap warning for a re-check flow, from RECHECK_NUDGE_TURNS on.
+
+    Text-only in the current (never-cached) user message, like the
+    first-worker and smoke notes.
+    """
+    if action_count < rc.RECHECK_NUDGE_TURNS:
+        return ""
+    remaining = max(rc.RECHECK_MAX_TURNS - action_count, 1)
+    return (
+        f"**TURN LIMIT: {action_count} of {rc.RECHECK_MAX_TURNS} re-check turns "
+        f"used; the re-check ends as inconclusive after that.** Within "
+        f"~{remaining} turn(s), record your recheck_result — `inconclusive` "
+        f"if you have not been able to judge the finding."
     )
 
 
@@ -709,6 +771,10 @@ class ActionResult:
     # raw exception string). Corrective errors are kept intact in the action
     # history shown to the model instead of the tight raw-error truncation.
     corrective_error: bool = False
+    # A re-check flow's verdict (recheck_result action): one of
+    # recheck.OUTCOMES, with the verifier's evidence
+    recheck_outcome: str = ""
+    recheck_reason: str = ""
 
     def __post_init__(self):
         if self.pending_flows is None:
@@ -791,14 +857,21 @@ class FlowExplorationWorker:
         self._network_issue_counts: dict[tuple[int, str], int] = {}
         # (script host, message prefix) -> count of auto-filed console errors
         self._console_issue_counts: dict[tuple[str, str], int] = {}
+        # Set when this flow is an independent re-check of a CRITICAL
+        # finding (orchestrator/recheck.py): the recheck_id it verifies
+        recheck_of = getattr(flow_task, "recheck_of", None)
+        self.recheck_id: Optional[str] = recheck_of if isinstance(recheck_of, str) else None
 
     def _turn_cap(self) -> Optional[int]:
         """Hard turn cap for this worker, or None for a normal worker.
 
         The first (flow-enumeration) worker is capped at
         FIRST_WORKER_MAX_TURNS; the single smoke-mode worker at
-        SMOKE_MAX_TURNS. Both are force-completed at the cap.
+        SMOKE_MAX_TURNS; a re-check flow (smoke run or not) at
+        RECHECK_MAX_TURNS. All are force-completed at the cap.
         """
+        if self.recheck_id:
+            return rc.RECHECK_MAX_TURNS
         if self.is_first_worker:
             return FIRST_WORKER_MAX_TURNS
         if getattr(self.state, "smoke", False):
@@ -839,6 +912,14 @@ class FlowExplorationWorker:
                 }
             }
 
+        if self.recheck_id:
+            # Ended without a verdict (turn cap, AI error, run limit): the
+            # critical stays critical, annotated inconclusive. No-op when
+            # recheck_result already settled it.
+            settled = await self.state.close_recheck(self.recheck_id)
+            if settled:
+                yield self._recheck_result_event(settled)
+
     async def _execute_flow(self) -> AsyncGenerator[dict, None]:
         """Execute the flow exploration."""
         task = self.flow_task
@@ -855,6 +936,22 @@ class FlowExplorationWorker:
             )
             return
 
+        recheck_context = ""
+        if self.recheck_id:
+            started, settled = await self.state.start_recheck(self.recheck_id)
+            if not started:
+                # Settled already, or too little time/cost left to finish:
+                # don't open a browser for a verdict that can't be reached
+                reason = (settled or {}).get("reason") or "re-check already settled"
+                await self.state.complete_flow(task.flow_id, f"Re-check not run: {reason}")
+                if settled:
+                    yield self._recheck_result_event(settled)
+                return
+            brief = await self.state.get_recheck_brief(self.recheck_id) or {}
+            recheck_context = format_recheck_context(
+                brief, self.worker_number, rc.RECHECK_MAX_TURNS
+            )
+
         yield {
             "type": "flow_started",
             "data": {
@@ -864,6 +961,9 @@ class FlowExplorationWorker:
                 "is_root": task.is_root,
                 "parent_flow_id": task.parent_flow_id,
                 "flow_path": task.flow_path.to_list(),
+                # Independent re-check of a critical: the UI keeps it out of
+                # "Completed" like get_progress() does
+                "recheck_of": self.recheck_id,
                 # Set when this flow continues a paused/blocked one under
                 # the same name — the UI shows "(resumed)" from this flag
                 "resumed_from": flow_data.resumed_from,
@@ -874,34 +974,40 @@ class FlowExplorationWorker:
                 "is_first_worker": flow_data.is_first_worker,
             }
         }
+        if self.recheck_id:
+            yield {
+                "type": "recheck_started",
+                "worker_id": self.worker_id,
+                "flow_id": task.flow_id,
+                "data": {
+                    "recheck_id": self.recheck_id,
+                    "flow_id": task.flow_id,
+                    "title": task.flow_name.removeprefix("Re-check: "),
+                    "worker_id": self.worker_id,
+                },
+            }
 
         context = None
         page = None
         browser = None
         conversation_history = []
+        # Action records behind the Recent Actions recap. A fresh flow starts
+        # empty; a continuation inherits its checkpoint's (bound here so the
+        # pause handler below can checkpoint even when cancelled early).
+        action_history: list[dict] = []
         parent_flow_name = ""
 
         try:
-            # Check for HTTP Basic Auth credentials
+            # HTTP Basic Auth credentials (applied to the target's origin
+            # only by create_isolated_context)
             http_auth = await self.state.get_http_auth()
-            pw_credentials = (
-                {"username": http_auth["username"], "password": http_auth["password"]}
-                if http_auth else None
-            )
 
             if task.is_root or task.checkpoint_id is None:
                 # Root flow or fresh flow: create fresh context
                 # Flows created via add_flow_task have checkpoint_id=None and start fresh
                 context = await self.browser_pool.create_isolated_context(
-                    http_credentials=pw_credentials,
+                    http_auth=http_auth,
                 )
-
-                # Also apply via route interception to proactively send the header
-                # (avoids 401 round-trip on subrequests after initial navigation)
-                if http_auth:
-                    await self.browser_pool.apply_http_auth(
-                        context, http_auth["username"], http_auth["password"], http_auth["target_url"]
-                    )
 
                 page = await context.new_page()
 
@@ -933,14 +1039,8 @@ class FlowExplorationWorker:
 
                 context = await self.browser_pool.create_isolated_context(
                     storage_state=checkpoint.browser_storage_state,
-                    http_credentials=pw_credentials,
+                    http_auth=http_auth,
                 )
-
-                # Also apply via route interception for checkpoint-restored flows
-                if http_auth:
-                    await self.browser_pool.apply_http_auth(
-                        context, http_auth["username"], http_auth["password"], http_auth["target_url"]
-                    )
 
                 page = await context.new_page()
 
@@ -959,8 +1059,17 @@ class FlowExplorationWorker:
                     raise
 
                 conversation_history = checkpoint.conversation_history.copy()
+                # The inherited turns are stored as stubs + action JSON
+                # (HISTORY_COMPACTION): their outcomes live only in these
+                # records, so the first prompt's recap must carry them.
+                # Copied, so a retry of this flow re-reads the checkpoint
+                # as it was saved.
+                action_history = checkpoint.action_history.copy()
 
-                # Check if this is a resume from approval request
+                # Check if this is a resume from approval request. The
+                # restored history ends with the assistant turn that asked;
+                # the provider merges this user note into the first resumed
+                # turn's prompt, so the request still alternates roles.
                 approval_result = await self.state.get_approval_result(task.flow_id)
                 if approval_result:
                     if approval_result.get('approved'):
@@ -980,7 +1089,6 @@ class FlowExplorationWorker:
             prior_context = self._build_flow_context(task, conversation_history)
 
             action_count = 0
-            action_history = []
             flow_completed = False
             last_error = ""
             # Why the exploration loop broke, for accurate flow accounting after
@@ -1001,7 +1109,12 @@ class FlowExplorationWorker:
                 # single smoke worker must stay a short bounded pass.
                 turn_cap = self._turn_cap()
                 if turn_cap is not None and action_count >= turn_cap:
-                    if self.is_first_worker:
+                    if self.recheck_id:
+                        completion_reason = (
+                            f"Re-check force-completed at the "
+                            f"{rc.RECHECK_MAX_TURNS}-turn cap without a verdict"
+                        )
+                    elif self.is_first_worker:
                         completion_reason = (
                             f"Flow enumeration force-completed at the "
                             f"{FIRST_WORKER_MAX_TURNS}-turn cap"
@@ -1060,6 +1173,7 @@ class FlowExplorationWorker:
                             # history references the popup.
                             current_url=browser.current_url,
                             conversation_history=conversation_history.copy(),
+                            action_history=action_history.copy(),
                             flow_path=task.flow_path,
                             branch_name=task.flow_name,
                             created_by_worker=self.worker_id
@@ -1104,6 +1218,7 @@ class FlowExplorationWorker:
                             # Active page (popup-aware), matching the history
                             current_url=browser.current_url,
                             conversation_history=conversation_history.copy(),
+                            action_history=action_history.copy(),
                             flow_path=task.flow_path,
                             branch_name=task.flow_name,
                             created_by_worker=self.worker_id
@@ -1149,6 +1264,7 @@ class FlowExplorationWorker:
                             # Active page (popup-aware), matching the history
                             current_url=browser.current_url,
                             conversation_history=conversation_history.copy(),
+                            action_history=action_history.copy(),
                             flow_path=task.flow_path,
                             branch_name=task.flow_name,
                             created_by_worker=self.worker_id
@@ -1246,11 +1362,16 @@ class FlowExplorationWorker:
                         conversation_history=conversation_history,
                         prior_context=prior_context,
                         additional_context="\n\n".join(note for note in (
-                            _budget_wrap_up_note(self.state),
+                            # A re-check has its own cap note; the budget,
+                            # first-worker and smoke notes describe other jobs
+                            (_recheck_turn_note(action_count) if self.recheck_id else ""),
+                            ("" if self.recheck_id else _budget_wrap_up_note(self.state)),
                             _first_worker_turn_note(
                                 self.is_first_worker, action_count
                             ),
-                            _smoke_mode_note(self.state.smoke, action_count),
+                            _smoke_mode_note(
+                                self.state.smoke and not self.recheck_id, action_count
+                            ),
                             _new_tab_note(browser),
                             page_extent_note,
                         ) if note),
@@ -1264,6 +1385,7 @@ class FlowExplorationWorker:
                         credentials=credentials,
                         user_data=user_data,
                         known_issues=self.state.known_issues,
+                        recheck_context=recheck_context,
                     ):
                         # Handle AI events
                         result = await self._handle_ai_event(
@@ -1276,6 +1398,9 @@ class FlowExplorationWorker:
                             action_history=action_history,
                             conversation_history=conversation_history,
                             current_screenshot_size=current_screenshot_size,
+                            # This turn's one-off context, kept in its
+                            # history stub (cleared after this turn)
+                            prior_context=prior_context,
                         )
 
                         if result is None:
@@ -1377,7 +1502,9 @@ class FlowExplorationWorker:
                     # on the run mode, because BLOCKED_FOR_PAUSE is a
                     # resume-pending status that is_complete() blocks on:
                     reason = self.state.get_stop_reason()
-                    if self.state.interactive:
+                    # A re-check never resumes (close_recheck settles it
+                    # inconclusive), so it always ends terminally here
+                    if self.state.interactive or self.recheck_id:
                         # Interactive (web UI): the run pauses for possible
                         # resume, and the coordinator's cancellation path owns
                         # checkpoint creation. If the worker self-exits on
@@ -1438,7 +1565,15 @@ class FlowExplorationWorker:
             # Check if pause (should checkpoint) vs user stop (no checkpoint)
             # Note: We can't yield here - the generator is being torn down.
             # The checkpoint is saved and coordinator will emit events for saved checkpoints.
-            if self.state.is_pause_cancellation():
+            if self.recheck_id:
+                # A re-check is never checkpointed or resumed: end it
+                # terminally (a BLOCKED_FOR_PAUSE flow with no checkpoint
+                # would wedge is_complete) and let finalize_rechecks settle
+                # it inconclusive before synthesis.
+                await self.state.complete_flow(
+                    task.flow_id, "Re-check interrupted before a verdict"
+                )
+            elif self.state.is_pause_cancellation():
                 # Always mark the flow as blocked for pause, even if we can't checkpoint
                 # This prevents the flow from showing as "exploring" after pause
                 await self.state.block_flow_for_pause(task.flow_id, self.state.get_stop_reason())
@@ -1457,6 +1592,7 @@ class FlowExplorationWorker:
                             # fall back to the main page's URL.
                             current_url=browser.current_url if browser else page.url,
                             conversation_history=conversation_history.copy(),
+                            action_history=action_history.copy(),
                             flow_path=task.flow_path,
                             branch_name=task.flow_name,  # resume clone keeps the flow's human name
                             created_by_worker=self.worker_id
@@ -1604,6 +1740,16 @@ class FlowExplorationWorker:
             },
         }
 
+    def _recheck_result_event(self, data: dict) -> dict:
+        """The `recheck_result` event for a settled re-check (see
+        SharedFlowState._settle_recheck for `data`)."""
+        return {
+            "type": "recheck_result",
+            "worker_id": self.worker_id,
+            "flow_id": self.flow_task.flow_id,
+            "data": data,
+        }
+
     def _log_issue_to_transcript(self, task: FlowTask, issue: Issue):
         """Drop an ISSUE REPORTED marker into the worker's chat transcript so
         `grep -n 'ISSUE REPORTED' chats/*.txt` lands on the exact turn — this
@@ -1630,8 +1776,10 @@ class FlowExplorationWorker:
             context_parts.append("")
 
         if conversation_history:
+            # Count exchanges (assistant turns), not stored messages
+            exchanges = sum(1 for msg in conversation_history if msg.get("role") == "assistant")
             context_parts.append("## Previous Context")
-            context_parts.append(f"{len(conversation_history)} previous exchanges preserved.")
+            context_parts.append(f"{exchanges} previous exchanges preserved.")
             context_parts.append("")
 
         return "\n".join(context_parts) if context_parts else ""
@@ -1647,6 +1795,7 @@ class FlowExplorationWorker:
         action_history: list[dict],
         conversation_history: list[dict],
         current_screenshot_size: int,
+        prior_context: str = "",
     ) -> dict | None:
         """
         Handle a single AI event.
@@ -1791,16 +1940,27 @@ class FlowExplorationWorker:
                     cache_read_tokens=cache_read_tokens
                 )
 
-            # Store conversation history
+            # Store the exchange in API order: this turn's prompt (page
+            # state), THEN the action it produced. The reverse order showed
+            # the model each action before the page that prompted it and put
+            # two user turns after the cache breakpoint (the previous prompt
+            # re-billed as uncached input every turn).
+            # The prompt is stored as a compact stub (the full text was only
+            # ever sent as the uncached current turn) unless compaction is off.
+            if ai_event.get("user_content"):
+                conversation_history.append({
+                    "role": "user",
+                    "content": (
+                        _history_turn_stub(
+                            conversation_history, browser.current_url, prior_context
+                        )
+                        if HISTORY_COMPACTION else ai_event["user_content"]
+                    ),
+                })
             if ai_event.get("assistant_content"):
                 conversation_history.append({
                     "role": "assistant",
                     "content": ai_event["assistant_content"]
-                })
-            if ai_event.get("user_content"):
-                conversation_history.append({
-                    "role": "user",
-                    "content": ai_event["user_content"]
                 })
 
             # Free memory from old screenshots no longer needed for API calls
@@ -1817,12 +1977,8 @@ class FlowExplorationWorker:
                     try:
                         await page.close()
                         await context.close()
-                        pw_credentials = {"username": http_auth["username"], "password": http_auth["password"]}
                         context = await self.browser_pool.create_isolated_context(
-                            http_credentials=pw_credentials,
-                        )
-                        await self.browser_pool.apply_http_auth(
-                            context, http_auth["username"], http_auth["password"], http_auth["target_url"]
+                            http_auth=http_auth,
                         )
                         page = await context.new_page()
                         await _safe_goto(page, reload_url)
@@ -1830,12 +1986,13 @@ class FlowExplorationWorker:
                     except Exception as e:
                         logger.error(f"Context rebuild failed after set_http_auth: {e}")
                         # Close the just-created context before bailing so a
-                        # failed apply_http_auth / new_page / goto doesn't leak
-                        # it — on success the new context is handed back to the
-                        # caller via result["new_context"], but on this error
-                        # path nothing else owns it. (If create_isolated_context
-                        # itself failed, `context` is the already-closed old one;
-                        # the double close is caught and harmless.)
+                        # failed new_page / goto doesn't leak it — on success
+                        # the new context is handed back to the caller via
+                        # result["new_context"], but on this error path
+                        # nothing else owns it. (If create_isolated_context
+                        # itself failed — it closes a context whose auth
+                        # route failed — `context` is the already-closed old
+                        # one; the double close is caught and harmless.)
                         try:
                             await context.close()
                         except Exception:
@@ -1941,6 +2098,14 @@ class FlowExplorationWorker:
             if exec_result.flow_done:
                 completion_reason = exec_result.done_reason
                 await self.state.complete_flow(task.flow_id, completion_reason)
+                if exec_result.recheck_outcome:
+                    settled = await self.state.record_recheck_outcome(
+                        self.recheck_id,
+                        exec_result.recheck_outcome,
+                        exec_result.recheck_reason,
+                    )
+                    if settled:
+                        events.append(self._recheck_result_event(settled))
 
                 if self.state.chat_logger:
                     self.state.chat_logger.log_worker_completion(
@@ -1984,7 +2149,10 @@ class FlowExplorationWorker:
                 # Check if we already have data for this request name
                 existing_data = await self.state.get_user_data(data_request.request_name)
                 if existing_data:
-                    # Data already available - add to conversation history for AI to use
+                    # Data already available - add to conversation history for AI to use.
+                    # This user note follows the turn's assistant message; the
+                    # provider merges it into the next turn's user message so
+                    # the request still alternates roles.
                     # Note: Password fields are masked in logs but AI still receives raw values
                     data_lines = [f"Data for '{data_request.request_name}' is available:"]
                     data_lines.extend(format_user_data_for_prompt(existing_data, data_request.fields))
@@ -2026,6 +2194,7 @@ class FlowExplorationWorker:
                             browser_storage_state=storage_state,
                             current_url=branch_url,
                             conversation_history=conversation_history.copy(),
+                            action_history=action_history.copy(),
                             flow_path=task.flow_path.extend(pending_flow.name),
                             branch_name=pending_flow.name,
                             created_by_worker=self.worker_id
@@ -2109,6 +2278,14 @@ class FlowExplorationWorker:
                 if is_new:
                     self._log_issue_to_transcript(task, issue)
                 events.append(self._issue_event(task, issue, is_new))
+                # A new critical was scheduled for (or joined, or skipped)
+                # an independent re-check — say so in the CI log / UI
+                recheck_event = (
+                    rc.new_issue_event(issue, self.worker_id, task.flow_id)
+                    if is_new else None
+                )
+                if recheck_event:
+                    events.append(recheck_event)
 
             # Auto-report console errors
             console_errors = browser.get_console_errors()
@@ -2285,6 +2462,13 @@ class FlowExplorationWorker:
         Action types match Claude for Chrome MCP tools exactly.
         Returns ActionResult with success status and any control flow signals.
         """
+        if self.recheck_id and action.action_type in RECHECK_DISABLED_ACTIONS:
+            return ActionResult(
+                success=False,
+                message=f"{action.action_type} refused in a re-check flow",
+                corrective_error=True,
+                error=RECHECK_DISABLED_ERROR.format(action=action.action_type),
+            )
         try:
             # Click actions. Refs are preferred (auto-wait, actionability
             # checks), but a bare [x, y] coordinate from the screenshot is
@@ -2665,6 +2849,31 @@ class FlowExplorationWorker:
                         description=action.flow_description or action.flow_name,
                         keep_state=action.keep_state
                     )]
+                )
+
+            elif action.action_type == "recheck_result":
+                if not self.recheck_id:
+                    return ActionResult(
+                        success=False,
+                        message="recheck_result outside a re-check flow",
+                        corrective_error=True,
+                        error=(
+                            "recheck_result is only for independent re-check "
+                            "flows. Report problems with report_issue and "
+                            "finish your flow with done."
+                        ),
+                    )
+                reason = " ".join((action.reason or "").split())
+                return ActionResult(
+                    success=True,
+                    message=f"Re-check verdict: {action.recheck_outcome}",
+                    flow_done=True,
+                    done_reason=(
+                        f"Re-check verdict: {action.recheck_outcome}"
+                        + (f" — {rc.clip(reason, 200)}" if reason else "")
+                    ),
+                    recheck_outcome=action.recheck_outcome,
+                    recheck_reason=reason,
                 )
 
             elif action.action_type == "done":

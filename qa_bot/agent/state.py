@@ -21,7 +21,20 @@ class Issue:
     flow_id: str = ""
     flow_name: str = ""
     turn: Optional[int] = None
+    # 1-based position of the action that filed the issue in its flow's
+    # recorded actions (FlowExplorationData.actions) — the step synthesis
+    # cites against that flow's action summary. Stamped by
+    # SharedFlowState.add_issue: the worker records a turn's action before
+    # it files that turn's issues. Unlike ``turn`` it does not restart when
+    # a retry or a resumed flow appends to the same actions list.
+    flow_step: Optional[int] = None
     source: str = "ai"  # "ai" | "console" | "network" | "dialog"
+    # Independent re-check of a CRITICAL finding (orchestrator/recheck.py):
+    # {"status": pending|running|reproduced|not_reproduced|inconclusive|
+    # skipped, "reason", "original_description", "original_severity",
+    # "recheck_id", "recheck_flow_id", "linked"}. None when the issue was
+    # never a re-check candidate.
+    recheck: Optional[dict] = None
 
     def to_dict(self) -> dict:
         result = {
@@ -42,6 +55,8 @@ class Issue:
             result["flow_name"] = self.flow_name
         if self.turn is not None:
             result["turn"] = self.turn
+        if self.recheck:
+            result["recheck"] = dict(self.recheck)
         return result
 
 

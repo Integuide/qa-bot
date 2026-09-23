@@ -37,6 +37,10 @@ PRIORITY_DEFAULT = 0      # Normal flows: FIFO in creation order
 PRIORITY_RETRY = 50       # Automatic retry of a failed generic flow
 PRIORITY_GOAL = 55        # Fresh flow named by the testing goal
 PRIORITY_RETRY_GOAL = 60  # Retry of a flow named by the testing goal
+# Independent re-check of a CRITICAL finding (orchestrator/recheck.py). Runs
+# next, ahead of every user flow: it decides whether the deploy gate fails,
+# and it must finish inside the run's time budget to count.
+PRIORITY_RECHECK = 90
 PRIORITY_ROOT = 100       # Root/first-worker flow
 
 
@@ -95,6 +99,7 @@ class FlowCheckpoint:
     Contains everything needed to restore the exploration state:
     - Browser state (cookies, localStorage, sessionStorage)
     - Conversation history (so the AI has context)
+    - Action history (so the AI knows how its earlier actions turned out)
     - Flow name/description (so the AI knows what to explore)
     """
     checkpoint_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -107,6 +112,14 @@ class FlowCheckpoint:
     # Conversation history for AI context inheritance
     # List of API-format message dicts: [{"role": "user"|"assistant", "content": ...}]
     conversation_history: list[dict] = field(default_factory=list)
+
+    # The worker's action records up to the checkpoint (success, error,
+    # note, page URL per action) — the continuing worker seeds its Recent
+    # Actions recap from them. With HISTORY_COMPACTION the stored history
+    # keeps each past prompt only as a stub plus the action JSON, so this is
+    # the only record of how those actions turned out: without it a
+    # continuation saw "No actions taken yet" next to a click with no result.
+    action_history: list[dict] = field(default_factory=list)
 
     # Flow context
     flow_path: FlowPath = field(default_factory=FlowPath)
@@ -129,6 +142,7 @@ class FlowCheckpoint:
             "browser_storage_state": self.browser_storage_state,
             "current_url": self.current_url,
             "conversation_history": self.conversation_history,
+            "action_history": self.action_history,
             "flow_path": self.flow_path.to_list(),
             "branch_name": self.branch_name,
             "created_by_worker": self.created_by_worker,
@@ -147,6 +161,7 @@ class FlowCheckpoint:
             browser_storage_state=data["browser_storage_state"],
             current_url=data["current_url"],
             conversation_history=data["conversation_history"],
+            action_history=data.get("action_history", []),
             flow_path=FlowPath.from_list(data["flow_path"]),
             branch_name=data["branch_name"],
             created_by_worker=data["created_by_worker"],
@@ -196,6 +211,11 @@ class FlowTask:
     # This flag is propagated through resume flows so the first worker retains its behavior
     is_first_worker: bool = False
 
+    # Set on an independent re-check flow: the recheck_id (orchestrator/
+    # recheck.py) of the CRITICAL finding it verifies. Such a flow is not a
+    # tested user flow, never forks, never retries and never checkpoints.
+    recheck_of: Optional[str] = None
+
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
         return {
@@ -211,6 +231,7 @@ class FlowTask:
             "created_at": self.created_at.isoformat(),
             "is_first_worker": self.is_first_worker,
             "attempt": self.attempt,
+            "recheck_of": self.recheck_of,
         }
 
     @classmethod
@@ -229,6 +250,7 @@ class FlowTask:
             created_at=datetime.fromisoformat(data["created_at"]),
             is_first_worker=data.get("is_first_worker", False),
             attempt=data.get("attempt", 1),
+            recheck_of=data.get("recheck_of"),
         )
 
     @classmethod
@@ -310,6 +332,10 @@ class FlowExplorationData:
     resumed_from: Optional[str] = None
     resume_kind: Optional[str] = None  # "pause" | "credentials" | "data" | "approval"
 
+    # Set on an independent re-check flow (see FlowTask.recheck_of). Like
+    # is_first_worker, it keeps the flow out of every "flows tested" count.
+    recheck_of: Optional[str] = None
+
     # Exploration data
     actions: list[dict] = field(default_factory=list)
     issues: list[dict] = field(default_factory=list)
@@ -345,6 +371,7 @@ class FlowExplorationData:
             "is_first_worker": self.is_first_worker,
             "resumed_from": self.resumed_from,
             "resume_kind": self.resume_kind,
+            "recheck_of": self.recheck_of,
             "actions": self.actions,
             "issues": self.issues,
             "thinking_history": self.thinking_history,

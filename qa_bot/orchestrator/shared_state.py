@@ -14,6 +14,7 @@ from qa_bot.config import calculate_cost, DEFAULT_MODEL
 from qa_bot.orchestrator.flow import (
     PRIORITY_DEFAULT,
     PRIORITY_GOAL,
+    PRIORITY_RECHECK,
     PRIORITY_RETRY,
     PRIORITY_RETRY_GOAL,
     FlowTask,
@@ -22,8 +23,9 @@ from qa_bot.orchestrator.flow import (
     FlowStatus,
     FlowExplorationData,
 )
-from qa_bot.orchestrator.severity_guard import cap_severity
-from qa_bot.utils.secrets import is_sensitive_key, mask_value
+from qa_bot.orchestrator import recheck as rc
+from qa_bot.orchestrator.severity_guard import cap_severity, severity_rank
+from qa_bot.utils.secrets import is_sensitive_key, mask_value, redact_values
 
 # Fixed goal for smoke mode (CLI `--smoke`, action `mode: smoke`). The
 # coordinator forces this goal whenever smoke is on so a smoke run can never
@@ -172,6 +174,12 @@ class SharedFlowState:
     # add_checkpoint refuse to schedule children so the run stays a single
     # bounded pass. The report is tagged "SMOKE TEST ONLY".
     smoke: bool = False
+    # Independent re-check of CRITICAL findings (orchestrator/recheck.py):
+    # add_issue queues a short verification flow for each new AI-reported
+    # critical and its outcome deterministically keeps, tags or demotes the
+    # original. On by default for non-interactive runs only (see
+    # config.recheck_criticals_default); the one child flow smoke mode allows.
+    recheck_criticals: bool = False
 
     # Configuration
     max_branches_per_flow: int = 10  # Limit branching to prevent explosion
@@ -240,6 +248,15 @@ class SharedFlowState:
     # Results aggregation
     _all_issues: list[Issue] = field(default_factory=list)
     _issue_screenshot_counter: int = 0
+    # recheck_id -> RecheckRecord, in scheduling order
+    _rechecks: dict = field(default_factory=dict)
+    # Where each flow's recorded actions came from, so a re-check is handed
+    # the steps that actually led to a finding (see _action_trail):
+    # flow_id -> index into flow.actions where its current attempt began (a
+    # retry re-runs the same flow_id and appends to the same list), and
+    # checkpoint_id -> (the parent's trail as of the fork, complete?).
+    _attempt_action_start: dict = field(default_factory=dict)
+    _checkpoint_trails: dict = field(default_factory=dict)
 
     # Lock for thread-safe operations
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -317,6 +334,7 @@ class SharedFlowState:
         known_issues: str = "",
         smoke: bool = False,
         previous_report: str = "",
+        recheck_criticals: bool = False,
     ) -> "SharedFlowState":
         """Create a new shared flow state with initial root flow.
 
@@ -336,6 +354,7 @@ class SharedFlowState:
             known_issues=known_issues,
             smoke=smoke,
             previous_report=previous_report,
+            recheck_criticals=recheck_criticals,
             max_branches_per_flow=max_branches_per_flow,
             max_duration_minutes=max_duration_minutes,
             max_cost_usd=max_cost_usd,
@@ -377,6 +396,9 @@ class SharedFlowState:
             self._checkpoint_registry.clear()
             self._flow_registry.clear()
             self._all_issues.clear()
+            self._rechecks.clear()
+            self._attempt_action_start.clear()
+            self._checkpoint_trails.clear()
             self._approval_responses.clear()
             self._pending_approval_requests.clear()
             self._blocked_workers.clear()
@@ -456,6 +478,18 @@ class SharedFlowState:
             # Then the regular queue, highest priority first
             return self._queue_pop_next()
 
+    async def claim_pending_recheck(self) -> Optional[FlowTask]:
+        """Claim the oldest queued re-check flow, if any (non-blocking).
+
+        Lets the coordinator start a re-check in its own slot while every
+        regular worker slot is busy (see recheck.RECHECK_SLOTS).
+        """
+        async with self._lock:
+            for index, (_, task) in enumerate(self._task_queue):
+                if task.recheck_of:
+                    return self._task_queue.pop(index)[1]
+            return None
+
     async def return_flow_to_pending(self, task: FlowTask):
         """
         Return a flow task to the pending queue.
@@ -532,6 +566,7 @@ class SharedFlowState:
 
             # Save checkpoint
             self._checkpoint_registry[checkpoint.checkpoint_id] = checkpoint
+            self._record_checkpoint_trail(checkpoint)
 
             # If not queueing (credential/approval resume), just save the checkpoint
             # Return checkpoint to indicate it was saved (task will be created later)
@@ -594,6 +629,7 @@ class SharedFlowState:
         precedence, so no priority value is involved."""
         async with self._lock:
             self._checkpoint_registry[checkpoint.checkpoint_id] = checkpoint
+            self._record_checkpoint_trail(checkpoint)
             flow_task = FlowTask.create_from_checkpoint(checkpoint, goal)
 
             # Propagate is_first_worker from parent flow. The clone keeps
@@ -699,6 +735,9 @@ class SharedFlowState:
             flow_data.status = FlowStatus.EXPLORING
             flow_data.worker_id = worker_id
             flow_data.started_at = datetime.now()
+            # A retry restarts from the start URL / checkpoint but appends to
+            # the same actions list: remember where this attempt begins
+            self._attempt_action_start[flow_data.flow_id] = len(flow_data.actions)
 
             return flow_data
 
@@ -825,6 +864,9 @@ class SharedFlowState:
                 allow_retry
                 and task is not None
                 and task.attempt < self.MAX_FLOW_ATTEMPTS
+                # A re-check that crashed settles inconclusive (the critical
+                # stays critical); a second paid attempt is not worth it
+                and not task.recheck_of
                 and flow_id not in self._skip_set
                 # Only retry a flow the worker actively owned. The worker's
                 # catch-all can route here after the flow already reached a
@@ -922,7 +964,21 @@ class SharedFlowState:
         their own, fail a deploy. It only ever lowers severity. Mutating the
         Issue in place means the downstream ``issue`` SSE event, the synthesis
         input, and the deploy gate all see the same corrected severity.
+
+        A new issue that is still ``critical`` after the guard goes to the
+        independent re-check (``_decide_recheck``); the decision lands on
+        ``issue.recheck`` before the caller emits the ``issue`` event.
+
+        Known secret values (``get_secret_values``) are masked in the
+        description and action context first, in place, so the ``issue``
+        event, the CI log line, the re-check brief, synthesis and the dedup
+        key all see the same masked text: a run can be handed a live API
+        key as a credential, and a finding quoting it must not be published.
         """
+        secrets = self.get_secret_values()
+        issue.description = redact_values(issue.description, secrets)
+        issue.action_context = redact_values(issue.action_context, secrets)
+
         capped, reason = cap_severity(
             issue.severity, issue.description, issue.action_context
         )
@@ -934,9 +990,13 @@ class SharedFlowState:
             issue.severity = capped
 
         async with self._lock:
+            # Compare pristine text: a re-check tag prefixed onto an earlier
+            # report must not make its exact repeat look new
+            key = self._issue_dedup_key(issue)
             for existing in self._all_issues:
-                if (existing.description == issue.description and
-                    existing.url == issue.url):
+                if (self._issue_dedup_key(existing) == key and
+                    existing.url == issue.url and
+                    self._covers_repeat(existing, issue)):
                     return False
             self._all_issues.append(issue)
             # Attribute the issue to its flow under the same lock so the
@@ -946,8 +1006,298 @@ class SharedFlowState:
             # "Issues Found: 0" while the issue list above it was non-empty.)
             flow_data = self._flow_registry.get(issue.flow_id)
             if flow_data is not None:
+                if flow_data.actions:
+                    # The reporting action is the last one recorded (same
+                    # stamp as _action_trail's): its place in the flow's
+                    # action summary, whatever attempt or resume filed it
+                    issue.flow_step = len(flow_data.actions)
                 flow_data.issues.append(issue.to_dict())
+            if issue.severity == "critical":
+                self._decide_recheck(issue, flow_data)
             return True
+
+    def _issue_dedup_key(self, issue: Issue) -> str:
+        pristine = (issue.recheck or {}).get("original_description") or issue.description
+        # Masked with today's secrets on both sides: an issue stored before
+        # a secret was learned (credentials provided mid-run) still matches
+        # its masked repeat
+        return redact_values(pristine, self._secret_values)
+
+    @staticmethod
+    def _covers_repeat(existing: Issue, issue: Issue) -> bool:
+        """Whether a stored issue with the same text on the same page makes
+        ``issue`` a duplicate: it was a re-check candidate (its outcome,
+        demoted or not, stands for every repeat), or it is already at least
+        as severe. A repeat that RAISES a never-rechecked finding (filed
+        major, later critical) is kept as its own issue, so it goes through
+        the critical path — re-check, raw count, CLI list — instead of being
+        dropped everywhere; the earlier, lower filing stays as it was.
+        """
+        if existing.recheck:
+            return True
+        return severity_rank(existing.severity) >= severity_rank(issue.severity)
+
+    # -------------------------------------------------------------------------
+    # Independent re-check of CRITICAL findings (orchestrator/recheck.py)
+    # -------------------------------------------------------------------------
+
+    def _recheck_shortfall(self, min_seconds: float, min_cost_usd: float) -> str:
+        """Why the run can no longer afford a re-check ("" when it can).
+
+        Sync, lock-free reads only — callers hold self._lock.
+        """
+        if self.should_stop():
+            return "the run is already stopping"
+        elapsed = (datetime.now() - self.start_time).total_seconds()
+        remaining_seconds = self.max_duration_minutes * 60 - elapsed
+        if remaining_seconds < min_seconds:
+            return f"only {max(0, int(remaining_seconds))}s of the run's time budget left"
+        exploration_budget = self.max_cost_usd * (1 - self.SYNTHESIS_COST_RESERVE_RATIO)
+        remaining_cost = exploration_budget - self.total_cost_usd
+        if remaining_cost < min_cost_usd:
+            return f"only ${max(0.0, remaining_cost):.2f} of the run's cost budget left"
+        return ""
+
+    def _action_trail(self, flow_id: Optional[str]) -> tuple[list[dict], bool]:
+        """The recorded actions that brought a flow to where it is now,
+        oldest first, and whether that trail is complete. Caller holds
+        self._lock.
+
+        Only the flow's CURRENT attempt counts: a retry restarts from the
+        start URL or checkpoint, so the failed attempt's actions (still in
+        ``flow.actions``) are not steps to anything it sees now. A flow
+        restored from a checkpoint (a fork, or a pause/credential resume)
+        continues where its parent stood at the fork, so the parent's trail
+        as of that moment comes first; when it was not captured the trail
+        is incomplete.
+        """
+        flow = self._flow_registry.get(flow_id) if flow_id else None
+        if flow is None:
+            return [], False
+        own = flow.actions[self._attempt_action_start.get(flow.flow_id, 0):]
+        if not flow.checkpoint_id:
+            return list(own), True
+        prefix, complete = self._checkpoint_trails.get(flow.checkpoint_id, ([], False))
+        return [*prefix, *own], complete
+
+    def _attempt_key(self, flow_id: Optional[str]) -> Optional[tuple]:
+        """Which attempt of a flow is running now: (flow_id, index into its
+        actions where the attempt began). Caller holds self._lock.
+
+        A retry re-runs the same flow_id from a fresh start, so the flow id
+        alone cannot tell a rewording (same attempt) from an independent
+        re-observation (the retry). Attempts that filed an issue always
+        start at distinct indexes: the worker records a turn's action
+        before it files that turn's issues. None for an issue with no flow.
+        """
+        if not flow_id or flow_id not in self._flow_registry:
+            return None
+        return (flow_id, self._attempt_action_start.get(flow_id, 0))
+
+    def _record_checkpoint_trail(self, checkpoint: FlowCheckpoint) -> None:
+        """Capture the parent's trail as the checkpoint is saved — the
+        forking action is already recorded (the worker records a turn's
+        action before handling its forks) — so a flow restored from it
+        can prefix the steps that set up its state. Caller holds self._lock.
+        """
+        self._checkpoint_trails[checkpoint.checkpoint_id] = self._action_trail(
+            checkpoint.parent_flow_id
+        )
+
+    def _decide_recheck(self, issue: Issue, origin: Optional[FlowExplorationData]) -> None:
+        """Queue, join or skip an independent re-check of a new critical.
+
+        Caller holds self._lock. Only AI-reported criticals qualify (the
+        auto-detectors never file one), and never a verifier's own
+        observation. A re-report of a critical already re-checked
+        (``rc.is_rereport``: same page, near-identical wording, and the
+        same attempt of the same flow filing it) joins that re-check and
+        shares its outcome (applied at once if it has settled). Anything
+        else — including a matching report from another flow or from a
+        retry of this one, open re-check or settled, which is independent
+        corroboration — is skipped (annotated with why, severity unchanged)
+        past MAX_RECHECKS_PER_RUN or when the run is too short on time/cost
+        to finish one, and queued at PRIORITY_RECHECK when not. Smoke
+        mode's no-forking rule deliberately does not apply: this is the one
+        child flow a smoke run may schedule.
+        """
+        if not self.recheck_criticals or issue.source != "ai":
+            return
+        if origin is not None and origin.recheck_of:
+            return
+        attempt = self._attempt_key(origin.flow_id if origin else None)
+        for record in self._rechecks.values():
+            if rc.is_rereport(record, issue, attempt):
+                record.issues.append(issue)
+                rc.apply_outcome(
+                    issue, record.status, record.reason,
+                    recheck_id=record.recheck_id,
+                    recheck_flow_id=record.flow_id,
+                    linked=True,
+                )
+                return
+
+        if len(self._rechecks) >= rc.MAX_RECHECKS_PER_RUN:
+            skip_reason = f"re-check cap ({rc.MAX_RECHECKS_PER_RUN} per run) reached"
+        else:
+            skip_reason = self._recheck_shortfall(
+                rc.RECHECK_MIN_REMAINING_SECONDS, rc.RECHECK_MIN_REMAINING_COST_USD
+            )
+        if skip_reason:
+            rc.apply_outcome(issue, rc.SKIPPED, skip_reason)
+            logger.info("Critical not re-checked (%s): %s", skip_reason, issue.description[:120])
+            return
+
+        # The steps are fixed NOW, at filing: the reporting action is the
+        # last one recorded (the worker records a turn's action before it
+        # files that turn's issues), so the trail ends exactly at the report.
+        # issue.turn is not an index into it: it restarts on a retry and in
+        # a flow restored from a checkpoint.
+        trail, complete = self._action_trail(origin.flow_id if origin else None)
+        record = rc.RecheckRecord.new(
+            issue,
+            steps=rc.original_steps(trail, complete=complete),
+            origin_flow_name=origin.flow_name if origin else issue.flow_name,
+            origin_attempt=attempt,
+        )
+        rc.apply_outcome(
+            issue, rc.PENDING,
+            recheck_id=record.recheck_id, recheck_flow_id=record.flow_id, linked=False,
+        )
+        name = f"Re-check: {record.title}"
+        flow_path = origin.flow_path.extend(name) if origin else FlowPath([name])
+        parent_flow_id = origin.flow_id if origin else None
+        task = FlowTask(
+            flow_id=record.flow_id,
+            flow_name=name,
+            flow_path=flow_path,
+            start_url=rc.recheck_start_url(issue.url, self.target_url),
+            goal=(
+                "Independently re-check this reported CRITICAL finding and "
+                "record the verdict with recheck_result: "
+                f"{rc.clip(record.original_description, 300)}"
+            ),
+            is_root=False,
+            parent_flow_id=parent_flow_id,
+            checkpoint_id=None,  # always a fresh browser context
+            priority=PRIORITY_RECHECK,
+            recheck_of=record.recheck_id,
+        )
+        self._flow_registry[task.flow_id] = FlowExplorationData(
+            flow_id=task.flow_id,
+            flow_name=name,
+            flow_path=flow_path,
+            status=FlowStatus.PENDING,
+            description=task.goal,
+            parent_flow_id=parent_flow_id,
+            recheck_of=record.recheck_id,
+        )
+        if origin is not None:
+            origin.child_flow_ids.append(task.flow_id)
+        self._rechecks[record.recheck_id] = record
+        self._queue_put(task)
+        logger.info("Re-checking critical: %s", record.title)
+
+    def _settle_recheck(self, record: "rc.RecheckRecord", status: str, reason: str) -> dict:
+        """Record a final outcome and apply it to every issue sharing the
+        re-check. Caller holds self._lock. Returns the recheck_result data."""
+        record.status = status
+        record.reason = reason
+        for issue in record.issues:
+            rc.apply_outcome(issue, status, reason)
+        logger.info("Re-check %s: %s (%s)", status, record.title, reason[:160])
+        return rc.result_event_data(record, record.issues)
+
+    async def get_recheck_brief(self, recheck_id: str) -> Optional[dict]:
+        """What the verifier's prompt needs about the finding it checks."""
+        async with self._lock:
+            record = self._rechecks.get(recheck_id)
+            if record is None:
+                return None
+            return {
+                "recheck_id": record.recheck_id,
+                "title": record.title,
+                "description": record.original_description,
+                "url": record.url,
+                "origin_flow_name": record.origin_flow_name,
+                "steps": list(record.steps),
+                "target_url": self.target_url,
+            }
+
+    async def start_recheck(self, recheck_id: str) -> tuple[bool, Optional[dict]]:
+        """Mark a re-check running as its worker starts.
+
+        Returns ``(True, None)`` to proceed, or ``(False, result)`` when it
+        must not run: already settled (``result`` None), or the run no
+        longer has RECHECK_MIN_START_SECONDS / RECHECK_MIN_START_COST_USD
+        left (settled inconclusive here; ``result`` is the event data).
+        """
+        async with self._lock:
+            record = self._rechecks.get(recheck_id)
+            if record is None or record.status not in rc.OPEN_STATUSES:
+                return False, None
+            shortfall = self._recheck_shortfall(
+                rc.RECHECK_MIN_START_SECONDS, rc.RECHECK_MIN_START_COST_USD
+            )
+            if shortfall:
+                return False, self._settle_recheck(
+                    record, rc.INCONCLUSIVE, f"not started: {shortfall}"
+                )
+            record.status = rc.RUNNING
+            for issue in record.issues:
+                rc.apply_outcome(issue, rc.RUNNING)
+            return True, None
+
+    async def record_recheck_outcome(
+        self, recheck_id: str, outcome: str, reason: str
+    ) -> Optional[dict]:
+        """The verifier's verdict. First verdict wins; None if already settled."""
+        async with self._lock:
+            record = self._rechecks.get(recheck_id)
+            if record is None or record.status not in rc.OPEN_STATUSES:
+                return None
+            if outcome not in rc.OUTCOMES:
+                reason = f"unrecognised verdict {outcome!r}: {reason}"
+                outcome = rc.INCONCLUSIVE
+            # The verifier's evidence lands in issue descriptions (the
+            # inconclusive tag), events and the CI log: mask like add_issue
+            reason = redact_values(reason, self._secret_values)
+            return self._settle_recheck(record, outcome, reason)
+
+    async def close_recheck(self, recheck_id: str) -> Optional[dict]:
+        """Settle a re-check whose worker ended without a verdict (turn cap,
+        AI error, run limit) as inconclusive. No-op once settled."""
+        async with self._lock:
+            record = self._rechecks.get(recheck_id)
+            if record is None or record.status not in rc.OPEN_STATUSES:
+                return None
+            flow = self._flow_registry.get(record.flow_id)
+            why = flow.completion_reason if flow is not None and flow.completion_reason else ""
+            reason = (
+                f"verifier ended without a verdict: {why}" if why
+                else "verifier ended without recording a verdict"
+            )
+            return self._settle_recheck(record, rc.INCONCLUSIVE, reason)
+
+    async def finalize_rechecks(self) -> list[dict]:
+        """Settle every still-open re-check as inconclusive (called before
+        synthesis): a critical must never reach the report still "pending"."""
+        async with self._lock:
+            settled = []
+            for record in self._rechecks.values():
+                if record.status == rc.PENDING:
+                    settled.append(self._settle_recheck(
+                        record, rc.INCONCLUSIVE, "the run ended before the re-check started"
+                    ))
+                elif record.status == rc.RUNNING:
+                    settled.append(self._settle_recheck(
+                        record, rc.INCONCLUSIVE, "the run ended before the re-check finished"
+                    ))
+            return settled
+
+    def recheck_summary(self) -> Optional[dict]:
+        """Per-issue re-check counts (None when no critical was a candidate)."""
+        return rc.summarize(self._all_issues)
 
     async def increment_actions(self, count: int = 1):
         """Increment total action counter."""
@@ -987,6 +1337,10 @@ class SharedFlowState:
 
             flow_data = self._flow_registry[flow_id]
             if flow_data.status != FlowStatus.PENDING:
+                return False
+            if flow_data.recheck_of:
+                # A re-check decides whether the gate fails; it is never a
+                # "duplicate" for the supervisor's review to drop
                 return False
 
             queued_task = next(
@@ -1049,11 +1403,12 @@ class SharedFlowState:
             return False
 
     async def get_pending_flows(self) -> list[FlowExplorationData]:
-        """Get all pending flows (for supervisor review)."""
+        """Get all pending user flows (for supervisor review). Queued
+        re-checks are left out: they are not the supervisor's to dedupe."""
         async with self._lock:
             return [
                 data for data in self._flow_registry.values()
-                if data.status == FlowStatus.PENDING
+                if data.status == FlowStatus.PENDING and not data.recheck_of
             ]
 
     async def get_all_flows(self) -> list[FlowExplorationData]:
@@ -1335,9 +1690,10 @@ class SharedFlowState:
         """Get current progress snapshot.
 
         ``flows.completed`` counts user flows tested to completion — the
-        Root/first-worker flow (flow enumeration only) is excluded so this
-        number agrees with the coordinator's ``flows_explored`` and a run
-        where only flow-mapping finished reports 0, not 1.
+        Root/first-worker flow (flow enumeration only) and independent
+        re-check flows are excluded so this number agrees with the
+        coordinator's ``flows_explored`` and a run where only flow-mapping
+        finished reports 0, not 1.
         """
         async with self._lock:
             # Single pass over flow registry to count all statuses
@@ -1346,7 +1702,7 @@ class SharedFlowState:
             for f in self._flow_registry.values():
                 status = f.status
                 if status == FlowStatus.COMPLETED:
-                    if not f.is_first_worker:
+                    if not f.is_first_worker and not f.recheck_of:
                         completed += 1
                 elif status == FlowStatus.PENDING:
                     pending += 1
@@ -1435,6 +1791,7 @@ class SharedFlowState:
                     "action_count": len(f.actions),
                     "issue_count": len(f.issues),
                     "is_first_worker": f.is_first_worker,
+                    "recheck_of": f.recheck_of,
                     "resumed_from": f.resumed_from,
                     "resume_kind": f.resume_kind,
                     "completion_reason": f.completion_reason,

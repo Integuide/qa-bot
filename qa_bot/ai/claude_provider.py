@@ -21,8 +21,8 @@ from anthropic import (
 from pydantic import ValidationError
 
 from qa_bot.browser.controller import DUPLICATE_REF_PREFIX
-from qa_bot.config import DEFAULT_MODEL, MODEL_SONNET, MODEL_OPUS
-from .base import AIProvider, AgentAction
+from qa_bot.config import DEFAULT_MODEL, MODEL_OPUS_5_5
+from .base import AIProvider, AgentAction, FatalProviderError
 from .prompts import (
     get_worker_system_prompt_parts,
     get_worker_action_prompt,
@@ -66,12 +66,14 @@ CACHE_CONTROL_EPHEMERAL = {"type": "ephemeral"}
 
 # History windowing for long worker flows.
 #
-# Every turn re-sends the full text conversation (each user turn carries the
-# complete action prompt: ref list, recap, boilerplate — several K tokens), so
-# an uncapped flow grows quadratically in cost and, deep into a flow, the
-# request gets large enough to feed the intermittent "thinking-only / no text"
-# response failure mode (2026-07-17 prod QA run: the image-fallback flow died
-# to it twice, ~46 turns deep, with the run's token counter moving ~100K per
+# Every turn re-sends the text conversation (with HISTORY_COMPACTION off each
+# stored user turn carries the complete action prompt: ref list, recap,
+# boilerplate — ~1.2K tokens; with it on, a ~30-token stub — see
+# HISTORY_TURN_STUB in orchestrator/worker.py), so an uncapped flow grows
+# quadratically in cost and, deep into a flow, the request gets large enough
+# to feed the intermittent "thinking-only / no text" response failure mode
+# (2026-07-17 prod QA run, before compaction: the image-fallback flow died to
+# it twice, ~46 turns deep, with the run's token counter moving ~100K per
 # turn). Windowing bounds both. Continuity survives trimming because every
 # turn's prompt independently carries the flow goal (system prompt) and a
 # recent-actions recap (action_history), and an omission note tells the model
@@ -92,14 +94,25 @@ HISTORY_OMITTED_NOTE = (
 )
 
 
-# Model-id prefixes that REQUIRE adaptive thinking (they reject the legacy
-# enabled+budget_tokens form with HTTP 400). Keyed on the config constants so it
-# stays correct as they're bumped: today these are Sonnet 5 / Opus 4.8. Matched
-# as prefixes so dated snapshot ids (e.g. "claude-sonnet-5-20260514") route the
-# same way. Any other model — Haiku 4.5, or a legacy Sonnet/Opus passed via
-# --model / AI_MODEL — takes the fixed-budget form, which those models accept.
-# NOTE: add any future adaptive-only model here when its constant is introduced.
-_ADAPTIVE_THINKING_MODEL_PREFIXES = (MODEL_SONNET, MODEL_OPUS)
+# Model-id prefixes whose thinking can't be turned off at all: an explicit
+# {"type": "disabled"} is a 400 (Fable/Mythos, Opus 5.5). Effort is the only
+# lever, so synthesis asks for low effort instead of disabling thinking.
+_THINKING_ALWAYS_ON_PREFIXES = ("claude-fable", "claude-mythos", MODEL_OPUS_5_5)
+
+# Model-id prefixes that still take the legacy enabled+budget_tokens form:
+# Haiku (which rejects adaptive), Claude 3.x, Sonnet 4.x and Opus 4.0-4.6.
+# Everything else — Sonnet 5, Opus 4.7+, Opus 5/5.5, Fable, Mythos, and any
+# model released after this list was written — gets adaptive thinking. The
+# list is of the PAST on purpose: an allowlist of adaptive models failed the
+# same way twice (every new model is adaptive-only and 400s on budget_tokens),
+# while the legacy set only shrinks. "claude-opus-4-2" is Opus 4.0's dated id
+# (claude-opus-4-20250514). Matched as prefixes so dated snapshot ids route
+# the same way.
+_LEGACY_THINKING_MODEL_PREFIXES = (
+    "claude-haiku", "claude-3", "claude-sonnet-4",
+    "claude-opus-4-0", "claude-opus-4-1", "claude-opus-4-2",
+    "claude-opus-4-5", "claude-opus-4-6",
+)
 
 
 def _requires_adaptive_thinking(model: str) -> bool:
@@ -107,15 +120,16 @@ def _requires_adaptive_thinking(model: str) -> bool:
     and require {"type": "adaptive"}. Single source of truth for the model-family
     split so the worker/supervisor call sites and the synthesis path can't drift.
     """
-    return model.startswith(_ADAPTIVE_THINKING_MODEL_PREFIXES)
+    return not model.startswith(_LEGACY_THINKING_MODEL_PREFIXES)
 
 
 def _thinking_config(model: str, budget_tokens: int, *, stream_to_ui: bool = False) -> dict:
     """Return the thinking parameter appropriate for the model.
 
     The two forms are mutually exclusive and each 400s on the wrong model:
-    - Adaptive-only models (Sonnet 5 / Opus 4.8) require {"type": "adaptive"}.
-    - Everything else (Haiku 4.5, legacy Sonnet/Opus) takes the fixed-budget form
+    - Adaptive-only models (Sonnet 5, Opus 4.7+, Fable, anything newer) require
+      {"type": "adaptive"}.
+    - Legacy models (Haiku 4.5, Sonnet 4.x, Opus 4.0-4.6) take the fixed-budget form
       {"type": "enabled", "budget_tokens": N}.
 
     ``stream_to_ui`` adds display="summarized" so adaptive thinking actually streams
@@ -128,6 +142,27 @@ def _thinking_config(model: str, budget_tokens: int, *, stream_to_ui: bool = Fal
             config["display"] = "summarized"
         return config
     return {"type": "enabled", "budget_tokens": budget_tokens}
+
+
+# Synthesis output ceiling. Always-on models spend thinking out of max_tokens
+# before any visible text, and the qa-verdict fence is the report's LAST
+# section — truncating it nulls the curated count — so they get headroom.
+SYNTHESIS_MAX_TOKENS = 16000
+SYNTHESIS_MAX_TOKENS_ALWAYS_ON = 32000
+
+
+def _synthesis_thinking_kwargs(model: str) -> dict:
+    """Request kwargs that keep synthesis thinking to the minimum the model allows.
+
+    Disabled where the model accepts it; low effort (which caps thinking, but
+    does not remove it) on always-on models, which 400 on "disabled"; nothing
+    on legacy models, which default to no thinking.
+    """
+    if model.startswith(_THINKING_ALWAYS_ON_PREFIXES):
+        return {"output_config": {"effort": "low"}}
+    if _requires_adaptive_thinking(model):
+        return {"thinking": {"type": "disabled"}}
+    return {}
 
 
 def _calculate_wait_time(backoff: float) -> float:
@@ -161,6 +196,8 @@ def fatal_api_error_reason(exc: Exception) -> str | None:
     "Complete". Returns None for everything else (rate limits, transient
     5xx, malformed requests), which stays on the normal retry path.
     """
+    if isinstance(exc, FatalProviderError):  # e.g. OpenRouter 401/402/403
+        return str(exc)
     if isinstance(exc, AuthenticationError):
         return "Anthropic rejected this API key — check it at console.anthropic.com"
     if isinstance(exc, PermissionDeniedError):
@@ -188,6 +225,13 @@ def _extract_token_usage(usage) -> dict:
         "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
         "cache_creation_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
     }
+
+
+def _as_blocks(content) -> list[dict]:
+    """Message content as a list of blocks (a bare string becomes one text block)."""
+    if isinstance(content, list):
+        return content
+    return [{"type": "text", "text": content}]
 
 
 def simplify_url(url: str) -> str:
@@ -232,15 +276,23 @@ class ClaudeProvider(AIProvider):
     @staticmethod
     def _build_messages_from_history(
         conversation_history: list[dict],
+        current_message: dict | None = None,
     ) -> list[dict]:
         """Build messages list from conversation history, stripping screenshots
         and windowing long histories.
 
+        History is stored in API order, one exchange per turn:
+        [user_1, assistant_1, ..., user_N, assistant_N] — each turn's prompt
+        (page state) followed by the action it produced — so the model reads
+        page -> action in order and only ``current_message`` follows the
+        cache breakpoint on assistant_N.
+
         Replaces **all** image blocks with a lightweight text placeholder.
-        Only the *current turn* (appended by the caller) carries a real
-        screenshot.  This keeps the text prefix stable across turns so that
-        Anthropic prompt-caching can reuse it, and avoids resending large
-        base64 payloads that the model has already seen.
+        Only the *current turn* (``current_message``, appended last and never
+        stripped) carries a real screenshot.  This keeps the text prefix
+        stable across turns so that Anthropic prompt-caching can reuse it,
+        and avoids resending large base64 payloads that the model has
+        already seen.
 
         Histories longer than HISTORY_WINDOW_MESSAGES are trimmed to a recent
         window (stepped boundary — see the constant's comment for the caching
@@ -248,21 +300,36 @@ class ClaudeProvider(AIProvider):
         omitted.  Windowing happens here, at message-build time, so the
         stored history stays complete for checkpoints and flow forking.
 
-        The original ``conversation_history`` is NOT mutated.
-        """
-        if not conversation_history:
-            return []
+        Consecutive same-role messages are merged into one (the API would
+        merge them anyway; doing it here keeps the request strictly
+        alternating for any provider reusing this). That covers the omission
+        note meeting a window that starts on a user message, and the worker's
+        one-off user notes (approval result on resume, data already
+        available) that sit between an assistant turn and the next prompt —
+        they join the current turn's user message after the breakpoint.
 
+        The original ``conversation_history`` and ``current_message`` are
+        NOT mutated.
+        """
         messages: list[dict] = []
 
-        window = conversation_history
-        if len(conversation_history) > HISTORY_WINDOW_MESSAGES:
-            over = len(conversation_history) - HISTORY_WINDOW_MESSAGES
+        def add(msg: dict) -> None:
+            if messages and messages[-1]["role"] == msg["role"]:
+                messages[-1] = {
+                    "role": msg["role"],
+                    "content": _as_blocks(messages[-1]["content"]) + _as_blocks(msg["content"]),
+                }
+            else:
+                messages.append(msg)
+
+        window = conversation_history or []
+        if len(window) > HISTORY_WINDOW_MESSAGES:
+            over = len(window) - HISTORY_WINDOW_MESSAGES
             # Round the drop count up to a step multiple so the boundary is
             # stable across several turns (prompt-cache friendly).
             drop = ((over + HISTORY_TRIM_STEP - 1) // HISTORY_TRIM_STEP) * HISTORY_TRIM_STEP
-            window = conversation_history[drop:]
-            messages.append({
+            window = window[drop:]
+            add({
                 "role": "user",
                 "content": [{
                     "type": "text",
@@ -279,9 +346,12 @@ class ClaudeProvider(AIProvider):
                         new_blocks.append({"type": "text", "text": "[Screenshot of page]"})
                     else:
                         new_blocks.append(block.copy())
-                messages.append({"role": msg["role"], "content": new_blocks})
+                add({"role": msg["role"], "content": new_blocks})
             else:
-                messages.append({"role": msg["role"], "content": content})
+                add({"role": msg["role"], "content": content})
+
+        if current_message is not None:
+            add(current_message)
 
         return messages
 
@@ -289,9 +359,10 @@ class ClaudeProvider(AIProvider):
     def _apply_cache_breakpoint(messages: list[dict]) -> None:
         """Mark the last assistant message as the prompt-cache breakpoint.
 
-        History is stored as [assistant_N, user_N, ...] so the last message
-        is always a user message.  Walk backwards to find the last assistant
-        turn and add cache_control to its final content block.
+        History is stored as [user_N, assistant_N, ...], so in a built
+        request the last assistant message is the previous turn's action and
+        only the current turn's user message follows it.  Walk backwards to
+        find it and add cache_control to its final content block.
 
         Mutates ``messages`` in place.
         """
@@ -389,6 +460,7 @@ class ClaudeProvider(AIProvider):
         credentials: dict[str, str] | None = None,
         user_data: dict[str, dict[str, str]] | None = None,
         known_issues: str = "",
+        recheck_context: str = "",
     ) -> AsyncGenerator[dict, None]:
         """
         Stream AI analysis for worker-based exploration.
@@ -414,7 +486,8 @@ class ClaudeProvider(AIProvider):
         # message). Two parts: the base is identical for every worker in a
         # run, the context is per-worker. They go in separate system blocks
         # with their own cache breakpoints so all workers share one cache
-        # entry for the ~4-5k-token base instead of each writing their own.
+        # entry for the base (~15.7K tokens on Sonnet 5, measured 2026-09)
+        # instead of each writing their own.
         system_base, system_worker_context = get_worker_system_prompt_parts(
             is_first_worker=is_first_worker,
             worker_number=worker_number,
@@ -425,6 +498,7 @@ class ClaudeProvider(AIProvider):
             run_nonce=self.run_nonce,
             current_date=self.run_date,
             known_issues=known_issues,
+            recheck_context=recheck_context,
         )
         system_prompt = system_base + system_worker_context  # for logging
 
@@ -465,11 +539,11 @@ class ClaudeProvider(AIProvider):
         }
 
         # Build complete messages: history (screenshots stripped) + current turn
-        messages = self._build_messages_from_history(conversation_history or [])
+        messages = self._build_messages_from_history(
+            conversation_history or [], current_message
+        )
 
         self._apply_cache_breakpoint(messages)
-
-        messages.append(current_message)
 
         # Track content as we stream
         full_thinking = ""
@@ -760,12 +834,19 @@ class ClaudeProvider(AIProvider):
         }
 
     def _format_history(self, action_history: list[dict]) -> str:
-        """Format action history for prompts."""
+        """Format action history for prompts.
+
+        Entries are numbered by their absolute position in the flow, the
+        same N the stored history stubs carry ("[Turn N — url]",
+        worker._history_turn_stub), so the model can match a recap entry to
+        its turn once the flow is past 10 actions."""
         if not action_history:
             return ""
 
+        recent = action_history[-10:]  # Last 10 actions
+        first_number = len(action_history) - len(recent) + 1
         lines = []
-        for i, action in enumerate(action_history[-10:], 1):  # Last 10 actions
+        for i, action in enumerate(recent, first_number):
             action_type = action.get("action_type", "unknown")
             reasoning = action.get("reasoning", "")
             # The worker records where an action ran as page_url (and the
@@ -1111,15 +1192,20 @@ class ClaudeProvider(AIProvider):
             # Synthesis doesn't need thinking, and it protects the 10% synthesis
             # cost reserve. On adaptive-only models (Sonnet 5 / Opus 4.8), omitting
             # the param would silently enable adaptive thinking (extra cost + a
-            # thinking block ahead of the report), so disable it explicitly. Haiku
-            # and legacy models default to no thinking when the param is omitted.
+            # thinking block ahead of the report), so disable it explicitly —
+            # except on always-on models, which 400 on "disabled": those get
+            # low effort (still some thinking, billed as output) and a larger
+            # max_tokens so it can't truncate the report. Haiku and legacy models
+            # default to no thinking when the param is omitted.
             # Same family check as _thinking_config so the two can't drift.
-            synthesis_kwargs = {}
-            if _requires_adaptive_thinking(self.model):
-                synthesis_kwargs["thinking"] = {"type": "disabled"}
+            synthesis_kwargs = _synthesis_thinking_kwargs(self.model)
             return await self.client.messages.create(
                 model=self.model,
-                max_tokens=16000,
+                max_tokens=(
+                    SYNTHESIS_MAX_TOKENS_ALWAYS_ON
+                    if self.model.startswith(_THINKING_ALWAYS_ON_PREFIXES)
+                    else SYNTHESIS_MAX_TOKENS
+                ),
                 system=[{
                     "type": "text",
                     "text": SYNTHESIS_SYSTEM_PROMPT,

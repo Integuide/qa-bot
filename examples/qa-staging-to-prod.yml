@@ -1,16 +1,43 @@
-# QA Bot - Staging to Production
+# QA Bot - Staging to Production (deploy gate)
 #
-# This workflow runs QA testing when:
+# Runs QA testing against staging when:
 # 1. A PR is opened from staging -> production
-# 2. Someone comments "@QABot" on a staging -> production PR
+# 2. A maintainer comments "@QABot" (at the START of the comment) on that PR
+#
+# Run shape:
+#  - mode=full  when the deploy changes the app under test: a Haiku call turns
+#               the PR description into a targeted goal (fractions of a cent)
+#               and the multi-agent exploration focuses on what changed.
+#  - mode=smoke when it doesn't (see FULL_MODE_PATHS below; empty = every
+#               deploy runs full): one turn-capped worker opens each top-level
+#               nav link once — 1 agent / 5 min / $0.75, goal ignored, report
+#               and PR comment tagged "SMOKE TEST ONLY — not a regression test".
+#  Both gates stay on in both modes: fail-on-critical (on the curated count
+#  when synthesis produced one) and fail-on-zero-flows (a run that tested
+#  nothing must never read as a green check).
+#
+# Run-over-run memory (two separate inputs, deliberately never merged):
+#  - known-issues    <- .qa-known-issues.md, checked into this repo (one issue
+#                       per line, `#` lines are comments; missing file = none).
+#                       Acknowledged findings / environment caveats are demoted
+#                       to one-line "observed again" notes. Acknowledging one is
+#                       a one-line PR. Describe the BEHAVIOR, keep entries narrow.
+#  - previous-report <- the newest `qa-bot-report-gate-<host>-<mode>` artifact,
+#                       uploaded below by every run that produced a report (green
+#                       or red). Findings are labelled NEW / recurring and the PR
+#                       footer prints "N new, M recurring". Labels only — never
+#                       copy a previous report into .qa-known-issues.md: that
+#                       would demote a regression found the run before.
 #
 # Setup:
 # 1. Copy this file to .github/workflows/qa-bot-staging-to-prod.yml
 # 2. Add ANTHROPIC_API_KEY to repository secrets
 # 3. Add QA_BOT_STAGING_URL as a repository variable (Settings > Variables)
-#
-# Note: This example uses lighter settings (3 agents, 15 min) than the main
-# workflow (5 agents, 20 min) for faster/cheaper runs. Adjust as needed.
+# 4. Optional: add a QA_BOT_CREDENTIALS secret, KEY=value per line (test
+#    account logins; HTTP_USERNAME / HTTP_PASSWORD for a basic-auth staging box)
+# 5. Optional: commit .qa-known-issues.md, and set FULL_MODE_PATHS below
+# 6. Branches not named staging / production? Change them in `on:`, the job
+#    `if:` and the "Get PR details" script.
 
 name: QA Bot - Staging to Production
 
@@ -23,6 +50,13 @@ on:
   issue_comment:
     types: [created]
 
+env:
+  # Extended regex (grep -E) over the PR's changed file paths. A deploy that
+  # touches none of them gets a smoke pass instead of a full exploration —
+  # e.g. '^(src|templates|static)/' so docs- or CI-only deploys don't pay for
+  # a full run. Empty = always full.
+  FULL_MODE_PATHS: ''
+
 # NOTE: Concurrency is set at the JOB level, not the workflow level.
 # Workflow-level concurrency groups are evaluated before job `if` conditions,
 # so any issue_comment (even non-@QABot ones) would cancel an in-progress
@@ -32,7 +66,8 @@ jobs:
   qa-test:
     # Run if:
     # 1. PR opened from staging branch, OR
-    # 2. Comment contains @QABot on a PR from staging
+    # 2. Comment STARTING with @QABot on a PR, by a maintainer (startsWith, not
+    #    contains, so discussing the bot mid-comment doesn't start a paid run)
     if: |
       (github.event_name == 'pull_request' && github.head_ref == 'staging') ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request && startsWith(github.event.comment.body, '@QABot') &&
@@ -46,19 +81,23 @@ jobs:
       cancel-in-progress: true
 
     runs-on: ubuntu-latest
+    # Must exceed the full-mode max-duration below by ~10 min (image build,
+    # setup and the graceful stop + report run on the same clock), or GitHub
+    # hard-cancels the job before the bot finishes. Keep the two in sync.
     timeout-minutes: 30
 
     permissions:
       contents: read
       pull-requests: write
-      issues: write  # For adding rocket emoji to triggering comment
+      issues: write   # Rocket reaction on the triggering comment
+      actions: read   # Find/download the previous run's report artifact
 
     steps:
       # For comment triggers, verify it's a staging -> production PR
       - name: Get PR details (comment trigger)
         if: github.event_name == 'issue_comment'
         id: pr-details
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const { data: pr } = await github.rest.pulls.get({
@@ -67,9 +106,17 @@ jobs:
               pull_number: context.issue.number
             });
 
+            // This repo's own staging branch only. The job checks out the PR
+            // head with secrets in scope (and reads .qa-known-issues.md from
+            // it; any step you add may run its code), so a fork PR whose
+            // branch happens to be named staging must not qualify.
+            // head.repo is null when the fork has been deleted.
+            const thisRepo = `${context.repo.owner}/${context.repo.repo}`;
+            const headRepo = pr.head.repo ? pr.head.repo.full_name : null;
+            const isSameRepo = headRepo === thisRepo;
             const isFromStaging = pr.head.ref === 'staging';
             const isToProduction = pr.base.ref === 'production';
-            const isValid = isFromStaging && isToProduction;
+            const isValid = isSameRepo && isFromStaging && isToProduction;
 
             if (!isValid) {
               core.setOutput('valid', 'false');
@@ -91,7 +138,7 @@ jobs:
       - name: Skip (not staging -> production)
         if: github.event_name == 'issue_comment' && steps.pr-details.outputs.valid == 'false'
         run: |
-          echo "::notice::@QABot only runs on PRs from staging to production"
+          echo "::notice::The deploy gate only runs on this repository's own staging -> production PRs (never a fork's: it checks out the PR head with secrets in scope)."
 
       - name: Check for target URL
         if: github.event_name == 'pull_request' || steps.pr-details.outputs.valid == 'true'
@@ -106,11 +153,11 @@ jobs:
 
       - name: Checkout repository
         if: github.event_name == 'pull_request' || steps.pr-details.outputs.valid == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ steps.pr-details.outputs.ref || github.event.pull_request.head.sha }}
 
-      - name: Get PR description
+      - name: Get PR description and run mode
         if: github.event_name == 'pull_request' || steps.pr-details.outputs.valid == 'true'
         id: pr-desc
         env:
@@ -131,42 +178,125 @@ jobs:
             echo "$DELIM"
           } >> $GITHUB_OUTPUT
 
+          # Full exploration only when the deploy changes the app under test
+          # (FULL_MODE_PATHS, above). If the file list can't be fetched, run
+          # full: a deploy gate should test more, not less, when unsure.
+          MODE=full
+          if [ -n "$FULL_MODE_PATHS" ]; then
+            if CHANGED=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename'); then
+              printf '%s\n' "$CHANGED" | grep -qE "$FULL_MODE_PATHS" || MODE=smoke
+            else
+              echo "::warning::Could not list the PR's changed files; running mode=full"
+            fi
+          fi
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+          echo "Run mode: $MODE"
+
+      - name: Load known issues and previous report
+        if: github.event_name == 'pull_request' || steps.pr-details.outputs.valid == 'true'
+        id: memory
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_URL: ${{ vars.QA_BOT_STAGING_URL }}
+          MODE: ${{ steps.pr-desc.outputs.mode }}
+          KNOWN_ISSUES_FILE: .qa-known-issues.md
+        run: |
+          # Known issues: the checked-in file (one per line, `#` lines are
+          # comments) — operator acknowledgement lives in one reviewable place.
+          KNOWN_ISSUES=""
+          if [ -f "$KNOWN_ISSUES_FILE" ]; then
+            KNOWN_ISSUES=$(grep -v '^[[:space:]]*#' "$KNOWN_ISSUES_FILE" | grep -v '^[[:space:]]*$' || true)
+          fi
+          echo "Known issues from $KNOWN_ISSUES_FILE: $(printf '%s' "$KNOWN_ISSUES" | grep -c '') entr(y/ies)"
+          DELIM="QABOT_$(dd if=/dev/urandom bs=15 count=1 status=none | base64)"
+          {
+            echo "known_issues<<$DELIM"
+            echo "$KNOWN_ISSUES"
+            echo "$DELIM"
+          } >> $GITHUB_OUTPUT
+
+          # Previous report: newest non-expired `qa-bot-report-gate-<host>-<mode>`
+          # artifact (uploaded below by every run that produced a report,
+          # whatever its conclusion — a red run's findings are exactly what
+          # the next run must label "recurring"). Per host AND mode so a full
+          # run is never compared against a smoke baseline. "None yet" and
+          # download failures just mean no labels this run.
+          HOST=$(echo "$TARGET_URL" | sed -E 's#^https?://##; s#[/:].*$##; s/[^A-Za-z0-9._-]/_/g')
+          ARTIFACT="qa-bot-report-gate-${HOST}-${MODE}"
+          echo "artifact_name=$ARTIFACT" >> $GITHUB_OUTPUT
+          PREVIOUS=""
+          RUN_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$ARTIFACT&per_page=50" \
+            --jq '[.artifacts[] | select(.expired | not)] | sort_by(.created_at) | last | .workflow_run.id // empty' 2>/dev/null || true)
+          if [ -n "$RUN_ID" ]; then
+            PREV_DIR="$RUNNER_TEMP/qa-bot-previous"
+            rm -rf "$PREV_DIR" && mkdir -p "$PREV_DIR"
+            if gh run download "$RUN_ID" -n "$ARTIFACT" -D "$PREV_DIR" && [ -f "$PREV_DIR/report.md" ]; then
+              PREVIOUS=$(head -c 20000 "$PREV_DIR/report.md")
+              echo "Previous report: $ARTIFACT from run $RUN_ID — findings will be labelled NEW / recurring"
+            else
+              echo "::notice::Could not download $ARTIFACT from run $RUN_ID; findings will not be labelled new/recurring this run"
+            fi
+          else
+            echo "No $ARTIFACT artifact yet (first run for this host/mode) — findings will not be labelled new/recurring"
+          fi
+          DELIM="QABOT_$(dd if=/dev/urandom bs=15 count=1 status=none | base64)"
+          {
+            echo "previous_report<<$DELIM"
+            echo "$PREVIOUS"
+            echo "$DELIM"
+          } >> $GITHUB_OUTPUT
+
       - name: Generate testing goal from PR
         if: github.event_name == 'pull_request' || steps.pr-details.outputs.valid == 'true'
         id: generate-goal
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TARGET_URL: ${{ vars.QA_BOT_STAGING_URL }}
           PR_TITLE_RAW: ${{ steps.pr-desc.outputs.pr_title }}
           PR_BODY_RAW: ${{ steps.pr-desc.outputs.pr_body }}
+          MODE: ${{ steps.pr-desc.outputs.mode }}
         run: |
-          # Build the payload entirely with jq so PR title/body (quotes,
-          # newlines, markdown) are escaped correctly inside the JSON string.
-          PAYLOAD=$(jq -n \
-            --arg title "$PR_TITLE_RAW" \
-            --arg body "$PR_BODY_RAW" \
-            '{
-              model: "claude-haiku-4-5",
-              max_tokens: 200,
-              messages: [{
-                role: "user",
-                content: ("You are generating a QA testing goal for an AI that will explore a website. Based on this PR being deployed to production, write a concise testing goal (1-2 sentences) that focuses on testing the changed functionality. Also mention testing general critical flows (login, navigation) to check for regressions. If the PR description is empty or unclear, return a general exploration goal.\n\nPR Title: \($title)\n\nPR Body:\n\($body)")
-              }]
-            }')
+          if [ "$MODE" = "full" ]; then
+            # Tailor this prompt: one sentence describing your product (what
+            # it is, what users mainly do, what the test account can and
+            # can't reach) markedly improves the goals. Prose lives in the
+            # shell variable, never inside the single-quoted jq program below:
+            # an apostrophe there ends the shell quoting, jq fails to compile
+            # and the step dies before the fallback goal can engage.
+            PROMPT="You are writing the testing goal for an AI QA bot that explores a website in a real browser as a black-box UI tester: it can only observe what an end user sees. This PR is being deployed from staging to production. Write a concise testing goal (1-2 sentences) naming the 2-3 most important user-facing changes it describes, most important first, with the navigation steps to reach any that are not obvious from the homepage. Omit backend-only changes (APIs, logging, infrastructure) or frame them only by their visible effect. Keep any condition the PR states (a change that applies only when X) - never restate conditional behavior as unconditional, or the bot will report a false regression. If the PR description is empty or unclear, return a general exploration goal covering the site's critical user flows."
+            PAYLOAD=$(jq -n \
+              --arg prompt "$PROMPT" \
+              --arg url "$TARGET_URL" \
+              --arg title "$PR_TITLE_RAW" \
+              --arg body "$PR_BODY_RAW" \
+              '{
+                model: "claude-haiku-4-5",
+                max_tokens: 200,
+                messages: [{
+                  role: "user",
+                  content: ($prompt + "\n\nTarget URL: " + $url + "\n\nPR Title: " + $title + "\n\nPR Body:\n" + $body)
+                }]
+              }')
 
-          RESPONSE=$(curl -sf https://api.anthropic.com/v1/messages \
-            -H "x-api-key: $ANTHROPIC_API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
-            -H "content-type: application/json" \
-            -d "$PAYLOAD") || echo "::warning::Goal generation API call failed (non-2xx response)"
+            RESPONSE=$(curl -sf https://api.anthropic.com/v1/messages \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              -d "$PAYLOAD") || echo "::warning::Goal generation API call failed (non-2xx response)"
 
-          GOAL=""
-          if [ -n "$RESPONSE" ]; then
-            GOAL=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
-          fi
+            GOAL=""
+            if [ -n "$RESPONSE" ]; then
+              GOAL=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+            fi
 
-          if [ -z "$GOAL" ]; then
-            GOAL="Explore user flows and find bugs, broken elements, or usability problems."
-            echo "::warning::Goal generation failed, using default goal"
+            if [ -z "$GOAL" ]; then
+              GOAL="Explore user flows and find bugs, broken elements, or usability problems."
+              echo "::warning::Goal generation failed, using default goal"
+            fi
+          else
+            # Smoke mode: the bot's goal is fixed (open each top-level nav
+            # link once) and this value is ignored — no LLM call needed.
+            GOAL="(smoke mode: goal fixed by the bot)"
           fi
 
           # Random heredoc delimiter (GitHub's hardening guidance): the goal
@@ -186,22 +316,52 @@ jobs:
         with:
           url: ${{ vars.QA_BOT_STAGING_URL }}
           goal: ${{ steps.generate-goal.outputs.goal }}
-          max-agents: '3'
-          max-duration: '15'
+          mode: ${{ steps.pr-desc.outputs.mode }}
+          # Full-mode limits (lighter than the 5-agent / 20-min monorepo gate;
+          # adjust, and keep timeout-minutes ~10 min above max-duration).
+          # Empty in smoke mode = the smoke defaults (1 agent / 5 min / $0.75).
+          max-agents: ${{ steps.pr-desc.outputs.mode == 'full' && '3' || '' }}
+          max-duration: ${{ steps.pr-desc.outputs.mode == 'full' && '15' || '' }}
+          # Run-over-run memory (see header). Never merged: a regression found
+          # last run must not be demoted this run.
+          known-issues: ${{ steps.memory.outputs.known_issues }}
+          previous-report: ${{ steps.memory.outputs.previous_report }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           github-token: ${{ github.token }}
+          # Empty when the secret isn't set. Every line is shown to the AI and
+          # typed into the tested site's forms: test accounts only.
+          credentials: ${{ secrets.QA_BOT_CREDENTIALS }}
           fail-on-critical: 'true'
+          fail-on-zero-flows: 'true'
 
+      # The PR comment tells reviewers to download this artifact whenever
+      # issue screenshots were captured. Screenshots can show pages behind
+      # the test login — drop this step if repo readers shouldn't see them.
       - name: Upload issue screenshots
-        if: always() && steps.qa.outcome != 'cancelled'
-        uses: actions/upload-artifact@v4
+        if: always() && steps.qa.outcome != 'cancelled' && steps.qa.outcome != 'skipped'
+        uses: actions/upload-artifact@v7
         with:
           name: qa-bot-screenshots
           path: qa-bot-screenshots/
           if-no-files-found: ignore
 
-      - name: Summary
-        if: always() && steps.qa.outcome != 'cancelled'
+      # The next run reads this back as `previous-report` (stable name per
+      # host + mode). report.md and summary.json are credential-masked by the
+      # bot before export. Uploaded for red runs too: their findings are what
+      # the next run must label "recurring".
+      - name: Upload report for the next run
+        if: always() && steps.qa.outcome != 'cancelled' && steps.qa.outcome != 'skipped' && steps.memory.outputs.artifact_name != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.memory.outputs.artifact_name }}
+          path: |
+            qa-bot-screenshots/report.md
+            qa-bot-screenshots/summary.json
+          if-no-files-found: ignore
+          overwrite: true
+
+      - name: Write job summary
+        if: always() && steps.qa.outcome != 'cancelled' && steps.qa.outcome != 'skipped'
         env:
           TARGET_URL: ${{ vars.QA_BOT_STAGING_URL }}
           FLOWS: ${{ steps.qa.outputs.flows-explored }}
@@ -209,10 +369,18 @@ jobs:
           CRITICAL: ${{ steps.qa.outputs.critical-issues }}
           CURATED: ${{ steps.qa.outputs.curated-critical-issues }}
           QA_OUTCOME: ${{ steps.qa.outcome }}
+          MODE: ${{ steps.qa.outputs.mode }}
+          NEW_FINDINGS: ${{ steps.qa.outputs.new-findings }}
+          RECURRING_FINDINGS: ${{ steps.qa.outputs.recurring-findings }}
         run: |
-          echo "### QA Bot Results" >> $GITHUB_STEP_SUMMARY
+          if [ "$MODE" = "smoke" ]; then
+            echo "## QA Bot Results — SMOKE TEST ONLY (not a regression test)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## QA Bot Results" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Target:** $TARGET_URL" >> $GITHUB_STEP_SUMMARY
+          echo "**Mode:** ${MODE:-full}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
@@ -220,14 +388,31 @@ jobs:
           echo "| Issues Found | ${ISSUES:-0} |" >> $GITHUB_STEP_SUMMARY
           echo "| Critical (raw worker findings) | ${CRITICAL:-0} |" >> $GITHUB_STEP_SUMMARY
           echo "| Critical (after curation) | ${CURATED:-n/a} |" >> $GITHUB_STEP_SUMMARY
+          SINCE_PREVIOUS="n/a"
+          [ -n "$NEW_FINDINGS" ] && SINCE_PREVIOUS="$NEW_FINDINGS new, $RECURRING_FINDINGS recurring"
+          echo "| Since previous run | $SINCE_PREVIOUS |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          # fail-on-critical gates on the curated count when present, else raw.
+          # fail-on-critical gates on the curated count when present, else
+          # raw; the verdict below uses the same number so it agrees with
+          # the check.
           GATE="${CURATED:-${CRITICAL:-0}}"
           # A run that tested nothing (or crashed) must not read as a pass.
           if [ -z "$FLOWS" ] || [ "$FLOWS" = "0" ]; then
             echo "> [!CAUTION]" >> $GITHUB_STEP_SUMMARY
-            echo "> The target was **NOT tested** — 0 user flows were explored. This deploy has not been verified; see the PR comment and the run logs." >> $GITHUB_STEP_SUMMARY
-          elif [ "$QA_OUTCOME" = "failure" ] && [ "$GATE" -eq 0 ]; then
+            echo "> The target was **NOT tested** — 0 user flows were explored (unreachable target, missing credentials, limit hit before any flow finished, or a crashed run). This deploy has not been verified; see the PR comment and the run logs." >> $GITHUB_STEP_SUMMARY
+          elif [ "$GATE" -gt 0 ]; then
             echo "> [!CAUTION]" >> $GITHUB_STEP_SUMMARY
-            echo "> The QA step failed after exploring $FLOWS flow(s) — results are incomplete. See the run logs." >> $GITHUB_STEP_SUMMARY
+            echo "> Critical issues found! Review the PR comment for details." >> $GITHUB_STEP_SUMMARY
+          elif [ "$QA_OUTCOME" = "failure" ]; then
+            echo "> [!CAUTION]" >> $GITHUB_STEP_SUMMARY
+            echo "> The QA step failed after exploring $FLOWS flow(s) — results are incomplete and this deploy has not been verified. See the run logs." >> $GITHUB_STEP_SUMMARY
+          elif [ "${ISSUES:-0}" -gt 0 ]; then
+            echo "> [!WARNING]" >> $GITHUB_STEP_SUMMARY
+            echo "> Non-critical issues found. Review before merging." >> $GITHUB_STEP_SUMMARY
+          elif [ "$MODE" = "smoke" ]; then
+            echo "> [!NOTE]" >> $GITHUB_STEP_SUMMARY
+            echo "> Smoke test passed — SMOKE TEST ONLY, not a regression test. The site loads and its top-level pages render without server errors or console exceptions; this deploy's own changes were NOT explored." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "> [!TIP]" >> $GITHUB_STEP_SUMMARY
+            echo "> No issues found! Safe to merge." >> $GITHUB_STEP_SUMMARY
           fi

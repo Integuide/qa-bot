@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-from qa_bot.utils.secrets import redact_values
+from qa_bot.utils.secrets import redact_obj, redact_values
 
 
 # Query parameters that may contain sensitive data and should be masked
@@ -184,13 +184,7 @@ class ChatLogger:
     def _redact_obj(self, obj):
         """Redact every string inside a nested dict/list (before JSON-encoding,
         so a secret containing quotes or non-ASCII isn't hidden by escaping)."""
-        if isinstance(obj, str):
-            return self._redact(obj)
-        if isinstance(obj, dict):
-            return {k: self._redact_obj(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [self._redact_obj(v) for v in obj]
-        return obj
+        return redact_obj(obj, self._secret_values)
 
     def _cleanup_old_logs(self):
         """Remove old exploration logs, keeping only the most recent ones."""

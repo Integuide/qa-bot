@@ -43,16 +43,41 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 MODEL_HAIKU = "claude-haiku-4-5"
 MODEL_SONNET = "claude-sonnet-5"
 MODEL_OPUS = "claude-opus-4-8"
+# Selectable via --model / AI_MODEL / the manual workflow, never defaults.
+MODEL_OPUS_5_5 = "claude-opus-5-5"
+MODEL_FABLE = "claude-fable-5-1"
+MODEL_FABLE_5 = "claude-fable-5"
 DEFAULT_MODEL = MODEL_SONNET
 
 AI_MODEL = os.getenv("AI_MODEL", DEFAULT_MODEL)
 
+# OpenRouter: any "vendor/slug" model id (a Claude id never has a slash) runs
+# on OpenRouterProvider instead of Claude — CLI / GitHub Action only, never a
+# default. Screenshots, page text and test credentials in prompts then go to
+# OpenRouter and the model vendor, not Anthropic.
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+MODEL_GPT6_LUNA = "openai/gpt-6-luna"
+# Reasoning effort per role ("minimal"/"low"/"medium"/"high"/"xhigh"; empty =
+# the model's default). Workers default to high to match Sonnet 5's default
+# adaptive effort, so a Luna-vs-Sonnet A/B compares like with like.
+OPENROUTER_WORKER_EFFORT = os.getenv("OPENROUTER_WORKER_EFFORT", "high").strip()
+OPENROUTER_SUPERVISOR_EFFORT = os.getenv("OPENROUTER_SUPERVISOR_EFFORT", "low").strip()
+OPENROUTER_SYNTHESIS_EFFORT = os.getenv("OPENROUTER_SYNTHESIS_EFFORT", "low").strip()
+# Per-request timeout. Calls are non-streaming, so this bounds a whole reply.
+OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "300"))
+
+
+def is_openrouter_model(model: str) -> bool:
+    """True for OpenRouter "vendor/slug" ids (openai/gpt-6-luna)."""
+    return "/" in (model or "")
+
 # Model pricing per million tokens (USD)
 # Used for cost tracking and Max Cost -> Max Tokens conversion
-# Source: https://platform.claude.com/docs/en/about-claude/pricing (Jul 2026)
-# Rates are sticker prices. Sonnet 5 has an introductory $2/$10 discount through
-# 2026-08-31, but we bill the cost cap at sticker rates so it stays conservative
-# (a run is estimated slightly high, never low). Note: Sonnet 5's tokenizer emits
+# Source: https://platform.claude.com/docs/en/about-claude/pricing (Jul 2026;
+# Sonnet 5 re-checked 2026-09-23: "The $2/$10 per million input/output token
+# pricing for Claude Sonnet 5, announced at launch as introductory pricing
+# through August 31, 2026, is now the standard price. The previously scheduled
+# increase to $3/$15 ... will not occur."). Note: Sonnet 5's tokenizer emits
 # ~30% more tokens for the same text than Haiku/Sonnet 4.6, so a given dollar cap
 # buys less exploration than the raw per-token rate ratio suggests.
 MODEL_PRICING: dict[str, dict[str, float]] = {
@@ -64,11 +89,11 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
         "estimated_blended": 2.2,  # For max cost conversion (~70% input, ~30% output)
     },
     MODEL_SONNET: {
-        "input": 3.0,           # $3/MTok for input tokens
-        "output": 15.0,         # $15/MTok for output tokens
-        "cache_read": 0.30,     # $0.30/MTok (10% of input)
-        "cache_creation": 3.75,    # $3.75/MTok (125% of input)
-        "estimated_blended": 6.6,  # For max cost conversion (~70% input, ~30% output)
+        "input": 2.0,           # $2/MTok for input tokens
+        "output": 10.0,         # $10/MTok for output tokens
+        "cache_read": 0.20,     # $0.20/MTok (10% of input)
+        "cache_creation": 2.50,    # $2.50/MTok (125% of input)
+        "estimated_blended": 4.4,  # For max cost conversion (~70% input, ~30% output)
     },
     MODEL_OPUS: {
         "input": 5.0,           # $5/MTok for input tokens
@@ -77,20 +102,57 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
         "cache_creation": 6.25,    # $6.25/MTok (125% of input)
         "estimated_blended": 11.0,  # For max cost conversion (~70% input, ~30% output)
     },
+    MODEL_OPUS_5_5: {
+        "input": 4.0,           # $4/MTok for input tokens
+        "output": 20.0,         # $20/MTok for output tokens
+        "cache_read": 0.20,     # $0.20/MTok (5% of input)
+        "cache_creation": 5.0,     # $5/MTok (125% of input)
+        "estimated_blended": 8.8,  # For max cost conversion (~70% input, ~30% output)
+    },
+    MODEL_FABLE: {
+        "input": 10.0,          # $10/MTok for input tokens
+        "output": 50.0,         # $50/MTok for output tokens
+        "cache_read": 0.25,     # $0.25/MTok (2.5% of input)
+        "cache_creation": 12.5,    # $12.50/MTok (125% of input)
+        "estimated_blended": 22.0,  # For max cost conversion (~70% input, ~30% output)
+    },
+    MODEL_FABLE_5: {
+        "input": 10.0,          # $10/MTok for input tokens
+        "output": 50.0,         # $50/MTok for output tokens
+        "cache_read": 1.0,      # $1/MTok (10% of input)
+        "cache_creation": 12.5,    # $12.50/MTok (125% of input)
+        "estimated_blended": 22.0,  # For max cost conversion (~70% input, ~30% output)
+    },
+    # GPT-6 Luna via OpenRouter (openrouter.ai/api/v1/models, read 2026-09-23).
+    # Without this row the unknown-model fallback prices Luna at the per-field
+    # maximum and the cost cap trips ~100x early. Prompts over 272K tokens bill
+    # 2x input / 1.5x output; worker requests stay far below that, so it is not
+    # modelled. OpenRouter's own usage.cost is reported as charged_cost_usd.
+    MODEL_GPT6_LUNA: {
+        "input": 0.10,          # $0.10/MTok for input tokens
+        "output": 0.50,         # $0.50/MTok for output tokens (reasoning included)
+        "cache_read": 0.01,     # $0.01/MTok (10% of input)
+        "cache_creation": 0.125,   # $0.125/MTok (125% of input)
+        "estimated_blended": 0.22,  # For max cost conversion (~70% input, ~30% output)
+    },
 }
 
-# Fallback pricing for unknown models. Deliberately the most expensive known
-# rates (Opus) rather than the default model's: an unpriced model must tighten
-# the cost cap, never loosen it. If a run's model is missing from MODEL_PRICING,
-# billing it at cheaper rates would silently let the run blow past its dollar cap.
-DEFAULT_MODEL_PRICING = MODEL_PRICING[MODEL_OPUS]
+# Fallback pricing for unknown models: the per-FIELD maximum over every known
+# row, not any one model's rates. An unpriced model must tighten the cost cap,
+# never loosen it — and no single row is the most expensive on every field
+# (Fable 5.1 has the top input/output but a 0.025x cache read), so picking a
+# model rots the moment a row is added.
+DEFAULT_MODEL_PRICING: dict[str, float] = {
+    field: max(rates[field] for rates in MODEL_PRICING.values())
+    for field in next(iter(MODEL_PRICING.values()))
+}
 
 
 def get_model_pricing(model: str) -> dict[str, float]:
     """Get pricing for a model, with fallback to the most expensive known rates."""
     if model not in MODEL_PRICING:
         logger.warning(
-            f"Unknown model '{model}', using most-expensive ({MODEL_OPUS}) pricing "
+            f"Unknown model '{model}', using the most-expensive known rates "
             f"for cost calculation so the cost cap stays conservative"
         )
     return MODEL_PRICING.get(model, DEFAULT_MODEL_PRICING)
@@ -150,6 +212,27 @@ MAX_AGENTS = max(1, min(20, _max_agents_raw))  # Clamp to 1-20 range
 MAX_DURATION_MINUTES = int(os.getenv("MAX_DURATION_MINUTES", "30"))  # 30 minutes default
 MAX_CONCURRENT_API_CALLS = int(os.getenv("MAX_CONCURRENT_API_CALLS", "2"))  # Limit concurrent Anthropic API calls
 MAX_COST_CAP_USD = 200.0  # Maximum allowed cost per run (safety cap)
+# Past worker turns go into conversation history as a compact stub (turn, URL,
+# one-off context) instead of the full action prompt — see HISTORY_TURN_STUB in
+# orchestrator/worker.py. HISTORY_COMPACTION=false stores full prompts (A/B).
+HISTORY_COMPACTION = os.getenv("HISTORY_COMPACTION", "true").lower() == "true"
+
+
+def recheck_criticals_default(interactive: bool) -> bool:
+    """Whether CRITICAL findings get an independent re-check this run.
+
+    ``RECHECK_CRITICALS`` = ``true`` / ``false`` forces it; unset or
+    ``auto`` means on for non-interactive runs (CLI/CI — a false critical
+    fails the deploy gate with no human in the loop) and off for the web UI
+    (a human is watching and judges the finding). Read at call time so a
+    workflow step's ``env:`` reaches the action's container.
+    """
+    value = os.getenv("RECHECK_CRITICALS", "auto").strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return not interactive
 
 # Production Safeguards
 MAX_CONCURRENT_EXPLORATIONS = int(os.getenv("MAX_CONCURRENT_EXPLORATIONS", "3"))  # Max parallel exploration sessions

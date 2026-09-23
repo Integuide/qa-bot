@@ -52,6 +52,7 @@ class AgentAction(BaseModel):
         "close_popup",     # Close active popup window
         "request_data",    # Request data from user (credentials, codes, etc.)
         "set_http_auth",   # Apply HTTP Basic Auth using provided credential keys
+        "recheck_result",  # Re-check flows only: record the verdict (terminal)
     ]
     reasoning: str = ""
 
@@ -114,6 +115,10 @@ class AgentAction(BaseModel):
     username_key: Optional[str] = None  # Credential key to use as username
     password_key: Optional[str] = None  # Credential key to use as password
 
+    # For recheck_result action (independent re-check of a CRITICAL finding);
+    # the evidence goes in `reason`
+    recheck_outcome: Optional[Literal["reproduced", "not_reproduced", "inconclusive"]] = None
+
     @model_validator(mode="after")
     def _require_element_target(self) -> "AgentAction":
         """Element-targeting actions must carry a ref or a coordinate.
@@ -132,6 +137,11 @@ class AgentAction(BaseModel):
                 f'"coordinate" [x, y] read from the screenshot. Pick an '
                 f"element from the current list."
             )
+        if self.action_type == "recheck_result" and self.recheck_outcome is None:
+            raise ValueError(
+                'recheck_result needs "recheck_outcome": one of "reproduced", '
+                '"not_reproduced" or "inconclusive", plus the evidence in "reason".'
+            )
         return self
 
 
@@ -142,8 +152,21 @@ class WorkerActionResponse(BaseModel):
     thinking: str = ""
 
 
+class FatalProviderError(Exception):
+    """An API error no retry can fix — a rejected key, an account with no
+    credit. Raised by providers without an SDK error class of their own;
+    ``fatal_api_error_reason`` returns its message, so the worker aborts the
+    whole run (``SharedFlowState.abort``) instead of retrying the flow. The
+    message must say what to fix."""
+
+
 class AIProvider(ABC):
     """Abstract base class for AI vision providers."""
+
+    # The real charge the provider's API reported for this run, in USD —
+    # None when it reports none (Anthropic); the token-priced estimate is
+    # computed separately from config.MODEL_PRICING either way.
+    charged_cost_usd: Optional[float] = None
 
     @abstractmethod
     async def analyze_for_worker_stream(
@@ -167,13 +190,16 @@ class AIProvider(ABC):
         credentials: dict[str, str] = None,
         user_data: dict[str, dict[str, str]] = None,
         known_issues: str = "",
+        recheck_context: str = "",
     ) -> AsyncGenerator[dict, None]:
         """
         Stream AI analysis for worker-based exploration.
 
         The AI receives a screenshot (for visual analysis) and a text list
         of interactive elements with ref numbers, and outputs a structured
-        JSON action to execute.
+        JSON action to execute. ``recheck_context`` (a re-check flow's
+        assignment, see prompts.format_recheck_context) replaces the usual
+        per-worker assignment block.
 
         Yields events:
             {"type": "thinking_start"}

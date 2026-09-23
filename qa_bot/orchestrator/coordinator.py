@@ -15,8 +15,10 @@ from qa_bot.orchestrator.worker import FlowExplorationWorker
 from qa_bot.orchestrator.supervisor import SupervisorAgent
 from qa_bot.orchestrator.synthesis import SynthesisAgent, apply_smoke_tag, format_duration
 from qa_bot.orchestrator.flow import FlowTask, FlowStatus
-from qa_bot.config import VIEWPORT_WIDTH, VIEWPORT_HEIGHT, LOG_CHAT_HISTORY, LOG_DIR, LOG_SCREENSHOTS, LOG_MAX_RUNS, ENVIRONMENT, TESTMAIL_API_KEY, TESTMAIL_NAMESPACE, MAX_COST_CAP_USD, DEFAULT_MODEL
+from qa_bot.orchestrator.recheck import RECHECK_SLOTS
+from qa_bot.config import VIEWPORT_WIDTH, VIEWPORT_HEIGHT, LOG_CHAT_HISTORY, LOG_DIR, LOG_SCREENSHOTS, LOG_MAX_RUNS, ENVIRONMENT, TESTMAIL_API_KEY, TESTMAIL_NAMESPACE, MAX_COST_CAP_USD, DEFAULT_MODEL, recheck_criticals_default
 from qa_bot.utils.chat_logger import ChatLogger
+from qa_bot.utils.secrets import redact_obj, redact_values
 from qa_bot.services.email_service import EmailService
 
 # summary.json statuses that mean the run has finished. Anything else left on
@@ -32,10 +34,14 @@ def _count_flows_explored(all_flows) -> int:
     ``is_first_worker``) is excluded: its only job is flow enumeration, so
     counting it let a run where nothing but flow-mapping finished report
     ``flows_explored=1`` and slip past the action's fail-on-zero-flows gate.
+    Independent re-check flows (``recheck_of``) verify one finding and are
+    excluded for the same reason.
     """
     return len([
         f for f in all_flows
-        if f.status == FlowStatus.COMPLETED and not f.is_first_worker
+        if f.status == FlowStatus.COMPLETED
+        and not f.is_first_worker
+        and not f.recheck_of
     ])
 
 
@@ -208,6 +214,11 @@ class FlowExplorationOrchestrator:
         self._active_worker_tasks: set[asyncio.Task] = set()
         # Worker number pool: recycles numbers 1 through max_agents
         self._available_worker_numbers: set[int] = set()
+        # Slot(s) reserved for independent re-checks of critical findings, on
+        # top of max_agents, with their own worker numbers (see
+        # _reset_recheck_slots)
+        self._recheck_semaphore: Optional[asyncio.Semaphore] = None
+        self._recheck_worker_numbers: set[int] = set()
         self._supervisor: Optional[SupervisorAgent] = None
         self._supervisor_task: Optional[asyncio.Task] = None
         self._event_queue: Optional[asyncio.Queue] = None
@@ -245,6 +256,7 @@ class FlowExplorationOrchestrator:
         known_issues: str = "",
         smoke: bool = False,
         previous_report: str = "",
+        recheck_criticals: Optional[bool] = None,
     ) -> AsyncGenerator[dict, None]:
         """
         Run flow-based parallel exploration of target URL.
@@ -263,9 +275,15 @@ class FlowExplorationOrchestrator:
         target; synthesis labels findings NEW / recurring against it. It is
         deliberately NOT merged into ``known_issues`` — a regression found in
         the previous run must not be demoted on this one.
+
+        ``recheck_criticals`` turns on the independent re-check of CRITICAL
+        findings (orchestrator/recheck.py); None means the default —
+        ``RECHECK_CRITICALS`` env, else on for non-interactive runs only.
         """
         if smoke:
             goal = SMOKE_GOAL
+        if recheck_criticals is None:
+            recheck_criticals = recheck_criticals_default(self._interactive)
         num_agents = max_agents or self.max_agents
         # Clamp to the same 1-20 range config.py enforces on the MAX_AGENTS env
         # var (defense-in-depth): the CLI --max-agents flag and the GitHub
@@ -285,6 +303,7 @@ class FlowExplorationOrchestrator:
 
         # Initialize worker number pool (1 through num_agents)
         self._available_worker_numbers = set(range(1, num_agents + 1))
+        self._reset_recheck_slots(num_agents)
 
         # Get model from AI provider for cost tracking
         model = getattr(self.ai, 'model', DEFAULT_MODEL)
@@ -305,6 +324,7 @@ class FlowExplorationOrchestrator:
             known_issues=known_issues,
             smoke=smoke,
             previous_report=previous_report,
+            recheck_criticals=recheck_criticals,
         )
 
         # Initialize chat logger if enabled (before credentials are set, so
@@ -350,6 +370,7 @@ class FlowExplorationOrchestrator:
                 "has_known_issues": bool(known_issues),
                 "has_previous_report": bool(previous_report),
                 "mode": "smoke" if smoke else "full",
+                "recheck_criticals": recheck_criticals,
                 "credential_keys": list(self._initial_credentials.keys()) if self._initial_credentials else [],
                 "timestamp": datetime.now().isoformat()
             }
@@ -551,6 +572,7 @@ class FlowExplorationOrchestrator:
                         self._available_worker_numbers = set(range(1, num_agents + 1))
                         # Reset semaphore to full capacity for fresh start
                         self._worker_semaphore = asyncio.Semaphore(num_agents)
+                        self._reset_recheck_slots(num_agents)
 
                         # Continue the main loop - will spawn workers for any pending flows
                         continue
@@ -634,6 +656,13 @@ class FlowExplorationOrchestrator:
             # queue unbounded for the whole synthesis await. Stop it first.
             await self._stop_supervisor()
 
+            # Every worker has exited: a re-check still queued or cut off
+            # settles inconclusive (its critical stays critical) so no
+            # finding reaches the report or the gate still "pending"
+            for event in await self._finalize_rechecks():
+                _log_event(event)
+                yield event
+
             event = {
                 "type": "synthesis_started",
                 "data": {"timestamp": datetime.now().isoformat()}
@@ -654,6 +683,7 @@ class FlowExplorationOrchestrator:
                 report, verdict = await synthesis.generate_report_with_verdict(
                     self._shared_state
                 )
+                report, verdict = self._mask_secrets(report, verdict)
                 self._persist_report(report)
                 event = {
                     "type": "synthesis_complete",
@@ -698,7 +728,8 @@ class FlowExplorationOrchestrator:
                     "total_actions": self._shared_state.total_actions,
                     "duration_seconds": (datetime.now() - self._shared_state.start_time).total_seconds(),
                     "final_progress": final_progress,
-                    "synthesis_report": report
+                    "synthesis_report": report,
+                    "recheck_summary": self._shared_state.recheck_summary(),
                 }
             }
             _log_event(event)
@@ -778,11 +809,26 @@ class FlowExplorationOrchestrator:
                 )
             await self._cleanup()
 
-    async def _spawn_worker_for_flow(self, flow_task: FlowTask, is_first_worker: bool = False):
+    def _reset_recheck_slots(self, num_agents: int):
+        """(Re)create the re-check slot(s): numbered after the regular
+        workers, so worker ids stay unique across both pools."""
+        self._recheck_semaphore = asyncio.Semaphore(RECHECK_SLOTS)
+        self._recheck_worker_numbers = set(
+            range(num_agents + 1, num_agents + 1 + RECHECK_SLOTS)
+        )
+
+    async def _spawn_worker_for_flow(
+        self,
+        flow_task: FlowTask,
+        is_first_worker: bool = False,
+        recheck_slot: bool = False,
+    ):
         """Spawn a dedicated worker for a specific flow.
 
         The is_first_worker flag is read from the flow_task if set there,
         otherwise falls back to the parameter (for backward compatibility).
+        ``recheck_slot`` runs the worker in a reserved re-check slot instead
+        of a regular one.
         """
         # Acquire semaphore slot (blocks if at max workers).
         # Capture the semaphore and number pool objects so the worker's
@@ -790,8 +836,12 @@ class FlowExplorationOrchestrator:
         # replaces both after a 15s grace period; without this, a straggler
         # worker finishing after resume would over-credit the new semaphore
         # beyond max_agents and exhaust the worker number pool.
-        semaphore = self._worker_semaphore
-        number_pool = self._available_worker_numbers
+        if recheck_slot:
+            semaphore = self._recheck_semaphore
+            number_pool = self._recheck_worker_numbers
+        else:
+            semaphore = self._worker_semaphore
+            number_pool = self._available_worker_numbers
         await semaphore.acquire()
 
         # Re-check the supervisor skip set after the (possibly long) semaphore
@@ -910,6 +960,15 @@ class FlowExplorationOrchestrator:
             # this will block until a slot is free, which is acceptable
             await self._spawn_worker_for_flow(flow_task)
 
+        # A queued re-check of a critical finding never waits for a user flow
+        # to finish: it decides the gate and must end inside the run's
+        # budget, so it also has slot(s) of its own.
+        while self._recheck_semaphore is not None and not self._recheck_semaphore.locked():
+            recheck_task = await self._shared_state.claim_pending_recheck()
+            if recheck_task is None:
+                break
+            await self._spawn_worker_for_flow(recheck_task, recheck_slot=True)
+
     def _is_exploration_complete(self) -> bool:
         """Check if exploration is complete.
 
@@ -976,6 +1035,7 @@ class FlowExplorationOrchestrator:
         )
         if self._shared_state.smoke:
             report = apply_smoke_tag(report)
+        report, _ = self._mask_secrets(report, None)
         self._persist_report(report)
         event = {
             "type": "synthesis_complete",
@@ -1025,6 +1085,7 @@ class FlowExplorationOrchestrator:
         if self._shared_state.total_actions == 0 and not all_issues:
             return []
 
+        events = await self._finalize_rechecks()
         all_flows = await self._shared_state.get_all_flows()
         flow_tree = await self._shared_state.get_flow_tree()
 
@@ -1040,7 +1101,6 @@ class FlowExplorationOrchestrator:
         except Exception as synth_error:
             logger.warning(f"Salvage synthesis failed: {synth_error}")
 
-        events = []
         if report:
             report = (
                 "> **Warning:** QA Bot encountered an error during this run and "
@@ -1048,6 +1108,7 @@ class FlowExplorationOrchestrator:
                 ">\n"
                 f"> `{error[:300]}`\n\n"
             ) + report
+            report, verdict = self._mask_secrets(report, verdict)
             self._persist_report(report)
             # CLI captures the report from synthesis_complete
             events.append({
@@ -1080,10 +1141,30 @@ class FlowExplorationOrchestrator:
                 "total_actions": self._shared_state.total_actions,
                 "duration_seconds": (datetime.now() - self._shared_state.start_time).total_seconds(),
                 "final_progress": final_progress,
-                "synthesis_report": report
+                "synthesis_report": report,
+                "recheck_summary": self._shared_state.recheck_summary(),
             }
         })
         return events
+
+    async def _finalize_rechecks(self) -> list[dict]:
+        """`recheck_result` events for re-checks settled at the end of the run."""
+        return [
+            {"type": "recheck_result", "flow_id": data.get("flow_id"), "data": data}
+            for data in await self._shared_state.finalize_rechecks()
+        ]
+
+    def _mask_secrets(
+        self, report: Optional[str], verdict: Optional[dict]
+    ) -> tuple[Optional[str], Optional[dict]]:
+        """Mask known secret values in the report and the verdict before
+        ``synthesis_complete`` carries them out. The report becomes the PR
+        comment, the action's ``report`` output and the CI log; the
+        verdict's titles become the ``::error::`` line. Until now only
+        report.md / summary.json were masked (by the chat logger), and a run
+        can be handed a live API key as a credential."""
+        secrets = self._shared_state.get_secret_values() if self._shared_state else ()
+        return redact_values(report, secrets), redact_obj(verdict, secrets)
 
     def _persist_report(self, report: Optional[str]):
         """Persist the synthesis report to report.md (best-effort)."""
@@ -1107,6 +1188,9 @@ class FlowExplorationOrchestrator:
         if not self._shared_state or not self._shared_state.chat_logger:
             return
 
+        # The provider API's own reported charge (OpenRouter's usage.cost);
+        # None for Claude, whose cost is only the token-priced estimate.
+        charged_cost_usd = getattr(self.ai, "charged_cost_usd", None)
         summary = {
             "exploration_id": progress.get("exploration_id", ""),
             "url": progress.get("target_url", ""),
@@ -1117,6 +1201,10 @@ class FlowExplorationOrchestrator:
             "model": self._shared_state.model,
             "tokens": progress.get("token_breakdown", {}),
             "estimated_cost_usd": round(progress.get("cost_usd", 0), 4),
+            "charged_cost_usd": (
+                round(charged_cost_usd, 4)
+                if isinstance(charged_cost_usd, (int, float)) else None
+            ),
             "flows": {
                 "completed": progress.get("flows", {}).get("completed", 0),
                 "total": progress.get("flows", {}).get("total", 0),
@@ -1134,6 +1222,9 @@ class FlowExplorationOrchestrator:
             # report was supplied or the verdict carried no counts).
             "new_findings_count": verdict.get("new") if verdict else None,
             "recurring_findings_count": verdict.get("recurring") if verdict else None,
+            # Independent re-check of criticals: per-issue outcome counts
+            # (None when no critical was a candidate this run)
+            "recheck": self._shared_state.recheck_summary(),
             "total_actions": progress.get("total_actions", 0),
             "status": status,
         }

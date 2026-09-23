@@ -1,9 +1,13 @@
 # QA Bot - On-Demand via PR Comment
 #
-# This workflow allows users to request QA testing by commenting
-# "@QABot https://example.com" on any pull request.
+# A maintainer requests a QA report by starting a PR comment with
+# "@QABot https://example.com". The comment must BEGIN with @QABot — a
+# mention elsewhere (discussing the bot, `@QABot` in backticks) doesn't start
+# a paid run. If no URL is given, QA_BOT_STAGING_URL is used.
 #
-# If no URL is provided, falls back to the QA_BOT_STAGING_URL repository variable.
+# Report-only: neither criticals nor a run that tested nothing turn the
+# check red (the report, or its NOT TESTED blocker list, still posts). Use
+# qa-staging-to-prod.yml for a gate.
 #
 # If you also use qa-staging-to-prod.yml (the deploy gate), it responds to the
 # same @QABot comment on staging -> production PRs. The first step below skips
@@ -11,11 +15,21 @@
 # DEPLOY_BASE there to the branch names your deploy gate uses, or leave them
 # empty if you don't use it.
 #
+# Credentials and known issues describe YOUR app, so they only ride along when
+# the comment targets the QA_BOT_STAGING_URL host — the host the browser will
+# really open, parsed with urlsplit (see target_host below): the bot types
+# credential values into the tested site's forms, and a maintainer can put
+# any URL in a comment. previous-report is the newest `qa-bot-report-ondemand-<host>-full`
+# artifact for the target host (NEW / recurring labels; see the deploy gate
+# example for how the two inputs differ).
+#
 # Setup:
 # 1. Copy this file to .github/workflows/qa-bot-on-demand.yml
 # 2. Add ANTHROPIC_API_KEY to repository secrets
 # 3. Optionally add QA_BOT_STAGING_URL as a repository variable (Settings > Variables)
-# 4. Comment "@QABot https://your-url.com" on any PR
+# 4. Optionally add a QA_BOT_CREDENTIALS secret (KEY=value per line) and commit
+#    .qa-known-issues.md (one issue per line, `#` comments)
+# 5. Comment "@QABot https://your-url.com" on any PR
 
 name: QA Bot (On-Demand)
 
@@ -30,7 +44,7 @@ on:
 
 jobs:
   qa-test:
-    # Only run if comment mentions @QABot on a PR and author is a repo member
+    # Only run if the comment starts with @QABot on a PR and the author is a repo member
     if: |
       startsWith(github.event.comment.body, '@QABot') &&
       github.event.issue.pull_request &&
@@ -44,12 +58,14 @@ jobs:
       cancel-in-progress: true
 
     runs-on: ubuntu-latest
+    # Keep ~10 min above max-duration below (image build + report).
     timeout-minutes: 30
 
     permissions:
       contents: read
       pull-requests: write
       issues: write
+      actions: read  # Find/download the previous run's report artifact
 
     steps:
       # A DEPLOY_HEAD -> DEPLOY_BASE PR is the deploy gate's job (it runs with
@@ -57,7 +73,7 @@ jobs:
       # below, not even the acknowledgement comment, fires for it.
       - name: Defer to deploy gate on staging -> production PRs
         id: gate
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           DEPLOY_HEAD: staging      # match qa-staging-to-prod.yml; '' to disable
           DEPLOY_BASE: production
@@ -72,8 +88,14 @@ jobs:
                 repo: context.repo.repo,
                 pull_number: context.issue.number
               });
-              console.log(`PR #${pr.number}: ${pr.head.ref} -> ${pr.base.ref}`);
-              handledElsewhere = pr.head.ref === head && pr.base.ref === base;
+              // Mirrors the gate's check, fork guard included, so exactly
+              // one workflow answers each comment: the gate refuses a fork
+              // PR whose branch shares DEPLOY_HEAD's name, so it runs here
+              // (this job never checks out the PR head).
+              const headRepo = pr.head.repo ? pr.head.repo.full_name : null;
+              const isSameRepo = headRepo === `${context.repo.owner}/${context.repo.repo}`;
+              console.log(`PR #${pr.number}: ${headRepo || '(deleted fork)'}:${pr.head.ref} -> ${pr.base.ref}`);
+              handledElsewhere = isSameRepo && pr.head.ref === head && pr.base.ref === base;
             }
             core.setOutput('handled_elsewhere', handledElsewhere ? 'true' : 'false');
             if (handledElsewhere) {
@@ -107,9 +129,47 @@ jobs:
 
           echo "url=$URL" >> $GITHUB_OUTPUT
 
+          # Is the target your own app (the staging host)? Only then do
+          # QA_BOT_CREDENTIALS and .qa-known-issues.md apply. Extend this
+          # check if other hosts serve the same app (e.g. preview deploys),
+          # comparing the parsed host below — never a substring or suffix of
+          # the raw URL.
+
+          # The host the browser will really open, or "" when the URL is not a plain
+          # http(s)://HOST[:PORT]. Cutting the URL at the first ':' or '/' is not
+          # that: http://<staging-ip>:80@evil.example/ opens evil.example. Neither is
+          # urlsplit's hostname alone: browsers end the host at a backslash, so
+          # https://evil.example\@<staging-ip>/ opens evil.example. So: urlsplit, and
+          # fail closed (no credentials) on userinfo, backslashes, %-escapes,
+          # brackets, whitespace or non-ASCII in the authority.
+          target_host() {
+            python3 - "$1" <<'PY'
+          import re, sys
+          from urllib.parse import urlsplit
+          url = sys.argv[1].strip("".join(chr(c) for c in range(0x21)))  # as browsers do
+          try:
+              parts = urlsplit(url)
+          except ValueError:
+              sys.exit()
+          if parts.scheme in ("http", "https") and re.fullmatch(r"[A-Za-z0-9.-]+(:[0-9]*)?", parts.netloc):
+              print(parts.hostname or "")
+          PY
+          }
+          host=$(target_host "$URL")
+          staging_host=$(target_host "$DEFAULT_URL")
+          own_app=false
+          if [ -n "$staging_host" ] && [ "$host" = "$staging_host" ]; then
+            own_app=true
+          fi
+          {
+            echo "host=$host"
+            echo "own_app=$own_app"
+          } >> "$GITHUB_OUTPUT"
+          echo "Target host: ${host:-(none: not a plain http(s)://host[:port] URL)} (own app: $own_app — credentials and known issues $([ "$own_app" = true ] && echo apply || echo withheld))"
+
       - name: Acknowledge request
         if: steps.gate.outputs.handled_elsewhere != 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           TARGET_URL: ${{ steps.extract.outputs.url }}
         with:
@@ -124,7 +184,7 @@ jobs:
 
       - name: Checkout repository
         if: steps.gate.outputs.handled_elsewhere != 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Get PR details
         if: steps.gate.outputs.handled_elsewhere != 'true'
@@ -147,17 +207,87 @@ jobs:
             echo "$DELIM"
           } >> $GITHUB_OUTPUT
 
+      - name: Load known issues and previous report
+        if: steps.gate.outputs.handled_elsewhere != 'true'
+        id: memory
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_HOST: ${{ steps.extract.outputs.host }}
+          OWN_APP: ${{ steps.extract.outputs.own_app }}
+          KNOWN_ISSUES_FILE: .qa-known-issues.md
+        run: |
+          # Known issues: only for your own app — the checked-in file describes
+          # it, and an entry about it must not demote a look-alike finding on
+          # another site.
+          KNOWN_ISSUES=""
+          if [ "$OWN_APP" = "true" ] && [ -f "$KNOWN_ISSUES_FILE" ]; then
+            KNOWN_ISSUES=$(grep -v '^[[:space:]]*#' "$KNOWN_ISSUES_FILE" | grep -v '^[[:space:]]*$' || true)
+          fi
+          echo "Known issues: $(printf '%s' "$KNOWN_ISSUES" | grep -c '') entr(y/ies)"
+          DELIM="QABOT_$(dd if=/dev/urandom bs=15 count=1 status=none | base64)"
+          {
+            echo "known_issues<<$DELIM"
+            echo "$KNOWN_ISSUES"
+            echo "$DELIM"
+          } >> $GITHUB_OUTPUT
+
+          # Previous report: newest non-expired `qa-bot-report-ondemand-<host>-full`
+          # artifact for this target host (uploaded below by every run that
+          # produced a report). "None yet" just means no labels this run.
+          # <host> is the host the extract step parsed — the one the browser
+          # opens — so http://<staging-ip>:80@evil.example/ can neither read
+          # nor overwrite the staging host's report. A URL with no plain
+          # host gets no run-over-run memory (an empty name would match
+          # every artifact).
+          HOST=$(printf '%s' "$TARGET_HOST" | sed -E 's/[^A-Za-z0-9._-]/_/g')
+          ARTIFACT=""
+          PREVIOUS=""
+          if [ -z "$HOST" ]; then
+            echo "No plain host in the target URL — no previous report; findings will not be labelled new/recurring"
+          else
+            ARTIFACT="qa-bot-report-ondemand-${HOST}-full"
+            RUN_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$ARTIFACT&per_page=50" \
+              --jq '[.artifacts[] | select(.expired | not)] | sort_by(.created_at) | last | .workflow_run.id // empty' 2>/dev/null || true)
+            if [ -n "$RUN_ID" ]; then
+              PREV_DIR="$RUNNER_TEMP/qa-bot-previous"
+              rm -rf "$PREV_DIR" && mkdir -p "$PREV_DIR"
+              if gh run download "$RUN_ID" -n "$ARTIFACT" -D "$PREV_DIR" && [ -f "$PREV_DIR/report.md" ]; then
+                PREVIOUS=$(head -c 20000 "$PREV_DIR/report.md")
+                echo "Previous report: $ARTIFACT from run $RUN_ID — findings will be labelled NEW / recurring"
+              else
+                echo "::notice::Could not download $ARTIFACT from run $RUN_ID; findings will not be labelled new/recurring this run"
+              fi
+            else
+              echo "No $ARTIFACT artifact yet (first run for this host) — findings will not be labelled new/recurring"
+            fi
+          fi
+          echo "artifact_name=$ARTIFACT" >> $GITHUB_OUTPUT
+          DELIM="QABOT_$(dd if=/dev/urandom bs=15 count=1 status=none | base64)"
+          {
+            echo "previous_report<<$DELIM"
+            echo "$PREVIOUS"
+            echo "$DELIM"
+          } >> $GITHUB_OUTPUT
+
       - name: Generate testing goal from PR
         if: steps.gate.outputs.handled_elsewhere != 'true'
         id: generate-goal
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TARGET_URL: ${{ steps.extract.outputs.url }}
           PR_TITLE_RAW: ${{ steps.pr-details.outputs.pr_title }}
           PR_BODY_RAW: ${{ steps.pr-details.outputs.pr_body }}
         run: |
-          # Build the payload entirely with jq so PR title/body (quotes,
-          # newlines, markdown) are escaped correctly inside the JSON string.
+          # The goal must be scoped to what is actually reachable at the target
+          # URL: an unscoped goal sends the bot hunting for pages the PR
+          # mentions that aren't served there. Prose lives in the shell
+          # variable, never inside the single-quoted jq program: an apostrophe
+          # there ends the shell quoting and the step dies before the fallback
+          # goal can engage.
+          PROMPT="You are writing the testing goal for an AI QA bot that explores a website in a real browser as a black-box UI tester. Convert this PR description into a concise QA testing goal (1-2 sentences) focused on the user flows and functionality to test AT THE TARGET URL. Only reference functionality the PR suggests is deployed there. If the PR description is empty, unclear, or only concerns things not reachable at the target, return a general exploration goal for the target site."
           PAYLOAD=$(jq -n \
+            --arg prompt "$PROMPT" \
+            --arg url "$TARGET_URL" \
             --arg title "$PR_TITLE_RAW" \
             --arg body "$PR_BODY_RAW" \
             '{
@@ -165,7 +295,7 @@ jobs:
               max_tokens: 200,
               messages: [{
                 role: "user",
-                content: ("Convert this PR description into a concise QA testing goal (1-2 sentences). Focus on what user flows and functionality should be tested. If the PR description is empty or unclear, return a general exploration goal.\n\nPR Title: \($title)\n\nPR Body:\n\($body)")
+                content: ($prompt + "\n\nTarget URL: " + $url + "\n\nPR Title: " + $title + "\n\nPR Body:\n" + $body)
               }]
             }')
 
@@ -202,18 +332,46 @@ jobs:
         with:
           url: ${{ steps.extract.outputs.url }}
           goal: ${{ steps.generate-goal.outputs.goal }}
+          # Run-over-run memory (see header). Never merged: a regression found
+          # last run must not be demoted this run.
+          known-issues: ${{ steps.memory.outputs.known_issues }}
+          previous-report: ${{ steps.memory.outputs.previous_report }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Required for the report to be posted as a PR comment.
           github-token: ${{ github.token }}
+          # Your app's test credentials only when the target is your app.
+          credentials: ${{ steps.extract.outputs.own_app == 'true' && secrets.QA_BOT_CREDENTIALS || '' }}
           max-duration: '10'
-          fail-on-critical: 'false'  # Don't fail, just report
+          # Report-only: a maintainer asked for a report, so neither criticals
+          # nor a zero-flow run turn the check red. The NOT TESTED report (with
+          # its blocker list) still posts, so the human sees what went wrong.
+          # Keep fail-on-zero-flows at its default (true) in a deploy gate.
+          fail-on-critical: 'false'
+          fail-on-zero-flows: 'false'
 
+      # The PR comment tells reviewers to download this artifact whenever
+      # issue screenshots were captured. Screenshots can show pages behind
+      # the test login — drop this step if repo readers shouldn't see them.
       - name: Upload issue screenshots
-        if: always() && steps.gate.outputs.handled_elsewhere != 'true' && steps.qa.outcome != 'cancelled'
-        uses: actions/upload-artifact@v4
+        if: always() && steps.gate.outputs.handled_elsewhere != 'true' && steps.qa.outcome != 'cancelled' && steps.qa.outcome != 'skipped'
+        uses: actions/upload-artifact@v7
         with:
           name: qa-bot-screenshots
           path: qa-bot-screenshots/
           if-no-files-found: ignore
+
+      # Read back as `previous-report` by the next run against this host.
+      # report.md / summary.json are credential-masked by the bot before export.
+      - name: Upload report for the next run
+        if: always() && steps.gate.outputs.handled_elsewhere != 'true' && steps.qa.outcome != 'cancelled' && steps.qa.outcome != 'skipped' && steps.memory.outputs.artifact_name != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.memory.outputs.artifact_name }}
+          path: |
+            qa-bot-screenshots/report.md
+            qa-bot-screenshots/summary.json
+          if-no-files-found: ignore
+          overwrite: true
 
       # The acknowledgement comment promised results, so close the loop if
       # a step BEFORE the QA run failed (URL extraction, goal generation).
@@ -221,7 +379,7 @@ jobs:
       # its own failure notice with PR context, and double-commenting is noise.
       - name: Report failure on PR
         if: failure() && steps.gate.outputs.handled_elsewhere != 'true' && steps.qa.outcome != 'failure'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
@@ -233,14 +391,31 @@ jobs:
             });
 
       - name: Summary
-        if: always() && steps.gate.outputs.handled_elsewhere != 'true' && steps.qa.outcome != 'cancelled'
+        if: always() && steps.gate.outputs.handled_elsewhere != 'true' && steps.qa.outcome != 'cancelled' && steps.qa.outcome != 'skipped'
         env:
+          TARGET_URL: ${{ steps.extract.outputs.url }}
           FLOWS: ${{ steps.qa.outputs.flows-explored }}
           ISSUES: ${{ steps.qa.outputs.issues-count }}
           CRITICAL: ${{ steps.qa.outputs.critical-issues }}
+          CURATED: ${{ steps.qa.outputs.curated-critical-issues }}
+          NEW_FINDINGS: ${{ steps.qa.outputs.new-findings }}
+          RECURRING_FINDINGS: ${{ steps.qa.outputs.recurring-findings }}
         run: |
           echo "### QA Bot Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Flows explored:** $FLOWS" >> $GITHUB_STEP_SUMMARY
-          echo "- **Issues found:** $ISSUES" >> $GITHUB_STEP_SUMMARY
-          echo "- **Critical issues:** $CRITICAL" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** $TARGET_URL" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Flows Explored | ${FLOWS:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Issues Found | ${ISSUES:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical (raw worker findings) | ${CRITICAL:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical (after curation) | ${CURATED:-n/a} |" >> $GITHUB_STEP_SUMMARY
+          SINCE_PREVIOUS="n/a"
+          [ -n "$NEW_FINDINGS" ] && SINCE_PREVIOUS="$NEW_FINDINGS new, $RECURRING_FINDINGS recurring"
+          echo "| Since previous run | $SINCE_PREVIOUS |" >> $GITHUB_STEP_SUMMARY
+          if [ -z "$FLOWS" ] || [ "$FLOWS" = "0" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> [!CAUTION]" >> $GITHUB_STEP_SUMMARY
+            echo "> The target was **NOT tested** — 0 user flows were explored. See the PR comment for the blocker list." >> $GITHUB_STEP_SUMMARY
+          fi

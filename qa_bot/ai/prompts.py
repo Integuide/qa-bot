@@ -506,6 +506,48 @@ Focus on this specific flow. Use add_flow if you find sub-branches worth testing
 
 BRANCHED_CONTEXT = """You branched from "{parent_flow_name}" and inherited that browser state. Continue testing your specific branch."""
 
+# Per-worker block for an independent re-check flow (orchestrator/recheck.py),
+# used in place of ASSIGNED_WORKER_CONTEXT so the shared cached base prompt
+# stays identical for every worker. .format()ed: JSON braces are doubled.
+RECHECK_WORKER_CONTEXT = """
+## Your Assignment: Independent Re-check of a CRITICAL Finding
+
+You are worker {worker_number}, an independent verifier. Another worker reported the CRITICAL finding below. A critical fails the deploy gate, and false criticals are almost always ONE worker misreading ONE observation — placeholder text read as data loss, a blank-looking editor read as "text not rendered", a control with no ref read as "button broken". Your only job is to try to reproduce it yourself and record what you find.
+
+**Reported finding**: {description}
+**Where it was seen**: {url} (flow "{origin_flow_name}")
+**What the reporting worker did just before filing it** (its actions, not its conclusions):
+{steps}
+
+You start on that page in a FRESH browser session: no cookies, no login, nothing the original flow set up. If the page needs state you no longer have (an account, a login with the provided credentials, a saved item), recreate it with the fewest steps, starting from {target_url} if you have to.
+
+How to judge:
+- Prefer DOM evidence over pixels: the Interactive Elements list (attributes in brackets, `chars=N`, `first-line-hidden`), `find_text` results, the URL you land on, error pages and HTTP errors. One screenshot of a blank-looking area proves nothing.
+- Apply these rules strictly: "Data-Loss Claims Require a Verified Save First" (perform and confirm the save yourself before calling anything lost), "HTML Attribute Claims: Read the Element List, Never the Pixels", "Typed Text Is DOM-Verified", and "Your Own Tooling Failures Are NOT App Bugs".
+- Stay on the reported behavior. Do not explore anything else.
+
+Finish with exactly ONE recheck_result action — it replaces done:
+{{"action_type": "recheck_result", "recheck_outcome": "not_reproduced", "reason": "Typed 40 chars into the chapter editor, clicked Save, saw 'Saved', reloaded: the editor entry shows chars=40 and the text is visible once its first line is scrolled into view"}}
+- `reproduced` — you saw the same failure yourself, with evidence that meets the rules above.
+- `not_reproduced` — you performed the steps and the feature worked; say what you saw that shows it working.
+- `inconclusive` — you could not get far enough to judge (state or credentials you cannot recreate, the page no longer reachable, turns running out).
+The reason must cite your evidence. report_issue, add_flow and done are disabled in a re-check. You have {max_turns} turns; after that the re-check ends as inconclusive.
+"""
+
+
+def format_recheck_context(brief: dict, worker_number: int, max_turns: int) -> str:
+    """The re-check flow's per-worker system block (see RECHECK_WORKER_CONTEXT)."""
+    steps = brief.get("steps") or []
+    return RECHECK_WORKER_CONTEXT.format(
+        worker_number=worker_number,
+        description=brief.get("description", ""),
+        url=brief.get("url", ""),
+        origin_flow_name=brief.get("origin_flow_name", ""),
+        steps="\n".join(steps) if steps else "(no recorded steps)",
+        target_url=brief.get("target_url", ""),
+        max_turns=max_turns,
+    )
+
 WORKER_ACTION_PROMPT = """## Current State
 
 **URL**: {url}
@@ -543,14 +585,16 @@ def get_worker_system_prompt_parts(
     current_date: str = "",
     run_nonce: str = "",
     known_issues: str = "",
+    recheck_context: str = "",
 ) -> tuple[str, str]:
     """Get the worker system prompt as (shared base, per-worker context).
 
     The parts are separate so the provider can put them in two system
-    blocks with their own prompt-cache breakpoints: the ~4-5k-token base is
-    identical for every worker in a run (same domain/date/nonce), so a
-    single cache entry serves all workers; only the small per-worker
-    assignment block is cached per worker.
+    blocks with their own prompt-cache breakpoints: the base (~15.7K tokens
+    on Sonnet 5, measured with count_tokens 2026-09) is identical for every
+    worker in a run (same domain/date/nonce), so a single cache entry serves
+    all workers; only the small per-worker assignment block is cached per
+    worker.
 
     current_date/run_nonce ground the model's test-data generation: the model's
     internal date is stale, and reused "unique" emails collide with accounts
@@ -560,6 +604,10 @@ def get_worker_system_prompt_parts(
     text (per-run constant, so it belongs in the shared base block): workers
     stop re-investigating already-acknowledged findings and tag matching
     observations `[KNOWN]` at minor severity instead of re-reporting them.
+
+    recheck_context, when set, is a re-check flow's assignment
+    (format_recheck_context) and replaces the per-worker block; the base is
+    unchanged, so the verifier still shares the run's base cache entry.
     """
     if not current_date:
         current_date = datetime.now().strftime("%Y-%m-%d (%A)")
@@ -579,7 +627,9 @@ def get_worker_system_prompt_parts(
             "{known_issues}", known_issues.strip()
         )
 
-    if is_first_worker:
+    if recheck_context:
+        context = recheck_context
+    elif is_first_worker:
         context = FIRST_WORKER_CONTEXT
     else:
         branched_context = ""
@@ -606,6 +656,7 @@ def get_worker_system_prompt(
     current_date: str = "",
     run_nonce: str = "",
     known_issues: str = "",
+    recheck_context: str = "",
 ) -> str:
     """Full worker system prompt as one string (base + per-worker context).
 
@@ -622,6 +673,7 @@ def get_worker_system_prompt(
         current_date=current_date,
         run_nonce=run_nonce,
         known_issues=known_issues,
+        recheck_context=recheck_context,
     )
     return base + context
 
@@ -905,6 +957,8 @@ Hold every issue to these standards. A wrong or inflated finding is worse than n
 
 15. **A leak / isolation finding needs a planted canary in the action history.** "Context A saw content from B" (a sibling story branch, an unchosen variant, another user's data) is a claim about A's *input*, and matching a phrase in A's AI *output* against B cannot establish it: two generations from a shared premise routinely invent the same names, places and plot turns, and a `find_text` showing the phrase in B but not in the shared ancestor proves only where it first appeared. The finding is supported when the flow actions show a `type` into B's content carrying a unique run-ID token — its line reads `(text contains run-ID token '…')` and/or `searched at step N`, since typed text is otherwise truncated — BEFORE A was created or generated in, followed by that same token (or a clear paraphrase of the planted fact) found in A: a matched `find_text`, or the worker reading it in A's editor field. A page that displayed A's seeded context containing B's content also supports it. Without that, downgrade to **minor**, reword as "detail X appears in both A and B; A was never shown to contain B's content, and X could have been generated independently from the shared premise", and never call it confirmed, reproducible or verified.
 
+16. **Independent re-checks of critical findings are binding.** In CI runs every critical finding is re-tested by a separate verifier in a fresh browser; the result rides on the issue as a tag in its description and a "Re-check:" line. `[UNCONFIRMED — independent re-check did not reproduce]` means the verifier followed the same steps and saw the feature work: the finding arrives at **major** and must NEVER appear under Critical Issues or in the verdict's `critical` list — not on its own, and not by merging it into a similar finding. List it under Major Issues, keep the tag in its headline, and give the verifier's evidence in one line. `[REPRODUCED by independent re-check]` means a second, independent observation confirmed it: keep it critical (unless another standard above shows it is a false positive) and say it was independently reproduced. `RE-CHECK INCONCLUSIVE` and `NOT RE-CHECKED` findings are still single observations: judge them on their evidence under the standards above, and when you keep one critical, say the re-check did not settle it and why.
+
 ### Critical Issues
 Issues that block core functionality or pose security risks.
 - **Include reproduction steps** derived from the flow actions where available — each issue's "Flow: X, step N" line tells you which flow's action summary to derive them from, and step N is the numbered action that triggered it
@@ -1016,7 +1070,7 @@ After the markdown report, append exactly one fenced block with the info string 
 {"critical": [{"title": "<issue headline>", "flow": "<flow name or null>"}], "major": <count>, "known_observed_again": <count>, "new": <count>, "recurring": <count>}
 ```
 
-- `critical`: one entry per issue you actually listed under **Critical Issues** (after dedup, downgrades and known-issue matching) — an empty list `[]` when that section is empty. `title` is the headline you used in the report; `flow` is the flow it was observed in (null if unknown).
+- `critical`: one entry per issue you actually listed under **Critical Issues** (after dedup, downgrades and known-issue matching) — an empty list `[]` when that section is empty, and never an `[UNCONFIRMED]` finding (Report Quality Standard 16). `title` is the headline you used in the report; `flow` is the flow it was observed in (null if unknown).
 - `major`: the number of issues listed under **Major Issues**.
 - `known_observed_again`: the number of lines under **Known Issues Observed Again** (0 when that section is omitted).
 - `new` / `recurring`: ONLY when the input includes a "Previous Run Findings" section — how many of the findings you listed in the severity sections are labelled **NEW** and how many **recurring** (Report Quality Standard 11). Omit both keys when there is no previous report — counts given without one are discarded.
@@ -1075,6 +1129,28 @@ def format_issue_trace(issue: dict) -> str:
     if issue.get("screenshot"):
         parts.append(f"screenshot {issue['screenshot'].rsplit('/', 1)[-1]}")
     return ", ".join(parts)
+
+
+_RECHECK_LINE_LABELS = {
+    "not_reproduced": "NOT REPRODUCED by an independent verifier (demoted critical -> major)",
+    "reproduced": "REPRODUCED by an independent verifier",
+    "inconclusive": "INCONCLUSIVE (kept critical)",
+    "skipped": "NOT RE-CHECKED (kept critical)",
+}
+
+
+def format_recheck_line(recheck: dict | None) -> str:
+    """"Re-check: NOT REPRODUCED ... — <evidence>" for an issue's re-check
+    record (Report Quality Standard 16); "" when it has none or is open."""
+    if not recheck:
+        return ""
+    label = _RECHECK_LINE_LABELS.get(recheck.get("status", ""))
+    if not label:
+        return ""
+    reason = " ".join(str(recheck.get("reason") or "").split())[:300]
+    return f"Re-check: {label}" + (f" — {reason}" if reason else "")
+
+
 _SUMMARY_HEAD_ACTIONS = 10
 
 
@@ -1190,6 +1266,9 @@ def format_synthesis_context(
                 lines.append(f"  URL: {url}")
             if context:
                 lines.append(f"  Context: {context}")
+            recheck_line = format_recheck_line(i.get("recheck"))
+            if recheck_line:
+                lines.append(f"  {recheck_line}")
         return "\n".join(lines)
 
     def format_flow_summaries(flows: list[dict]) -> str:

@@ -1,0 +1,54 @@
+# Exact dependency set for the GitHub Action image ONLY — action/Dockerfile
+# installs requirements.txt with `-c action-constraints.txt`. Development
+# keeps requirements.txt's ranges; this file only stops the CI image from
+# drifting between builds (it is rebuilt from scratch on every run).
+#
+# Source: pip's "Successfully installed" line from the last green deploy gate
+# (Integuide/mono run 35740756563, 2026-09-22), i.e. what the gate actually
+# ran with. The image is Python 3.10 (Ubuntu jammy), hence tomli /
+# exceptiongroup / backports-asyncio-runner. playwright must match the
+# Dockerfile's base image tag (v<playwright>-jammy) so Chromium ships in the
+# base instead of being downloaded on every build.
+#
+# Bump procedure: docs/github-action.md "Action image dependencies".
+annotated-types==0.8.0
+anthropic==1.7.0
+anyio==4.15.1
+backports-asyncio-runner==1.2.0
+certifi==2026.7.22
+click==8.5.0
+docstring-parser==0.18.0
+exceptiongroup==1.3.1
+fastapi==0.116.1
+greenlet==3.5.6
+h11==0.16.0
+httpcore==1.0.9
+httpcore2==2.13.0
+httptools==0.8.0
+httpx==0.28.1
+httpx2==2.13.0
+idna==3.20
+iniconfig==2.3.0
+jiter==0.17.0
+packaging==26.3
+playwright==1.63.0
+pluggy==1.6.0
+psutil==7.2.2
+pydantic==2.13.5
+pydantic-core==2.46.5
+pyee==13.0.1
+pygments==2.21.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+python-dotenv==1.1.1
+pyyaml==6.0.3
+sniffio==1.3.1
+starlette==0.47.3
+tomli==2.4.1
+truststore==0.10.4
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+uvicorn==0.35.0
+uvloop==0.22.1
+watchfiles==1.3.0
+websockets==16.1.1

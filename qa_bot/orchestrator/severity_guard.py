@@ -108,6 +108,13 @@ _SEVERITY_RANK = {
     "critical": 3,
 }
 
+
+def severity_rank(severity: str) -> int:
+    """Position of ``severity`` in cosmetic < minor < major < critical; an
+    unrecognised value ranks as minor, as ``cap_severity`` treats it."""
+    return _SEVERITY_RANK.get(str(severity or "").strip().lower(), _SEVERITY_RANK["minor"])
+
+
 # The ceiling we apply to a recognised non-regression. ``minor`` (not
 # ``cosmetic``) so the observation still shows up in the report for a human to
 # notice, but can never fail the deploy on its own.

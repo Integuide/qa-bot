@@ -1,12 +1,23 @@
 # QA Bot - Manual Dispatch
 #
-# This workflow allows manually triggering QA testing via the GitHub Actions UI.
-# Go to Actions > QA Bot (Manual) > Run workflow, then enter the URL to test.
+# Manually trigger QA testing from the GitHub Actions UI:
+# Actions > QA Bot (Manual) > Run workflow, then enter the URL to test.
+# The report goes to the job summary (there is no PR to comment on).
+#
+# Credentials and known issues describe YOUR app, so they only ride along when
+# the URL is on the QA_BOT_STAGING_URL host — the host the browser will really
+# open, parsed with urlsplit (see target_host below) — since the bot types
+# credential values into the tested site's forms. previous-report is the newest
+# `qa-bot-report-manual-<host>-<mode>` artifact for the target host, so
+# findings are labelled NEW / recurring (labels only — see the deploy gate
+# example for how it differs from known-issues).
 #
 # Setup:
 # 1. Copy this file to .github/workflows/qa-bot-manual.yml
 # 2. Add ANTHROPIC_API_KEY to repository secrets
-# 3. Go to Actions tab and run manually
+# 3. Optionally add QA_BOT_STAGING_URL (variable), QA_BOT_CREDENTIALS (secret,
+#    KEY=value per line) and a checked-in .qa-known-issues.md
+# 4. Go to the Actions tab and run it
 
 name: QA Bot (Manual)
 
@@ -19,23 +30,43 @@ on:
         type: string
 
       goal:
-        description: 'Testing focus (optional)'
+        description: 'Testing focus (ignored in smoke mode)'
         required: false
         type: string
         default: 'Explore user flows and find bugs, broken elements, and usability problems.'
 
+      mode:
+        description: 'full = parallel exploration against the goal; smoke = one worker opens each top-level nav link once (1 agent / 5 min / $0.75)'
+        required: false
+        type: choice
+        options:
+          - full
+          - smoke
+        default: 'full'
+
+      # Limits: empty = the default for the mode (full: 3 agents / 30 min /
+      # $5.00; smoke: 1 / 5 / $0.75).
       max-agents:
-        description: 'Maximum parallel agents'
+        description: 'Maximum parallel agents (empty = mode default)'
         required: false
         type: string
-        default: '3'
+        default: ''
 
       max-duration:
-        description: 'Maximum duration (minutes)'
+        description: 'Maximum duration in minutes (empty = mode default; keep under ~35 or raise timeout-minutes)'
         required: false
         type: string
-        default: '30'
+        default: ''
 
+      max-cost:
+        description: 'Maximum cost in USD (empty = mode default)'
+        required: false
+        type: string
+        default: ''
+
+      # Only ids the bot has pricing for (qa_bot/config.py MODEL_PRICING). An
+      # unknown id still runs, but its cost cap is billed at the most
+      # expensive known rates, so the run stops far earlier than expected.
       model:
         description: 'Claude model'
         required: false
@@ -44,22 +75,115 @@ on:
           - claude-sonnet-5
           - claude-haiku-4-5
           - claude-opus-4-8
+          - claude-opus-5-5
+          - claude-fable-5-1
         default: 'claude-sonnet-5'
-
-      max-cost:
-        description: 'Maximum cost in USD (default: $5.00)'
-        required: false
-        type: string
-        default: '5.0'
 
 jobs:
   qa-test:
     runs-on: ubuntu-latest
+    # Must exceed max-duration by ~10 min (image build + graceful stop and
+    # report run on the same clock).
     timeout-minutes: 45
+
+    permissions:
+      contents: read
+      actions: read  # Find/download the previous run's report artifact
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Load known issues and previous report
+        id: memory
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_URL: ${{ inputs.url }}
+          STAGING_URL: ${{ vars.QA_BOT_STAGING_URL }}
+          MODE: ${{ inputs.mode }}
+          KNOWN_ISSUES_FILE: .qa-known-issues.md
+        run: |
+          # Your app's known issues and credentials apply only when the
+          # target is your app (the staging host). Extend this check if other
+          # hosts serve the same app, comparing the parsed host below — never
+          # a substring or suffix of the raw URL.
+
+          # The host the browser will really open, or "" when the URL is not a plain
+          # http(s)://HOST[:PORT]. Cutting the URL at the first ':' or '/' is not
+          # that: http://<staging-ip>:80@evil.example/ opens evil.example. Neither is
+          # urlsplit's hostname alone: browsers end the host at a backslash, so
+          # https://evil.example\@<staging-ip>/ opens evil.example. So: urlsplit, and
+          # fail closed (no credentials) on userinfo, backslashes, %-escapes,
+          # brackets, whitespace or non-ASCII in the authority.
+          target_host() {
+            python3 - "$1" <<'PY'
+          import re, sys
+          from urllib.parse import urlsplit
+          url = sys.argv[1].strip("".join(chr(c) for c in range(0x21)))  # as browsers do
+          try:
+              parts = urlsplit(url)
+          except ValueError:
+              sys.exit()
+          if parts.scheme in ("http", "https") and re.fullmatch(r"[A-Za-z0-9.-]+(:[0-9]*)?", parts.netloc):
+              print(parts.hostname or "")
+          PY
+          }
+          host=$(target_host "$TARGET_URL")
+          staging_host=$(target_host "$STAGING_URL")
+          OWN_APP=false
+          if [ -n "$staging_host" ] && [ "$host" = "$staging_host" ]; then
+            OWN_APP=true
+          fi
+          echo "own_app=$OWN_APP" >> $GITHUB_OUTPUT
+
+          KNOWN_ISSUES=""
+          if [ "$OWN_APP" = "true" ] && [ -f "$KNOWN_ISSUES_FILE" ]; then
+            KNOWN_ISSUES=$(grep -v '^[[:space:]]*#' "$KNOWN_ISSUES_FILE" | grep -v '^[[:space:]]*$' || true)
+          fi
+          echo "Target host: ${host:-(none: not a plain http(s)://host[:port] URL)} (own app: $OWN_APP); known issues: $(printf '%s' "$KNOWN_ISSUES" | grep -c '') entr(y/ies)"
+          DELIM="QABOT_$(dd if=/dev/urandom bs=15 count=1 status=none | base64)"
+          {
+            echo "known_issues<<$DELIM"
+            echo "$KNOWN_ISSUES"
+            echo "$DELIM"
+          } >> $GITHUB_OUTPUT
+
+          # Previous report: newest non-expired artifact for this host + mode
+          # (uploaded below by every run that produced a report).
+          # <host> is the host target_host above parsed — the one the browser
+          # opens — so http://<staging-ip>:80@evil.example/ can neither read
+          # nor overwrite the staging host's report. A URL with no plain
+          # host gets no run-over-run memory (an empty name would match
+          # every artifact).
+          HOST=$(printf '%s' "$host" | sed -E 's/[^A-Za-z0-9._-]/_/g')
+          ARTIFACT=""
+          PREVIOUS=""
+          if [ -z "$HOST" ]; then
+            echo "No plain host in the target URL — no previous report; findings will not be labelled new/recurring"
+          else
+            ARTIFACT="qa-bot-report-manual-${HOST}-${MODE}"
+            RUN_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$ARTIFACT&per_page=50" \
+              --jq '[.artifacts[] | select(.expired | not)] | sort_by(.created_at) | last | .workflow_run.id // empty' 2>/dev/null || true)
+            if [ -n "$RUN_ID" ]; then
+              PREV_DIR="$RUNNER_TEMP/qa-bot-previous"
+              rm -rf "$PREV_DIR" && mkdir -p "$PREV_DIR"
+              if gh run download "$RUN_ID" -n "$ARTIFACT" -D "$PREV_DIR" && [ -f "$PREV_DIR/report.md" ]; then
+                PREVIOUS=$(head -c 20000 "$PREV_DIR/report.md")
+                echo "Previous report: $ARTIFACT from run $RUN_ID — findings will be labelled NEW / recurring"
+              else
+                echo "::notice::Could not download $ARTIFACT from run $RUN_ID; findings will not be labelled new/recurring this run"
+              fi
+            else
+              echo "No $ARTIFACT artifact yet (first run for this host/mode) — findings will not be labelled new/recurring"
+            fi
+          fi
+          echo "artifact_name=$ARTIFACT" >> $GITHUB_OUTPUT
+          DELIM="QABOT_$(dd if=/dev/urandom bs=15 count=1 status=none | base64)"
+          {
+            echo "previous_report<<$DELIM"
+            echo "$PREVIOUS"
+            echo "$DELIM"
+          } >> $GITHUB_OUTPUT
 
       - name: Run QA Bot
         id: qa
@@ -67,43 +191,68 @@ jobs:
         with:
           url: ${{ inputs.url }}
           goal: ${{ inputs.goal }}
+          mode: ${{ inputs.mode }}
           model: ${{ inputs.model }}
           max-agents: ${{ inputs.max-agents }}
           max-duration: ${{ inputs.max-duration }}
           max-cost: ${{ inputs.max-cost }}
+          known-issues: ${{ steps.memory.outputs.known_issues }}
+          previous-report: ${{ steps.memory.outputs.previous_report }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          credentials: ${{ steps.memory.outputs.own_app == 'true' && secrets.QA_BOT_CREDENTIALS || '' }}
           post-comment: 'false'  # No PR to comment on
 
       - name: Write Summary
-        if: always() && steps.qa.outcome != 'cancelled'
+        if: always() && steps.qa.outcome != 'cancelled' && steps.qa.outcome != 'skipped'
         env:
           INPUT_URL: ${{ inputs.url }}
           FLOWS: ${{ steps.qa.outputs.flows-explored }}
           ISSUES: ${{ steps.qa.outputs.issues-count }}
           CRITICAL: ${{ steps.qa.outputs.critical-issues }}
           CURATED: ${{ steps.qa.outputs.curated-critical-issues }}
+          MODE: ${{ steps.qa.outputs.mode }}
+          COST: ${{ steps.qa.outputs.cost-usd }}
+          NEW_FINDINGS: ${{ steps.qa.outputs.new-findings }}
+          RECURRING_FINDINGS: ${{ steps.qa.outputs.recurring-findings }}
           REPORT: ${{ steps.qa.outputs.report }}
         run: |
-          echo "### QA Bot Results for $INPUT_URL" >> $GITHUB_STEP_SUMMARY
+          echo "### QA Bot Results for $INPUT_URL (${MODE:-full})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Flows Explored | $FLOWS |" >> $GITHUB_STEP_SUMMARY
-          echo "| Issues Found | $ISSUES |" >> $GITHUB_STEP_SUMMARY
-          echo "| Critical (raw worker findings) | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| Flows Explored | ${FLOWS:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Issues Found | ${ISSUES:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical (raw worker findings) | ${CRITICAL:-0} |" >> $GITHUB_STEP_SUMMARY
           echo "| Critical (after curation) | ${CURATED:-n/a} |" >> $GITHUB_STEP_SUMMARY
+          SINCE_PREVIOUS="n/a"
+          [ -n "$NEW_FINDINGS" ] && SINCE_PREVIOUS="$NEW_FINDINGS new, $RECURRING_FINDINGS recurring"
+          echo "| Since previous run | $SINCE_PREVIOUS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Estimated cost (USD) | ${COST:-n/a} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Full Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "$REPORT" >> $GITHUB_STEP_SUMMARY
 
-      # Issue screenshots are exported to the workspace by the action.
-      # (The result JSON lives inside the action container and is not
-      # reachable from the runner; the report is in the step summary above.)
+      # Issue screenshots (cited by filename in the report). They can show
+      # pages behind the test login — drop this step if repo readers
+      # shouldn't see them.
       - name: Upload issue screenshots
-        if: always() && steps.qa.outcome != 'cancelled'
-        uses: actions/upload-artifact@v4
+        if: always() && steps.qa.outcome != 'cancelled' && steps.qa.outcome != 'skipped'
+        uses: actions/upload-artifact@v7
         with:
           name: qa-bot-screenshots
           path: qa-bot-screenshots/
           if-no-files-found: ignore
+
+      # Read back as `previous-report` by the next run against this host/mode.
+      # report.md / summary.json are credential-masked by the bot before export.
+      - name: Upload report for the next run
+        if: always() && steps.qa.outcome != 'cancelled' && steps.qa.outcome != 'skipped' && steps.memory.outputs.artifact_name != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.memory.outputs.artifact_name }}
+          path: |
+            qa-bot-screenshots/report.md
+            qa-bot-screenshots/summary.json
+          if-no-files-found: ignore
+          overwrite: true

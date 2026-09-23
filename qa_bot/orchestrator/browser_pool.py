@@ -29,6 +29,27 @@ def strip_url_credentials(url: str) -> str:
         return url
 
 
+def url_origin(url: str) -> str:
+    """The origin of a web URL as the browser computes it:
+    ``scheme://host[:port]``, lower-cased, without userinfo, path or a
+    default port (``https://User:pw@Example.com:443/x`` ->
+    ``https://example.com``). "" for anything that is not http(s).
+    """
+    try:
+        parsed = urlparse(str(url or "").strip())
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError:  # malformed port
+        return ""
+    if scheme not in ("http", "https") or not host:
+        return ""
+    if ":" in host:  # IPv6 literal
+        host = f"[{host}]"
+    default_port = 443 if scheme == "https" else 80
+    return f"{scheme}://{host}" + (f":{port}" if port and port != default_port else "")
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -146,7 +167,7 @@ class BrowserPool:
     async def create_isolated_context(
         self,
         storage_state: Optional[dict] = None,
-        http_credentials: Optional[dict] = None,
+        http_auth: Optional[dict] = None,
     ) -> BrowserContext:
         """
         Create a new isolated browser context for a flow.
@@ -157,9 +178,16 @@ class BrowserPool:
         Args:
             storage_state: Optional storage state to restore (from checkpoint).
                           If None, creates a fresh context.
-            http_credentials: Optional dict with 'username' and 'password' for
-                             HTTP Basic Auth. Playwright handles 401 challenges
-                             natively when this is set.
+            http_auth: Optional HTTP Basic Auth, as SharedFlowState keeps it:
+                      {'username', 'password', 'target_url'}. The credentials
+                      are only ever given to the target URL's origin, both
+                      ways they are sent: Playwright's http_credentials
+                      (answers 401 challenges; the initial navigation needs
+                      it) with ``origin`` set, and the proactive
+                      Authorization header (``apply_http_auth``). Without
+                      ``origin`` Playwright answers ANY site's challenge — a
+                      third-party iframe or a redirect would get the pair.
+                      No derivable origin, no credentials.
 
         Returns:
             A new BrowserContext that is independent of other contexts.
@@ -169,6 +197,14 @@ class BrowserPool:
 
         if IGNORE_HTTPS_ERRORS:
             logger.info("Creating browser context with HTTPS error bypass enabled")
+
+        origin = url_origin(http_auth.get("target_url", "")) if http_auth else ""
+        if http_auth and not origin:
+            logger.warning(
+                "HTTP auth not applied: no web origin in target URL %r",
+                strip_url_credentials(str(http_auth.get("target_url", ""))),
+            )
+            http_auth = None
 
         context = await self._browser.new_context(
             viewport=self.viewport,
@@ -182,8 +218,23 @@ class BrowserPool:
             # HTTP Basic Auth — Playwright handles 401 challenges at the protocol
             # level, before route handlers fire. This is required for the initial
             # navigation; route interception alone misses it.
-            http_credentials=http_credentials,
+            http_credentials=(
+                {"username": http_auth["username"], "password": http_auth["password"],
+                 "origin": origin}
+                if http_auth else None
+            ),
         )
+
+        if http_auth:
+            # Also send the header proactively (no 401 round-trip on
+            # subrequests), scoped to the same origin
+            try:
+                await self.apply_http_auth(
+                    context, http_auth["username"], http_auth["password"], origin
+                )
+            except BaseException:
+                await context.close()
+                raise
 
         # Bound element-action waits so a stale ref or covered element fails
         # fast instead of eating Playwright's 30s default. Navigation keeps
@@ -239,10 +290,10 @@ class BrowserPool:
         encoded = base64.b64encode(credentials.encode()).decode()
         auth_header = f"Basic {encoded}"
 
-        # Parse target URL to scope auth to this domain only
-        parsed = urlparse(target_url)
-        # Match scheme://host/** to avoid credential leakage to third parties
-        route_pattern = f"{parsed.scheme}://{parsed.netloc}/**"
+        # Match the target's origin only (scheme://host[:port]/**, as the
+        # browser writes request URLs: no userinfo, no default port) to
+        # avoid credential leakage to third parties
+        route_pattern = f"{url_origin(target_url)}/**"
 
         logger.debug(f"Applying HTTP auth to route pattern: {route_pattern}")
 
