@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import uuid
 
 from qa_bot.agent.state import Issue
-from qa_bot.config import calculate_cost, DEFAULT_MODEL
+from qa_bot.config import calculate_cost, DEFAULT_CLAUDE_MODEL
 from qa_bot.orchestrator.flow import (
     PRIORITY_DEFAULT,
     PRIORITY_GOAL,
@@ -185,7 +185,7 @@ class SharedFlowState:
     max_branches_per_flow: int = 10  # Limit branching to prevent explosion
     max_duration_minutes: int = 30  # 30 minutes default
     max_cost_usd: float = 5.0  # Max cost limit in USD
-    model: str = DEFAULT_MODEL  # Model for cost calculation
+    model: str = DEFAULT_CLAUDE_MODEL  # Model for cost calculation (callers pass the run's real model)
 
     # State tracking
     start_time: datetime = field(default_factory=datetime.now)
@@ -327,7 +327,7 @@ class SharedFlowState:
         max_branches_per_flow: int = 10,
         max_duration_minutes: int = 30,
         max_cost_usd: float = 5.0,
-        model: str = DEFAULT_MODEL,
+        model: str = DEFAULT_CLAUDE_MODEL,
         skip_permissions: bool = False,
         interactive: bool = True,
         exploration_id: Optional[str] = None,

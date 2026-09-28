@@ -1,5 +1,5 @@
 name: 'QA Bot'
-description: 'AI-powered website QA testing using Claude - explores user flows and finds bugs, broken elements, or usability problems'
+description: 'AI-powered website QA testing (GPT-6 Luna via OpenRouter, or Claude) - explores user flows and finds bugs, broken elements, or usability problems'
 author: 'integuide'
 
 branding:
@@ -47,19 +47,19 @@ inputs:
     default: ''
 
   anthropic-api-key:
-    description: 'Anthropic API key — required for Claude models (every `model` id without a slash, including the default)'
+    description: 'Anthropic API key — for Claude models (every `model` id without a slash). With no `model` and no `openrouter-api-key`, the run uses claude-sonnet-5. Pass this or `openrouter-api-key` (or both).'
     required: false
     default: ''
 
   openrouter-api-key:
-    description: 'OpenRouter API key — required only when `model` is an OpenRouter "vendor/slug" id such as openai/gpt-6-luna. Screenshots, page text and test credentials then go to OpenRouter and the model vendor instead of Anthropic.'
+    description: 'OpenRouter API key — recommended: with no `model` set, the run uses openai/gpt-6-luna (about 13x cheaper than claude-sonnet-5 on the same run, with somewhat shallower coverage). Also required for any other OpenRouter "vendor/slug" `model`. Screenshots, page text and test credentials then go to OpenRouter and the model vendor (OpenAI) instead of Anthropic.'
     required: false
     default: ''
 
   model:
-    description: 'Model to use: a Claude model (claude-sonnet-5, claude-haiku-4-5, claude-opus-4-8, claude-opus-5-5, claude-fable-5-1) or an OpenRouter "vendor/slug" id such as openai/gpt-6-luna (needs openrouter-api-key)'
+    description: 'Model to use. Empty (the default) = openai/gpt-6-luna when `openrouter-api-key` is set, else claude-sonnet-5. Or name one: a Claude model (claude-sonnet-5, claude-haiku-4-5, claude-opus-4-8, claude-opus-5-5, claude-fable-5-1, needs anthropic-api-key) or an OpenRouter "vendor/slug" id such as openai/gpt-6-luna (needs openrouter-api-key).'
     required: false
-    default: 'claude-sonnet-5'
+    default: ''
 
   post-comment:
     description: 'Post results as a PR comment (true/false)'

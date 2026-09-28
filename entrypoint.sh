@@ -157,6 +157,20 @@ FAILURE_EOF
 }
 # --- end PR comment helpers
 
+# Model: the model input when set; empty (the default) asks the CLI, which
+# applies the one rule the CLI and the web UI share
+# (qa_bot.config.resolve_model): GPT-6 Luna whenever openrouter-api-key is
+# set, else Claude Sonnet 5 — so a workflow passing only anthropic-api-key
+# runs exactly as before. Resolved here so the key check, the log and the PR
+# footer name the model that will run, and passed on as --model so the run
+# cannot pick another.
+if ! MODEL_CHOICE=$(python -m qa_bot.cli "$INPUT_URL" --model "$INPUT_MODEL" --print-model); then
+    echo "::error::Could not resolve the model to run (python -m qa_bot.cli --print-model failed)"
+    exit 1
+fi
+MODEL=$(printf '%s\n' "$MODEL_CHOICE" | sed -n 1p)
+MODEL_REASON=$(printf '%s\n' "$MODEL_CHOICE" | sed -n 2p)
+
 # Provider follows the model id: an OpenRouter "vendor/slug" id (a Claude id
 # never has a slash) needs openrouter-api-key, anything else
 # anthropic-api-key. Check the one this run needs before any browser or AI
@@ -164,23 +178,34 @@ FAILURE_EOF
 # an aborted run — and say so on the PR: Docker actions don't enforce
 # `required: true`, so a missing or misnamed secret arrives as an empty input
 # and this is the only place that notices.
-case "$INPUT_MODEL" in
+case "$MODEL" in
     */*)
         PROVIDER="OpenRouter"
         PROVIDER_KEY_VAR="OPENROUTER_API_KEY"
         PROVIDER_KEY_INPUT="openrouter-api-key"
-        MODEL_CREDIT="$INPUT_MODEL via OpenRouter"
+        # The secret name the examples use: QA-Bot-specific, so a generic
+        # org-level OPENROUTER_API_KEY never switches a repo to Luna unasked
+        PROVIDER_SECRET="QA_BOT_OPENROUTER_API_KEY"
+        MODEL_CREDIT="$MODEL via OpenRouter"
         ;;
     *)
         PROVIDER="Anthropic"
         PROVIDER_KEY_VAR="ANTHROPIC_API_KEY"
         PROVIDER_KEY_INPUT="anthropic-api-key"
+        PROVIDER_SECRET="ANTHROPIC_API_KEY"
         MODEL_CREDIT="Claude AI"
         ;;
 esac
 if [ -z "${!PROVIDER_KEY_VAR}" ]; then
-    echo "::error::Model '$INPUT_MODEL' runs on $PROVIDER, but the $PROVIDER_KEY_INPUT input is empty — pass it from a secret (e.g. $PROVIDER_KEY_INPUT: \${{ secrets.$PROVIDER_KEY_VAR }})"
-    post_failure_notice "**QA Bot did not run:** model \`$INPUT_MODEL\` runs on $PROVIDER, but the \`$PROVIDER_KEY_INPUT\` input is empty — a missing or misnamed secret passes an empty string. Pass it from a secret, e.g. \`$PROVIDER_KEY_INPUT: \${{ secrets.$PROVIDER_KEY_VAR }}\`. Nothing was tested."
+    if [ -z "$INPUT_MODEL" ]; then
+        # No model input resolves to Luna whenever openrouter-api-key is set,
+        # so reaching here means both keys are empty — either one would do.
+        echo "::error::No API key: anthropic-api-key and openrouter-api-key are both empty — pass one from a secret (e.g. openrouter-api-key: \${{ secrets.QA_BOT_OPENROUTER_API_KEY }})"
+        post_failure_notice "**QA Bot did not run:** the \`anthropic-api-key\` and \`openrouter-api-key\` inputs are both empty — a missing or misnamed secret passes an empty string. Pass one from a secret, e.g. \`openrouter-api-key: \${{ secrets.QA_BOT_OPENROUTER_API_KEY }}\` (runs GPT-6 Luna) or \`anthropic-api-key: \${{ secrets.ANTHROPIC_API_KEY }}\` (runs Claude). Nothing was tested."
+    else
+        echo "::error::Model '$MODEL' runs on $PROVIDER, but the $PROVIDER_KEY_INPUT input is empty — pass it from a secret (e.g. $PROVIDER_KEY_INPUT: \${{ secrets.$PROVIDER_SECRET }})"
+        post_failure_notice "**QA Bot did not run:** model \`$MODEL\` runs on $PROVIDER, but the \`$PROVIDER_KEY_INPUT\` input is empty — a missing or misnamed secret passes an empty string. Pass it from a secret, e.g. \`$PROVIDER_KEY_INPUT: \${{ secrets.$PROVIDER_SECRET }}\`. Nothing was tested."
+    fi
     exit 1
 fi
 
@@ -199,7 +224,7 @@ fi
 echo "Max Agents: ${INPUT_MAX_AGENTS:-(mode default)}"
 if [ -n "$INPUT_MAX_COST" ]; then echo "Max Cost: \$$INPUT_MAX_COST"; else echo "Max Cost: (mode default)"; fi
 echo "Max Duration: ${INPUT_MAX_DURATION:-(mode default)}${INPUT_MAX_DURATION:+ minutes}"
-echo "Model: $INPUT_MODEL"
+echo "Model: $MODEL ($MODEL_REASON)"
 if [ "$PROVIDER" = "OpenRouter" ]; then
     echo "Provider: OpenRouter (screenshots, page text and test credentials go to OpenRouter and the model vendor, not Anthropic)"
 else
@@ -311,7 +336,7 @@ python -m qa_bot.cli "$INPUT_URL" \
     --goal "$INPUT_GOAL" \
     "${MODE_ARGS[@]}" \
     "${LIMIT_ARGS[@]}" \
-    --model "$INPUT_MODEL" \
+    --model "$MODEL" \
     --output json \
     --output-file /tmp/qa-result.json \
     --log-level full \

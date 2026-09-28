@@ -14,7 +14,17 @@
 #
 # Setup:
 # 1. Copy this file to .github/workflows/qa-bot-manual.yml
-# 2. Add ANTHROPIC_API_KEY to repository secrets
+# 2. Add ANTHROPIC_API_KEY to repository secrets. Unlike the other two
+#    examples, adding an OpenRouter key does NOT change the model here: a
+#    manual run uses the model you pick in the Run workflow form, which is
+#    Claude Sonnet 5 by default. To be able to pick openai/gpt-6-luna (GPT-6
+#    Luna, about 13x cheaper than Claude Sonnet 5), also add
+#    QA_BOT_OPENROUTER_API_KEY (an OpenRouter key). Without that secret, a
+#    Luna run stops before testing and names the missing secret. Picking
+#    Luna sends page text, screenshots and test credentials to OpenRouter
+#    and OpenAI, not Anthropic. (The secret has a QA-Bot-specific name, so a
+#    generic OPENROUTER_API_KEY inherited from your organization never
+#    reaches the bot.)
 # 3. Optionally add QA_BOT_STAGING_URL (variable), QA_BOT_CREDENTIALS (secret,
 #    KEY=value per line) and a checked-in .qa-known-issues.md
 # 4. Go to the Actions tab and run it
@@ -67,12 +77,16 @@ on:
       # Only ids the bot has pricing for (qa_bot/config.py MODEL_PRICING). An
       # unknown id still runs, but its cost cap is billed at the most
       # expensive known rates, so the run stops far earlier than expected.
+      # The form always sends a model, so this one always runs; the key
+      # rule the other examples rely on never applies. The default is Sonnet
+      # because it runs on the one required secret.
       model:
-        description: 'Claude model'
+        description: 'Model (openai/gpt-6-luna needs QA_BOT_OPENROUTER_API_KEY)'
         required: false
         type: choice
         options:
           - claude-sonnet-5
+          - openai/gpt-6-luna
           - claude-haiku-4-5
           - claude-opus-4-8
           - claude-opus-5-5
@@ -199,6 +213,7 @@ jobs:
           known-issues: ${{ steps.memory.outputs.known_issues }}
           previous-report: ${{ steps.memory.outputs.previous_report }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          openrouter-api-key: ${{ secrets.QA_BOT_OPENROUTER_API_KEY }}
           credentials: ${{ steps.memory.outputs.own_app == 'true' && secrets.QA_BOT_CREDENTIALS || '' }}
           post-comment: 'false'  # No PR to comment on
 

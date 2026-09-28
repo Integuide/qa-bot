@@ -1,8 +1,9 @@
 """OpenRouter provider — runs QA Bot on a non-Claude model (GPT-6 Luna) by id.
 
-Selected by model id only: a "vendor/slug" id (``openai/gpt-6-luna``) routes
-here through ``qa_bot.ai.create_provider``; Claude ids keep ClaudeProvider,
-which stays the default. Built for a like-for-like A/B: the prompts, the
+Selected by model id: a "vendor/slug" id (``openai/gpt-6-luna``) routes here
+through ``qa_bot.ai.create_provider``; Claude ids keep ClaudeProvider. Luna is
+the default whenever an OpenRouter key is available
+(``qa_bot.config.resolve_model``). Built for a like-for-like A/B: the prompts, the
 action/supervisor parsers and the history windowing are ClaudeProvider's own
 (borrowed below, not copied), so this module only translates the request to
 OpenAI chat format and the reply back into the AIProvider event protocol.

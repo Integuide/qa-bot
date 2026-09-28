@@ -21,7 +21,7 @@ from anthropic import (
 from pydantic import ValidationError
 
 from qa_bot.browser.controller import DUPLICATE_REF_PREFIX
-from qa_bot.config import DEFAULT_MODEL, MODEL_OPUS_5_5
+from qa_bot.config import DEFAULT_CLAUDE_MODEL, MODEL_OPUS_5_5
 from .base import AIProvider, AgentAction, FatalProviderError
 from .prompts import (
     get_worker_system_prompt_parts,
@@ -252,7 +252,7 @@ class ClaudeProvider(AIProvider):
     def __init__(
         self,
         api_key: str,
-        model: str = DEFAULT_MODEL,
+        model: str = DEFAULT_CLAUDE_MODEL,
         max_concurrent_calls: int = 2
     ):
         # Disable SDK-level retries — we handle retries ourselves with

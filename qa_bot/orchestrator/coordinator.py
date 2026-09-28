@@ -16,7 +16,7 @@ from qa_bot.orchestrator.supervisor import SupervisorAgent
 from qa_bot.orchestrator.synthesis import SynthesisAgent, apply_smoke_tag, format_duration
 from qa_bot.orchestrator.flow import FlowTask, FlowStatus
 from qa_bot.orchestrator.recheck import RECHECK_SLOTS
-from qa_bot.config import VIEWPORT_WIDTH, VIEWPORT_HEIGHT, LOG_CHAT_HISTORY, LOG_DIR, LOG_SCREENSHOTS, LOG_MAX_RUNS, ENVIRONMENT, TESTMAIL_API_KEY, TESTMAIL_NAMESPACE, MAX_COST_CAP_USD, DEFAULT_MODEL, recheck_criticals_default
+from qa_bot.config import VIEWPORT_WIDTH, VIEWPORT_HEIGHT, LOG_CHAT_HISTORY, LOG_DIR, LOG_SCREENSHOTS, LOG_MAX_RUNS, ENVIRONMENT, TESTMAIL_API_KEY, TESTMAIL_NAMESPACE, MAX_COST_CAP_USD, DEFAULT_CLAUDE_MODEL, recheck_criticals_default
 from qa_bot.utils.chat_logger import ChatLogger
 from qa_bot.utils.secrets import redact_obj, redact_values
 from qa_bot.services.email_service import EmailService
@@ -306,7 +306,7 @@ class FlowExplorationOrchestrator:
         self._reset_recheck_slots(num_agents)
 
         # Get model from AI provider for cost tracking
-        model = getattr(self.ai, 'model', DEFAULT_MODEL)
+        model = getattr(self.ai, 'model', DEFAULT_CLAUDE_MODEL)
 
         self._last_summary_status = None
 

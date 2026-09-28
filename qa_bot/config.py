@@ -2,6 +2,9 @@ import logging
 import os
 import re
 import subprocess
+from dataclasses import dataclass
+from typing import Optional
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -47,14 +50,11 @@ MODEL_OPUS = "claude-opus-4-8"
 MODEL_OPUS_5_5 = "claude-opus-5-5"
 MODEL_FABLE = "claude-fable-5-1"
 MODEL_FABLE_5 = "claude-fable-5"
-DEFAULT_MODEL = MODEL_SONNET
-
-AI_MODEL = os.getenv("AI_MODEL", DEFAULT_MODEL)
 
 # OpenRouter: any "vendor/slug" model id (a Claude id never has a slash) runs
-# on OpenRouterProvider instead of Claude — CLI / GitHub Action only, never a
-# default. Screenshots, page text and test credentials in prompts then go to
-# OpenRouter and the model vendor, not Anthropic.
+# on OpenRouterProvider instead of Claude. Screenshots, page text and test
+# credentials in prompts then go to OpenRouter and the model vendor, not
+# Anthropic.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 MODEL_GPT6_LUNA = "openai/gpt-6-luna"
 # Reasoning effort per role ("minimal"/"low"/"medium"/"high"/"xhigh"; empty =
@@ -66,10 +66,62 @@ OPENROUTER_SYNTHESIS_EFFORT = os.getenv("OPENROUTER_SYNTHESIS_EFFORT", "low").st
 # Per-request timeout. Calls are non-streaming, so this bounds a whole reply.
 OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "300"))
 
+# Default model — there are two, picked by resolve_model() from the keys a
+# run has (owner decision 2026-09-23). GPT-6 Luna whenever an OpenRouter key
+# is available: a live A/B on the same 8-minute run cost ~13x less than
+# Sonnet 5 ($0.146 vs $1.89) with no protocol errors, at somewhat shallower
+# coverage. Claude Sonnet 5 otherwise, so a caller with only an Anthropic
+# key (every public action user before this change) runs exactly as before.
+# DEFAULT_CLAUDE_MODEL is also ClaudeProvider's default and the cost-pricing
+# fallback when no model is known (the pricier of the two keeps a cost cap
+# conservative).
+DEFAULT_OPENROUTER_MODEL = MODEL_GPT6_LUNA
+DEFAULT_CLAUDE_MODEL = MODEL_SONNET
+
+# Web UI server only: an explicit model override (empty = resolve_model's
+# default). It applies whenever the key a run uses can run it, so
+# AI_MODEL=claude-haiku-4-5 makes Anthropic-key runs default to Haiku while
+# OpenRouter-key runs keep Luna. An id not in MODEL_PRICING is ignored, with
+# a warning (server/routes.py _ai_model_override). The CLI and the action
+# never read it (qa-bot/.env sets it for local web UI runs; --model / the
+# model input is their override).
+AI_MODEL = os.getenv("AI_MODEL", "").strip() or None
+
 
 def is_openrouter_model(model: str) -> bool:
     """True for OpenRouter "vendor/slug" ids (openai/gpt-6-luna)."""
     return "/" in (model or "")
+
+
+@dataclass(frozen=True)
+class ModelChoice:
+    """The model a run uses and why — the why is printed by the CLI, the
+    action log and the server log so a defaulted model is never a surprise."""
+    model: str
+    reason: str
+
+
+def resolve_model(
+    requested: Optional[str], have_openrouter_key: bool, have_anthropic_key: bool,
+) -> ModelChoice:
+    """The one default-model rule, shared by the CLI, the GitHub Action (via
+    ``cli --print-model``) and the web UI server.
+
+    An explicit model always wins, even when its provider's key is missing
+    (the caller's key check then names the missing key). Otherwise GPT-6
+    Luna whenever an OpenRouter key is available, else Claude Sonnet 5 —
+    also with no key at all, so the missing-key error a caller raises is the
+    one it raised before Luna was the default.
+    """
+    requested = (requested or "").strip()
+    if requested:
+        return ModelChoice(requested, "requested")
+    if have_openrouter_key:
+        return ModelChoice(DEFAULT_OPENROUTER_MODEL, "default when an OpenRouter key is available")
+    if have_anthropic_key:
+        return ModelChoice(DEFAULT_CLAUDE_MODEL, "default when only an Anthropic key is available")
+    return ModelChoice(DEFAULT_CLAUDE_MODEL, "default, but no API key is available")
+
 
 # Model pricing per million tokens (USD)
 # Used for cost tracking and Max Cost -> Max Tokens conversion
@@ -252,9 +304,10 @@ API_HOST = os.getenv("API_HOST", "0.0.0.0")
 # Branch *_claude_N -> Port 81N0 (e.g., 0105_claude_0 -> 8100)
 API_PORT = int(os.getenv("API_PORT", str(_get_port_from_branch())))
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-# /api/flow/start checks the API key against Anthropic before a run starts so
-# a revoked/typo'd key fails in <1s with a clear message. Set to true only
-# where no real key exists (the e2e suite runs the server with a dummy key).
+# /api/flow/start checks the API key with its provider (Anthropic or
+# OpenRouter) before a run starts so a revoked/typo'd key fails in <1s with a
+# clear message. Set to true only where no real key exists (the e2e suite
+# runs the server with a dummy key).
 SKIP_API_KEY_VALIDATION = os.getenv("SKIP_API_KEY_VALIDATION", "false").lower() == "true"
 
 # Email Testing Service (Testmail.app) - for testing email verification flows
@@ -264,9 +317,11 @@ TESTMAIL_NAMESPACE = os.getenv("TESTMAIL_NAMESPACE", "")
 
 
 def is_api_key_required() -> bool:
-    """Return True if user must provide their own Anthropic API key.
+    """Return True if the user must provide their own API key (OpenRouter or
+    Anthropic).
 
     In production, users must always provide their own key.
-    In development, the server's key is used by default but users can override.
+    In development, the server's keys are used by default (either one is
+    enough) but users can override.
     """
-    return ENVIRONMENT != "development" or not ANTHROPIC_API_KEY
+    return ENVIRONMENT != "development" or not (ANTHROPIC_API_KEY or OPENROUTER_API_KEY)

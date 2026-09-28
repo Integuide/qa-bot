@@ -28,7 +28,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
 
-from qa_bot.config import LOG_LEVEL, MAX_CONCURRENT_API_CALLS, DEFAULT_MODEL
+from qa_bot.config import (
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_OPENROUTER_MODEL,
+    LOG_LEVEL,
+    MAX_CONCURRENT_API_CALLS,
+    ModelChoice,
+    is_openrouter_model,
+    resolve_model,
+)
 from qa_bot.utils.secrets import is_sensitive_field_label
 
 # Configure logging with level from environment
@@ -692,6 +700,9 @@ async def run_exploration(
         "target_url": url,
         "goal": goal,
         "mode": "smoke" if smoke else "full",
+        # The model that ran — it decides where screenshots, page text and
+        # credentials went (summary.json carries the same field).
+        "model": model,
         "timestamp": datetime.now().isoformat()
     }
 
@@ -764,6 +775,68 @@ def resolve_limits(args) -> tuple[int, int, float]:
         args.max_duration if args.max_duration is not None else defaults["max_duration"],
         args.max_cost if args.max_cost is not None else defaults["max_cost"],
     )
+
+
+def resolve_cli_model(args) -> ModelChoice:
+    """The model a CLI run uses, and why.
+
+    ``--model`` wins. Otherwise a key passed by flag says which provider the
+    caller means: with exactly one of ``--api-key`` / ``--openrouter-api-key``
+    that provider's default runs, whatever other key the environment or
+    .env holds — ``--api-key sk-ant-…`` must not run GPT-6 Luna on an
+    ambient OpenRouter key and send page data to OpenAI. Everything else
+    (no key flag, or both) is resolve_model's rule over all the keys at
+    hand. The action passes its keys by environment, never by flag, so it
+    always takes that last path.
+    """
+    if not (args.model or "").strip():
+        if args.api_key and not args.openrouter_api_key:
+            return ModelChoice(DEFAULT_CLAUDE_MODEL, "default for the Anthropic key passed with --api-key")
+        if args.openrouter_api_key and not args.api_key:
+            return ModelChoice(
+                DEFAULT_OPENROUTER_MODEL, "default for the OpenRouter key passed with --openrouter-api-key",
+            )
+    return resolve_model(
+        args.model,
+        bool(args.openrouter_api_key or os.getenv("OPENROUTER_API_KEY")),
+        bool(args.api_key or os.getenv("ANTHROPIC_API_KEY")),
+    )
+
+
+def model_notice(choice: ModelChoice) -> str:
+    """The stderr line(s) naming the model a run uses and why, printed at
+    every log level, quiet included.
+
+    An OPENROUTER_API_KEY exported for some other tool, or found in a .env,
+    switches a run without flags to GPT-6 Luna. So an OpenRouter model also
+    gets a line saying where the data goes. Without it, a run could send
+    screenshots, page text and test credentials to OpenRouter and OpenAI
+    without anyone having chosen that.
+    """
+    notice = f"Model: {choice.model} ({choice.reason})"
+    if is_openrouter_model(choice.model):
+        vendor = choice.model.split("/", 1)[0]
+        notice += (
+            "\nNote: screenshots, page text and test credentials go to OpenRouter "
+            f"and the model vendor ({vendor}), not Anthropic; pass --model "
+            f"{DEFAULT_CLAUDE_MODEL} to keep them on Anthropic"
+        )
+    return notice
+
+
+def format_markdown_output(result: dict) -> str:
+    """The ``--output markdown`` text: the report, then a footer naming the
+    model, because the synthesis report doesn't name it.
+
+    Only the CLI's markdown output gets the footer. The JSON ``report``
+    field stays the bare report, because the action adds its own "Generated
+    by QA Bot using <model>" footer to it.
+    """
+    model = result.get("model")
+    if not model:
+        return result["report"]
+    provider = "OpenRouter" if is_openrouter_model(model) else "Anthropic"
+    return f"{result['report'].rstrip()}\n\n---\n*Model: {model} via {provider}*"
 
 
 def main():
@@ -877,24 +950,41 @@ Examples:
     parser.add_argument(
         "--api-key",
         default=None,
-        help="Anthropic API key (or set ANTHROPIC_API_KEY env var)"
+        help=(
+            "Anthropic API key for Claude models (or set ANTHROPIC_API_KEY "
+            "env var). Passed without --openrouter-api-key and --model, the "
+            f"run uses {DEFAULT_CLAUDE_MODEL} even when an OpenRouter key is "
+            "in the environment"
+        )
     )
     parser.add_argument(
         "--openrouter-api-key",
         default=None,
         help=(
-            "OpenRouter API key, needed only for an OpenRouter model id "
-            "(or set OPENROUTER_API_KEY env var)"
+            "OpenRouter API key for 'vendor/slug' models (or set "
+            "OPENROUTER_API_KEY env var). With it and no --model, the run "
+            f"uses {DEFAULT_OPENROUTER_MODEL}"
         )
     )
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
+        default=None,
         help=(
-            f"Model to use (default: {DEFAULT_MODEL}). A 'vendor/slug' id "
-            "such as openai/gpt-6-luna runs on OpenRouter and needs "
-            "--openrouter-api-key; screenshots and prompts then go to "
-            "OpenRouter and the model vendor"
+            f"Model to use (default: {DEFAULT_OPENROUTER_MODEL} when an "
+            f"OpenRouter key is set, else {DEFAULT_CLAUDE_MODEL}; a key "
+            "passed by flag alone picks its own provider's default). A "
+            "'vendor/slug' id runs on OpenRouter and needs "
+            "--openrouter-api-key; screenshots, page text and test "
+            "credentials then go to OpenRouter and the model vendor"
+        )
+    )
+    parser.add_argument(
+        "--print-model",
+        action="store_true",
+        help=(
+            "Print the model this run would use and why (two lines), then "
+            "exit without running — the GitHub Action resolves its default "
+            "model this way"
         )
     )
     parser.add_argument(
@@ -967,6 +1057,17 @@ Examples:
     # needs one (create_provider raises MissingAPIKeyError otherwise).
     api_key = args.api_key or os.getenv("ANTHROPIC_API_KEY")
     openrouter_api_key = args.openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
+    # --model wins; then a key passed alone by flag picks its provider's
+    # default; otherwise GPT-6 Luna when an OpenRouter key is set, else
+    # Claude Sonnet 5 (resolve_cli_model / qa_bot.config.resolve_model — the
+    # rule the action and the web UI share). AI_MODEL is deliberately not
+    # read: it is the web UI server's override, and qa-bot/.env sets it for
+    # local UI runs.
+    model_choice = resolve_cli_model(args)
+    if args.print_model:
+        print(model_choice.model)
+        print(model_choice.reason)
+        sys.exit(0)
 
     # Parse credentials
     credentials = {}
@@ -1018,6 +1119,12 @@ Examples:
         )
     if args.smoke and args.goal != parser.get_default("goal") and log_level != "quiet":
         print("Note: --smoke uses a fixed smoke goal; --goal is ignored", file=sys.stderr)
+    # Printed at every log level, quiet (the default) included, because the
+    # model decides where screenshots, page text and credentials go, and an
+    # ambient OPENROUTER_API_KEY can change it. It goes to stderr so that
+    # --output json on stdout stays parseable. --print-model exited above,
+    # so its stdout is still only its two lines.
+    print(model_notice(model_choice), file=sys.stderr)
 
     # Run exploration
     try:
@@ -1028,7 +1135,7 @@ Examples:
             max_agents=max_agents,
             max_duration=max_duration,
             api_key=api_key,
-            model=args.model,
+            model=model_choice.model,
             headless=not args.headed,
             log_level=log_level,
             credentials=credentials if credentials else None,
@@ -1040,9 +1147,18 @@ Examples:
             recheck_criticals=args.recheck_criticals,
         ))
     except MissingAPIKeyError as e:
-        flag = "--openrouter-api-key" if e.env_var == "OPENROUTER_API_KEY" else "--api-key"
-        print(f"Error: {e}", file=sys.stderr)
-        print(f"Set it via {flag} or the {e.env_var} environment variable", file=sys.stderr)
+        if not api_key and not openrouter_api_key and not args.model:
+            # No key at all and no model asked for: either key works.
+            print(
+                "Error: no API key is set. Set OPENROUTER_API_KEY / "
+                f"--openrouter-api-key (runs {DEFAULT_OPENROUTER_MODEL}) or "
+                f"ANTHROPIC_API_KEY / --api-key (runs {DEFAULT_CLAUDE_MODEL})",
+                file=sys.stderr,
+            )
+        else:
+            flag = "--openrouter-api-key" if e.env_var == "OPENROUTER_API_KEY" else "--api-key"
+            print(f"Error: {e}", file=sys.stderr)
+            print(f"Set it via {flag} or the {e.env_var} environment variable", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         print("\nExploration cancelled", file=sys.stderr)
@@ -1066,7 +1182,7 @@ Examples:
     if args.output == "json":
         output = json.dumps(result, indent=2, default=str)
     else:
-        output = result["report"]
+        output = format_markdown_output(result)
 
     # Write output
     if args.output_file:

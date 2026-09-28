@@ -1,10 +1,10 @@
 # QA Bot
 
-AI-powered website QA testing using Claude. Automatically explores user flows and finds bugs, broken elements, or usability problems.
+AI-powered website QA testing — GPT-6 Luna via OpenRouter, or Claude. Automatically explores user flows and finds bugs, broken elements, or usability problems.
 
 ## How It Works
 
-QA Bot uses Claude AI to explore your website like a real user would:
+QA Bot uses an AI model (GPT-6 Luna with an OpenRouter key, Claude with an Anthropic key) to explore your website like a real user would:
 
 1. **Discovers flows** - Finds signup, login, checkout, and other user journeys
 2. **Tests interactions** - Clicks buttons, fills forms, navigates pages
@@ -17,7 +17,8 @@ QA Bot uses Claude AI to explore your website like a real user would:
 - uses: Integuide/qa-bot@main
   with:
     url: 'https://your-staging-site.com'
-    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    openrouter-api-key: ${{ secrets.QA_BOT_OPENROUTER_API_KEY }}  # runs GPT-6 Luna via OpenRouter/OpenAI (recommended)
+    # or: anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}  # runs Claude Sonnet 5
     github-token: ${{ github.token }}  # Required to post the report as a PR comment
 ```
 
@@ -28,8 +29,8 @@ To post the report as a PR comment, the job also needs `permissions: pull-reques
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `url` | Yes | - | Target URL to test |
-| `anthropic-api-key` | For Claude models | - | Anthropic API key (every model id without a slash, including the default) |
-| `openrouter-api-key` | For OpenRouter models | - | OpenRouter API key, only for a `vendor/slug` `model` such as `openai/gpt-6-luna` — see [Non-Claude models](#non-claude-models-openrouter) |
+| `openrouter-api-key` | One key required | - | OpenRouter API key — recommended: with no `model` set the run uses `openai/gpt-6-luna`; also needed for any other `vendor/slug` model. See [Model and keys](#model-and-keys) |
+| `anthropic-api-key` | One key required | - | Anthropic API key, for Claude models (every model id without a slash); with no `model` and no `openrouter-api-key` the run uses `claude-sonnet-5` |
 | `goal` | No | Explore flows and find bugs | Testing focus |
 | `known-issues` | No | - | Already-acknowledged issues / environment caveats (free text, one per line). Matches aren't re-investigated and appear only as one-line "observed again" notes in the report, not as new findings |
 | `previous-report` | No | - | The previous run's report for the same target (path to its `report.md`, or the markdown inline). Findings are labelled **NEW** / **recurring (seen in previous run)** and previous findings not observed are listed once (never as "fixed"); the PR footer prints "N new, M recurring". Labels only — severity never changes; use `known-issues` to acknowledge a finding |
@@ -37,7 +38,7 @@ To post the report as a PR comment, the job also needs `permissions: pull-reques
 | `max-agents` | No | `3` (smoke: `1`) | Parallel AI agents (1-10). Empty = the default for the mode |
 | `max-cost` | No | `5.0` (smoke: `0.75`) | Maximum cost in USD. Empty = the default for the mode |
 | `max-duration` | No | `30` (smoke: `5`) | Maximum duration in minutes. Empty = the default for the mode |
-| `model` | No | `claude-sonnet-5` | A Claude model, or an OpenRouter `vendor/slug` id such as `openai/gpt-6-luna` |
+| `model` | No | (empty) | Empty = `openai/gpt-6-luna` when `openrouter-api-key` is set, else `claude-sonnet-5`. Or a Claude model / an OpenRouter `vendor/slug` id, which always wins |
 | `post-comment` | No | `true` | Post results as PR comment |
 | `comment-mode` | No | `update` | On re-runs, `update` edits the earlier QA Bot report comment in place (one current report per PR); `new` posts a fresh comment and collapses the earlier one under a "Superseded QA Bot report" summary |
 | `github-token` | No | - | GitHub token for PR comments. Pass `${{ github.token }}` when `post-comment` is `true` |
@@ -255,24 +256,19 @@ to verify) therefore buys much better coverage per dollar than a generic one.
 If a run's report says goal-critical flows were still untested at the cost
 limit, raise `max-cost` for that workflow.
 
-## Non-Claude models (OpenRouter)
+## Model and keys
 
-Set `model` to an OpenRouter `vendor/slug` id and pass `openrouter-api-key`
-instead of `anthropic-api-key`:
+With `model` empty (the default), QA Bot runs **GPT-6 Luna**
+(`openai/gpt-6-luna`, via OpenRouter) whenever `openrouter-api-key` is set —
+about 13x cheaper than Claude Sonnet 5 on the same run, with somewhat
+shallower coverage — and **Claude Sonnet 5** otherwise, so a workflow that
+passes only `anthropic-api-key` keeps running Claude. Name a `model` to pick
+one yourself. The job log says which model ran and why.
 
-```yaml
-- uses: Integuide/qa-bot@main
-  with:
-    url: 'https://your-staging-site.com'
-    model: openai/gpt-6-luna
-    openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
-    github-token: ${{ github.token }}
-```
-
-The same prompts run through OpenRouter's chat API. The action fails fast
-if the chosen model's key is missing, and the PR footer shows the charge
-OpenRouter reported next to the token estimate. **Screenshots, page text
-and test credentials go to OpenRouter and the model vendor, not
+The action fails fast if the resolved model's key is missing, and for an
+OpenRouter run the PR footer shows the charge OpenRouter reported next to
+the token estimate. **With an OpenRouter key, screenshots, page text and
+test credentials go to OpenRouter and the model vendor (OpenAI), not
 Anthropic.**
 
 ## Issue Severity
@@ -296,7 +292,7 @@ step's `env:` to turn it off.
 
 ## Requirements
 
-- Anthropic API key ([get one here](https://console.anthropic.com/)), or an OpenRouter key for an OpenRouter `model`
+- An OpenRouter API key ([get one here](https://openrouter.ai/settings/keys)) or an Anthropic API key ([get one here](https://console.anthropic.com/))
 - Publicly accessible URL (or use a tunnel for localhost)
 
 **Re-running on the same PR?** The report comment is updated in place by default (it carries a hidden `<!-- qa-bot-report -->` marker), so a fix-and-rerun cycle never leaves a stack of stale reports. Set `comment-mode: new` to keep each run as its own comment — earlier reports are then collapsed under a "Superseded QA Bot report" summary. A run that fails before producing results always posts a separate, short failure notice.

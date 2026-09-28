@@ -31,7 +31,14 @@
 #
 # Setup:
 # 1. Copy this file to .github/workflows/qa-bot-staging-to-prod.yml
-# 2. Add ANTHROPIC_API_KEY to repository secrets
+# 2. Add ANTHROPIC_API_KEY to repository secrets (the goal step calls Claude
+#    Haiku with it). Recommended: also add QA_BOT_OPENROUTER_API_KEY (an
+#    OpenRouter key). Setting it switches every run to GPT-6 Luna via
+#    OpenRouter, about 13x cheaper than Claude Sonnet 5 per run — page text,
+#    screenshots and test credentials then go to OpenRouter and OpenAI, not
+#    Anthropic. Unset, the bot runs Claude Sonnet 5 on ANTHROPIC_API_KEY. The
+#    name is QA Bot's own on purpose: a generic OPENROUTER_API_KEY inherited
+#    from your organization would switch the model without anyone choosing it.
 # 3. Add QA_BOT_STAGING_URL as a repository variable (Settings > Variables)
 # 4. Optional: add a QA_BOT_CREDENTIALS secret, KEY=value per line (test
 #    account logins; HTTP_USERNAME / HTTP_PASSWORD for a basic-auth staging box)
@@ -326,6 +333,10 @@ jobs:
           # last run must not be demoted this run.
           known-issues: ${{ steps.memory.outputs.known_issues }}
           previous-report: ${{ steps.memory.outputs.previous_report }}
+          # No model: GPT-6 Luna (via OpenRouter/OpenAI) when
+          # QA_BOT_OPENROUTER_API_KEY is set, else Claude Sonnet 5 on
+          # ANTHROPIC_API_KEY (an unset secret passes '').
+          openrouter-api-key: ${{ secrets.QA_BOT_OPENROUTER_API_KEY }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           github-token: ${{ github.token }}
           # Empty when the secret isn't set. Every line is shown to the AI and
