@@ -18,7 +18,7 @@ QA Bot uses an AI model (GPT-6 Luna with an OpenRouter key, Claude with an Anthr
   with:
     url: 'https://your-staging-site.com'
     openrouter-api-key: ${{ secrets.QA_BOT_OPENROUTER_API_KEY }}  # runs GPT-6 Luna via OpenRouter/OpenAI (recommended)
-    # or: anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}  # runs Claude Sonnet 5
+    # or: anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}  # runs Claude Sonnet 5.5
     github-token: ${{ github.token }}  # Required to post the report as a PR comment
 ```
 
@@ -30,7 +30,7 @@ To post the report as a PR comment, the job also needs `permissions: pull-reques
 |-------|----------|---------|-------------|
 | `url` | Yes | - | Target URL to test |
 | `openrouter-api-key` | One key required | - | OpenRouter API key — recommended: with no `model` set the run uses `openai/gpt-6-luna`; also needed for any other `vendor/slug` model. See [Model and keys](#model-and-keys) |
-| `anthropic-api-key` | One key required | - | Anthropic API key, for Claude models (every model id without a slash); with no `model` and no `openrouter-api-key` the run uses `claude-sonnet-5` |
+| `anthropic-api-key` | One key required | - | Anthropic API key, for Claude models (every model id without a slash); with no `model` and no `openrouter-api-key` the run uses `claude-sonnet-5-5` |
 | `goal` | No | Explore flows and find bugs | Testing focus |
 | `known-issues` | No | - | Already-acknowledged issues / environment caveats (free text, one per line). Matches aren't re-investigated and appear only as one-line "observed again" notes in the report, not as new findings |
 | `previous-report` | No | - | The previous run's report for the same target (path to its `report.md`, or the markdown inline). Findings are labelled **NEW** / **recurring (seen in previous run)** and previous findings not observed are listed once (never as "fixed"); the PR footer prints "N new, M recurring". Labels only — severity never changes; use `known-issues` to acknowledge a finding |
@@ -38,7 +38,7 @@ To post the report as a PR comment, the job also needs `permissions: pull-reques
 | `max-agents` | No | `3` (smoke: `1`) | Parallel AI agents (1-10). Empty = the default for the mode |
 | `max-cost` | No | `5.0` (smoke: `0.75`) | Maximum cost in USD. Empty = the default for the mode |
 | `max-duration` | No | `30` (smoke: `5`) | Maximum duration in minutes. Empty = the default for the mode |
-| `model` | No | (empty) | Empty = `openai/gpt-6-luna` when `openrouter-api-key` is set, else `claude-sonnet-5`. Or a Claude model / an OpenRouter `vendor/slug` id, which always wins |
+| `model` | No | (empty) | Empty = `openai/gpt-6-luna` when `openrouter-api-key` is set, else `claude-sonnet-5-5`. Or a Claude model / an OpenRouter `vendor/slug` id, which always wins |
 | `post-comment` | No | `true` | Post results as PR comment |
 | `comment-mode` | No | `update` | On re-runs, `update` edits the earlier QA Bot report comment in place (one current report per PR); `new` posts a fresh comment and collapses the earlier one under a "Superseded QA Bot report" summary |
 | `github-token` | No | - | GitHub token for PR comments. Pass `${{ github.token }}` when `post-comment` is `true` |
@@ -243,7 +243,7 @@ Inputs for testing email verification flows with [Testmail.app](https://testmail
 QA Bot tracks API costs in real-time and stops when limits are reached:
 
 - **Default limit:** $5.00 per run
-- **Sonnet 5 model (default):** ~$1.50-7.00 per typical full run (smoke runs ~$0.25)
+- **Sonnet 5.5 model (default):** ~$1.50-7.00 per typical full run (smoke runs ~$0.25)
 - **Haiku model (budget):** ~$0.50-2.00 per typical run
 - **Opus 4.8 model (premium):** ~$4.00-15.00 per typical run
 
@@ -261,7 +261,7 @@ limit, raise `max-cost` for that workflow.
 With `model` empty (the default), QA Bot runs **GPT-6 Luna**
 (`openai/gpt-6-luna`, via OpenRouter) whenever `openrouter-api-key` is set —
 about 13x cheaper than Claude Sonnet 5 on the same run, with somewhat
-shallower coverage — and **Claude Sonnet 5** otherwise, so a workflow that
+shallower coverage — and **Claude Sonnet 5.5** otherwise, so a workflow that
 passes only `anthropic-api-key` keeps running Claude. Name a `model` to pick
 one yourself. The job log says which model ran and why.
 

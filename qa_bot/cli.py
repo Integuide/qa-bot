@@ -1059,7 +1059,7 @@ Examples:
     openrouter_api_key = args.openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
     # --model wins; then a key passed alone by flag picks its provider's
     # default; otherwise GPT-6 Luna when an OpenRouter key is set, else
-    # Claude Sonnet 5 (resolve_cli_model / qa_bot.config.resolve_model — the
+    # Claude Sonnet 5.5 (resolve_cli_model / qa_bot.config.resolve_model — the
     # rule the action and the web UI share). AI_MODEL is deliberately not
     # read: it is the web UI server's override, and qa-bot/.env sets it for
     # local UI runs.

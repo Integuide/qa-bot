@@ -160,8 +160,8 @@ FAILURE_EOF
 # Model: the model input when set; empty (the default) asks the CLI, which
 # applies the one rule the CLI and the web UI share
 # (qa_bot.config.resolve_model): GPT-6 Luna whenever openrouter-api-key is
-# set, else Claude Sonnet 5 — so a workflow passing only anthropic-api-key
-# runs exactly as before. Resolved here so the key check, the log and the PR
+# set, else Claude Sonnet 5.5 — so a workflow passing only anthropic-api-key
+# still runs Claude. Resolved here so the key check, the log and the PR
 # footer name the model that will run, and passed on as --model so the run
 # cannot pick another.
 if ! MODEL_CHOICE=$(python -m qa_bot.cli "$INPUT_URL" --model "$INPUT_MODEL" --print-model); then

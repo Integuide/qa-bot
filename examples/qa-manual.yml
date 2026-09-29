@@ -17,7 +17,7 @@
 # 2. Add ANTHROPIC_API_KEY to repository secrets. Unlike the other two
 #    examples, adding an OpenRouter key does NOT change the model here: a
 #    manual run uses the model you pick in the Run workflow form, which is
-#    Claude Sonnet 5 by default. To be able to pick openai/gpt-6-luna (GPT-6
+#    Claude Sonnet 5.5 by default. To be able to pick openai/gpt-6-luna (GPT-6
 #    Luna, about 13x cheaper than Claude Sonnet 5), also add
 #    QA_BOT_OPENROUTER_API_KEY (an OpenRouter key). Without that secret, a
 #    Luna run stops before testing and names the missing secret. Picking
@@ -85,13 +85,14 @@ on:
         required: false
         type: choice
         options:
+          - claude-sonnet-5-5
           - claude-sonnet-5
           - openai/gpt-6-luna
           - claude-haiku-4-5
           - claude-opus-4-8
           - claude-opus-5-5
           - claude-fable-5-1
-        default: 'claude-sonnet-5'
+        default: 'claude-sonnet-5-5'
 
 jobs:
   qa-test:

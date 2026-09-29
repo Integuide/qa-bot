@@ -94,10 +94,14 @@ HISTORY_OMITTED_NOTE = (
 )
 
 
-# Model-id prefixes whose thinking can't be turned off at all: an explicit
-# {"type": "disabled"} is a 400 (Fable/Mythos, Opus 5.5). Effort is the only
-# lever, so synthesis asks for low effort instead of disabling thinking.
-_THINKING_ALWAYS_ON_PREFIXES = ("claude-fable", "claude-mythos", MODEL_OPUS_5_5)
+# Model-id prefixes that 400 on an explicit {"type": "disabled"} (Fable/Mythos,
+# Opus 5.5, Sonnet 5.5). Effort is the lever there, so synthesis asks for low
+# effort instead of disabling thinking. (Sonnet 5.5's own off switch,
+# "between_tools", 400s on every other model; low effort is the migration
+# guide's first choice anyway.)
+_THINKING_ALWAYS_ON_PREFIXES = (
+    "claude-fable", "claude-mythos", MODEL_OPUS_5_5, "claude-sonnet-5-5",
+)
 
 # Model-id prefixes that still take the legacy enabled+budget_tokens form:
 # Haiku (which rejects adaptive), Claude 3.x, Sonnet 4.x and Opus 4.0-4.6.
@@ -149,6 +153,12 @@ def _thinking_config(model: str, budget_tokens: int, *, stream_to_ui: bool = Fal
 # section — truncating it nulls the curated count — so they get headroom.
 SYNTHESIS_MAX_TOKENS = 16000
 SYNTHESIS_MAX_TOKENS_ALWAYS_ON = 32000
+# Synthesis is non-streaming, and without an explicit timeout the SDK refuses
+# any max_tokens it estimates could run past 10 minutes (~21K) before a
+# request is sent: "Streaming is required ..." (seen live 2026-09-29, the
+# 32K always-on budget on Sonnet 5.5). An explicit per-request timeout skips
+# that estimate.
+SYNTHESIS_TIMEOUT_S = 900.0
 
 
 def _synthesis_thinking_kwargs(model: str) -> dict:
@@ -1206,6 +1216,7 @@ class ClaudeProvider(AIProvider):
                     if self.model.startswith(_THINKING_ALWAYS_ON_PREFIXES)
                     else SYNTHESIS_MAX_TOKENS
                 ),
+                timeout=SYNTHESIS_TIMEOUT_S,
                 system=[{
                     "type": "text",
                     "text": SYNTHESIS_SYSTEM_PROMPT,

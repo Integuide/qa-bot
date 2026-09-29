@@ -44,12 +44,13 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Model ID constants (single source of truth for model identifiers)
 MODEL_HAIKU = "claude-haiku-4-5"
-MODEL_SONNET = "claude-sonnet-5"
+MODEL_SONNET = "claude-sonnet-5-5"
 MODEL_OPUS = "claude-opus-4-8"
 # Selectable via --model / AI_MODEL / the manual workflow, never defaults.
 MODEL_OPUS_5_5 = "claude-opus-5-5"
 MODEL_FABLE = "claude-fable-5-1"
 MODEL_FABLE_5 = "claude-fable-5"
+MODEL_SONNET_5 = "claude-sonnet-5"
 
 # OpenRouter: any "vendor/slug" model id (a Claude id never has a slash) runs
 # on OpenRouterProvider instead of Claude. Screenshots, page text and test
@@ -70,8 +71,9 @@ OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "300"
 # run has (owner decision 2026-09-23). GPT-6 Luna whenever an OpenRouter key
 # is available: a live A/B on the same 8-minute run cost ~13x less than
 # Sonnet 5 ($0.146 vs $1.89) with no protocol errors, at somewhat shallower
-# coverage. Claude Sonnet 5 otherwise, so a caller with only an Anthropic
-# key (every public action user before this change) runs exactly as before.
+# coverage. Claude Sonnet 5.5 otherwise (Sonnet 5 until 2026-09-29, same
+# price), so a caller with only an Anthropic key (every public action user
+# before this change) runs Claude as before.
 # DEFAULT_CLAUDE_MODEL is also ClaudeProvider's default and the cost-pricing
 # fallback when no model is known (the pricier of the two keeps a cost cap
 # conservative).
@@ -109,7 +111,7 @@ def resolve_model(
 
     An explicit model always wins, even when its provider's key is missing
     (the caller's key check then names the missing key). Otherwise GPT-6
-    Luna whenever an OpenRouter key is available, else Claude Sonnet 5 —
+    Luna whenever an OpenRouter key is available, else Claude Sonnet 5.5 —
     also with no key at all, so the missing-key error a caller raises is the
     one it raised before Luna was the default.
     """
@@ -129,7 +131,8 @@ def resolve_model(
 # Sonnet 5 re-checked 2026-09-23: "The $2/$10 per million input/output token
 # pricing for Claude Sonnet 5, announced at launch as introductory pricing
 # through August 31, 2026, is now the standard price. The previously scheduled
-# increase to $3/$15 ... will not occur."). Note: Sonnet 5's tokenizer emits
+# increase to $3/$15 ... will not occur."); Sonnet 5.5 launched 2026-09-29 at
+# the same price and tokenizer. Note: Sonnet 5's tokenizer emits
 # ~30% more tokens for the same text than Haiku/Sonnet 4.6, so a given dollar cap
 # buys less exploration than the raw per-token rate ratio suggests.
 MODEL_PRICING: dict[str, dict[str, float]] = {
@@ -167,6 +170,13 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
         "cache_read": 0.25,     # $0.25/MTok (2.5% of input)
         "cache_creation": 12.5,    # $12.50/MTok (125% of input)
         "estimated_blended": 22.0,  # For max cost conversion (~70% input, ~30% output)
+    },
+    MODEL_SONNET_5: {
+        "input": 2.0,           # $2/MTok for input tokens
+        "output": 10.0,         # $10/MTok for output tokens
+        "cache_read": 0.20,     # $0.20/MTok (10% of input)
+        "cache_creation": 2.50,    # $2.50/MTok (125% of input)
+        "estimated_blended": 4.4,  # For max cost conversion (~70% input, ~30% output)
     },
     MODEL_FABLE_5: {
         "input": 10.0,          # $10/MTok for input tokens
