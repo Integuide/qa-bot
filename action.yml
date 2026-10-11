@@ -57,7 +57,7 @@ inputs:
     default: ''
 
   model:
-    description: 'Model to use. Empty (the default) = openai/gpt-6-luna when `openrouter-api-key` is set, else claude-sonnet-5-5. Or name one: a Claude model (claude-sonnet-5-5, claude-sonnet-5, claude-haiku-4-5, claude-opus-4-8, claude-opus-5-5, claude-fable-5-1, needs anthropic-api-key) or an OpenRouter "vendor/slug" id such as openai/gpt-6-luna (needs openrouter-api-key).'
+    description: 'Model to use. Empty (the default) = openai/gpt-6-luna when `openrouter-api-key` is set, else claude-sonnet-5-5. Or name one: a Claude model (claude-sonnet-5-5, claude-sonnet-5, claude-haiku-5-5, claude-haiku-4-5, claude-opus-4-8, claude-opus-5-5, claude-fable-5-1, needs anthropic-api-key) or an OpenRouter "vendor/slug" id such as openai/gpt-6-luna (needs openrouter-api-key).'
     required: false
     default: ''
 

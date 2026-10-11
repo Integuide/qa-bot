@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import uuid
 
 from qa_bot.agent.state import Issue
-from qa_bot.config import calculate_cost, DEFAULT_CLAUDE_MODEL
+from qa_bot.config import calculate_cost, DEFAULT_CLAUDE_MODEL, LONG_CONTEXT_PROMPT_TOKENS
 from qa_bot.orchestrator.flow import (
     PRIORITY_DEFAULT,
     PRIORITY_GOAL,
@@ -195,6 +195,13 @@ class SharedFlowState:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    # Largest prompt (input + cache read + cache write) of one usage record.
+    # A record is one API call, except a worker turn's, which also sums its
+    # parse retries — so this can overstate a call, never understate it.
+    # Cost is priced over run totals at the short rate card, so a prompt past
+    # a model's long-context threshold makes total_cost_usd a lower bound.
+    max_call_prompt_tokens: int = 0
+    _long_context_warned: bool = False
     stop_requested: bool = False
     # Set by abort(): a reason no retry can fix (rejected API key, no
     # credit). The coordinator ends the run through its fatal-error path.
@@ -1623,12 +1630,30 @@ class SharedFlowState:
         cache_read_tokens: int = 0,
         cache_creation_tokens: int = 0,
     ):
-        """Add token usage by type for accurate cost calculation."""
+        """Add token usage by type for accurate cost calculation.
+
+        Also tracks the run's largest single-record prompt, and warns once
+        per run when one passes the run model's long-context threshold
+        (config.LONG_CONTEXT_PROMPT_TOKENS): that call bills at the long rate
+        card, which calculate_cost does not model."""
+        prompt_tokens = input_tokens + cache_read_tokens + cache_creation_tokens
         async with self._lock:
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens
             self.cache_read_tokens += cache_read_tokens
             self.cache_creation_tokens += cache_creation_tokens
+            self.max_call_prompt_tokens = max(self.max_call_prompt_tokens, prompt_tokens)
+            threshold = LONG_CONTEXT_PROMPT_TOKENS.get(self.model)
+            if threshold and prompt_tokens > threshold and not self._long_context_warned:
+                self._long_context_warned = True
+                logger.warning(
+                    f"A call's prompt reached {prompt_tokens:,} tokens, over "
+                    f"{self.model}'s {threshold:,}-token long-context threshold: "
+                    f"that call bills at the long-context rate card (Haiku 5.5: "
+                    f"the whole call at $0.50/$2.50 per MTok), which the cost "
+                    f"estimate does not model — the run's cost estimate, and so "
+                    f"the max-cost cap, is a lower bound from here on"
+                )
 
     # -------------------------------------------------------------------------
     # Browser Monitoring Aggregates
@@ -1731,6 +1756,7 @@ class SharedFlowState:
                 "total_actions": self.total_actions,
                 "tokens_used": self.total_tokens_used,
                 "cost_usd": self.total_cost_usd,
+                "max_call_prompt_tokens": self.max_call_prompt_tokens,
                 "max_cost_usd": self.max_cost_usd,
                 "exploration_budget_usd": exploration_budget,  # Budget minus synthesis reserve
                 "token_breakdown": {

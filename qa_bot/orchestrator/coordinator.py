@@ -1200,6 +1200,10 @@ class FlowExplorationOrchestrator:
             "duration_seconds": round(progress.get("elapsed_seconds", 0), 1),
             "model": self._shared_state.model,
             "tokens": progress.get("token_breakdown", {}),
+            # Over the model's long-context threshold
+            # (config.LONG_CONTEXT_PROMPT_TOKENS), estimated_cost_usd is a
+            # lower bound: the long rate card is not modelled.
+            "max_call_prompt_tokens": progress.get("max_call_prompt_tokens", 0),
             "estimated_cost_usd": round(progress.get("cost_usd", 0), 4),
             "charged_cost_usd": (
                 round(charged_cost_usd, 4)

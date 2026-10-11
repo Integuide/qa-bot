@@ -244,7 +244,7 @@ QA Bot tracks API costs in real-time and stops when limits are reached:
 
 - **Default limit:** $5.00 per run
 - **Sonnet 5.5 model (default):** ~$1.50-7.00 per typical full run (smoke runs ~$0.25)
-- **Haiku model (budget):** ~$0.50-2.00 per typical run
+- **Haiku 5.5 model (budget, `claude-haiku-5-5`):** GPT-6 Luna's per-token rates ($0.10/$0.50 per MTok), so roughly a tenth of Haiku 4.5's ~$0.50-2.00 per run (not yet measured on a full run); a lower bound for very long flows (see [Model and keys](#model-and-keys))
 - **Opus 4.8 model (premium):** ~$4.00-15.00 per typical run
 
 Adjust with `max-cost` and `max-duration` inputs.
@@ -270,6 +270,19 @@ OpenRouter run the PR footer shows the charge OpenRouter reported next to
 the token estimate. **With an OpenRouter key, screenshots, page text and
 test credentials go to OpenRouter and the model vendor (OpenAI), not
 Anthropic.**
+
+**Known issue — newer Claude models on new Anthropic accounts:** on
+accounts created on or after 2026-08-31, Claude Haiku 5.5, Sonnet 5.5 and
+Opus 5.5 can fail with an HTTP 400 on a worker's second turn. The worker
+rewrites each stored prompt into a short summary after the turn, and these
+models reject a replayed thinking block whose earlier conversation changed
+(the preserved-thinking history check). See [mono#759](https://github.com/Integuide/mono/issues/759); older accounts
+are not affected.
+
+Haiku 5.5's cost figure is a lower bound for very long flows: a call whose
+prompt passes 100K tokens bills at $0.50/$2.50 per MTok (5x), which the
+estimate does not model. The run logs one warning when that happens and
+records the largest prompt as `max_call_prompt_tokens` in `summary.json`.
 
 ## Issue Severity
 

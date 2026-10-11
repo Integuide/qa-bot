@@ -43,7 +43,7 @@ def _get_port_from_branch() -> int:
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Model ID constants (single source of truth for model identifiers)
-MODEL_HAIKU = "claude-haiku-4-5"
+MODEL_HAIKU = "claude-haiku-5-5"
 MODEL_SONNET = "claude-sonnet-5-5"
 MODEL_OPUS = "claude-opus-4-8"
 # Selectable via --model / AI_MODEL / the manual workflow, never defaults.
@@ -51,6 +51,7 @@ MODEL_OPUS_5_5 = "claude-opus-5-5"
 MODEL_FABLE = "claude-fable-5-1"
 MODEL_FABLE_5 = "claude-fable-5"
 MODEL_SONNET_5 = "claude-sonnet-5"
+MODEL_HAIKU_4_5 = "claude-haiku-4-5"
 
 # OpenRouter: any "vendor/slug" model id (a Claude id never has a slash) runs
 # on OpenRouterProvider instead of Claude. Screenshots, page text and test
@@ -82,7 +83,7 @@ DEFAULT_CLAUDE_MODEL = MODEL_SONNET
 
 # Web UI server only: an explicit model override (empty = resolve_model's
 # default). It applies whenever the key a run uses can run it, so
-# AI_MODEL=claude-haiku-4-5 makes Anthropic-key runs default to Haiku while
+# AI_MODEL=claude-haiku-5-5 makes Anthropic-key runs default to Haiku while
 # OpenRouter-key runs keep Luna. An id not in MODEL_PRICING is ignored, with
 # a warning (server/routes.py _ai_model_override). The CLI and the action
 # never read it (qa-bot/.env sets it for local web UI runs; --model / the
@@ -132,11 +133,30 @@ def resolve_model(
 # pricing for Claude Sonnet 5, announced at launch as introductory pricing
 # through August 31, 2026, is now the standard price. The previously scheduled
 # increase to $3/$15 ... will not occur."); Sonnet 5.5 launched 2026-09-29 at
-# the same price and tokenizer. Note: Sonnet 5's tokenizer emits
-# ~30% more tokens for the same text than Haiku/Sonnet 4.6, so a given dollar cap
-# buys less exploration than the raw per-token rate ratio suggests.
+# the same price and tokenizer. Note: Sonnet 5's tokenizer (and Haiku 5.5's)
+# emits ~30% more tokens for the same text than Haiku 4.5/Sonnet 4.6, so a given
+# dollar cap buys less exploration than the raw per-token rate ratio suggests.
 MODEL_PRICING: dict[str, dict[str, float]] = {
+    # Haiku 5.5 (launched 2026-10-07) has two rate cards chosen by PROMPT
+    # length: these are the <=100K-token rates; a prompt over 100K tokens
+    # bills $0.50/$2.50 (cache read $0.05, 5-min write $0.625). The longer
+    # card is not modelled: cost is computed over run totals
+    # (SharedFlowState.add_token_usage sums every call, and a worker turn's
+    # record already sums its parse retries), so no per-call prompt size
+    # reaches this table. A fresh worker turn measured ~17.5K prompt tokens
+    # live (2026-10-08) and the 60-message history window caps growth, so
+    # only a long flow with heavy thinking kept in its history could cross
+    # 100K; such calls would be under-costed by up to 5x, so the run records
+    # its largest prompt (summary.json max_call_prompt_tokens) and warns once
+    # (LONG_CONTEXT_PROMPT_TOKENS below).
     MODEL_HAIKU: {
+        "input": 0.10,          # $0.10/MTok for input tokens (prompt <=100K)
+        "output": 0.50,         # $0.50/MTok for output tokens (thinking included)
+        "cache_read": 0.01,     # $0.01/MTok (10% of input)
+        "cache_creation": 0.125,   # $0.125/MTok (125% of input, 5-min TTL)
+        "estimated_blended": 0.22,  # For max cost conversion (~70% input, ~30% output)
+    },
+    MODEL_HAIKU_4_5: {
         "input": 1.0,           # $1/MTok for input tokens
         "output": 5.0,          # $5/MTok for output tokens
         "cache_read": 0.10,     # $0.10/MTok (10% of input)
@@ -197,6 +217,15 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
         "cache_creation": 0.125,   # $0.125/MTok (125% of input)
         "estimated_blended": 0.22,  # For max cost conversion (~70% input, ~30% output)
     },
+}
+
+# Models whose WHOLE call bills at a higher rate once its prompt (input +
+# cache read + cache write) passes a size: model -> prompt-token threshold.
+# Not priced (see the Haiku 5.5 row); SharedFlowState.add_token_usage records
+# the run's largest prompt and warns once when one crosses the threshold.
+LONG_CONTEXT_PROMPT_TOKENS: dict[str, int] = {
+    MODEL_HAIKU: 100_000,       # $0.50/$2.50 per MTok above (5x)
+    MODEL_GPT6_LUNA: 272_000,   # 2x input / 1.5x output above
 }
 
 # Fallback pricing for unknown models: the per-FIELD maximum over every known

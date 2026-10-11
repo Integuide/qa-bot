@@ -271,14 +271,19 @@ jobs:
             # an apostrophe there ends the shell quoting, jq fails to compile
             # and the step dies before the fallback goal can engage.
             PROMPT="You are writing the testing goal for an AI QA bot that explores a website in a real browser as a black-box UI tester: it can only observe what an end user sees. This PR is being deployed from staging to production. Write a concise testing goal (1-2 sentences) naming the 2-3 most important user-facing changes it describes, most important first, with the navigation steps to reach any that are not obvious from the homepage. Omit backend-only changes (APIs, logging, infrastructure) or frame them only by their visible effect. Keep any condition the PR states (a change that applies only when X) - never restate conditional behavior as unconditional, or the bot will report a false regression. If the PR description is empty or unclear, return a general exploration goal covering the site's critical user flows."
+            # Haiku 5.5 thinks by default and thinking is spent out of
+            # max_tokens, so a 200-token cap could end before any text:
+            # thinking is off (accepted at its default medium effort) and
+            # the goal is read from the text block by type, not position.
             PAYLOAD=$(jq -n \
               --arg prompt "$PROMPT" \
               --arg url "$TARGET_URL" \
               --arg title "$PR_TITLE_RAW" \
               --arg body "$PR_BODY_RAW" \
               '{
-                model: "claude-haiku-4-5",
+                model: "claude-haiku-5-5",
                 max_tokens: 200,
+                thinking: {type: "disabled"},
                 messages: [{
                   role: "user",
                   content: ($prompt + "\n\nTarget URL: " + $url + "\n\nPR Title: " + $title + "\n\nPR Body:\n" + $body)
@@ -293,7 +298,7 @@ jobs:
 
             GOAL=""
             if [ -n "$RESPONSE" ]; then
-              GOAL=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+              GOAL=$(echo "$RESPONSE" | jq -r '[.content[]? | select(.type == "text") | .text] | join("")')
             fi
 
             if [ -z "$GOAL" ]; then

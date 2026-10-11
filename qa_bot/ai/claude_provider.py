@@ -98,22 +98,27 @@ HISTORY_OMITTED_NOTE = (
 # Opus 5.5, Sonnet 5.5). Effort is the lever there, so synthesis asks for low
 # effort instead of disabling thinking. (Sonnet 5.5's own off switch,
 # "between_tools", 400s on every other model; low effort is the migration
-# guide's first choice anyway.)
+# guide's first choice anyway.) Haiku 5.5 is deliberately absent: it thinks by
+# default but accepts "disabled" at effort low/medium/high, and synthesis
+# sends no effort (Haiku 5.5's default is medium).
 _THINKING_ALWAYS_ON_PREFIXES = (
     "claude-fable", "claude-mythos", MODEL_OPUS_5_5, "claude-sonnet-5-5",
 )
 
 # Model-id prefixes that still take the legacy enabled+budget_tokens form:
-# Haiku (which rejects adaptive), Claude 3.x, Sonnet 4.x and Opus 4.0-4.6.
-# Everything else — Sonnet 5, Opus 4.7+, Opus 5/5.5, Fable, Mythos, and any
-# model released after this list was written — gets adaptive thinking. The
-# list is of the PAST on purpose: an allowlist of adaptive models failed the
-# same way twice (every new model is adaptive-only and 400s on budget_tokens),
-# while the legacy set only shrinks. "claude-opus-4-2" is Opus 4.0's dated id
-# (claude-opus-4-20250514). Matched as prefixes so dated snapshot ids route
-# the same way.
+# Haiku 4.x (which rejects adaptive), Claude 3.x (3.x Haikus included),
+# Sonnet 4.x and Opus 4.0-4.6.
+# Everything else — Haiku 5.5, Sonnet 5, Opus 4.7+, Opus 5/5.5, Fable, Mythos,
+# and any model released after this list was written — gets adaptive
+# thinking. The list is of the PAST on purpose: an allowlist of adaptive
+# models failed the same way twice (every new model is adaptive-only and 400s
+# on budget_tokens), while the legacy set only shrinks — and a bare family
+# prefix is a trap of the same kind ("claude-haiku" sent budget_tokens to
+# claude-haiku-5-5, a 400 on every worker turn). "claude-opus-4-2" is Opus
+# 4.0's dated id (claude-opus-4-20250514). Matched as prefixes so dated
+# snapshot ids route the same way.
 _LEGACY_THINKING_MODEL_PREFIXES = (
-    "claude-haiku", "claude-3", "claude-sonnet-4",
+    "claude-haiku-4", "claude-3", "claude-sonnet-4",
     "claude-opus-4-0", "claude-opus-4-1", "claude-opus-4-2",
     "claude-opus-4-5", "claude-opus-4-6",
 )
@@ -131,8 +136,8 @@ def _thinking_config(model: str, budget_tokens: int, *, stream_to_ui: bool = Fal
     """Return the thinking parameter appropriate for the model.
 
     The two forms are mutually exclusive and each 400s on the wrong model:
-    - Adaptive-only models (Sonnet 5, Opus 4.7+, Fable, anything newer) require
-      {"type": "adaptive"}.
+    - Adaptive-only models (Haiku 5.5, Sonnet 5, Opus 4.7+, Fable, anything
+      newer) require {"type": "adaptive"}.
     - Legacy models (Haiku 4.5, Sonnet 4.x, Opus 4.0-4.6) take the fixed-budget form
       {"type": "enabled", "budget_tokens": N}.
 
@@ -1205,8 +1210,9 @@ class ClaudeProvider(AIProvider):
             # thinking block ahead of the report), so disable it explicitly —
             # except on always-on models, which 400 on "disabled": those get
             # low effort (still some thinking, billed as output) and a larger
-            # max_tokens so it can't truncate the report. Haiku and legacy models
-            # default to no thinking when the param is omitted.
+            # max_tokens so it can't truncate the report. Haiku 4.5 and legacy
+            # models default to no thinking when the param is omitted (Haiku
+            # 5.5 thinks by default, so it gets "disabled" like Sonnet 5).
             # Same family check as _thinking_config so the two can't drift.
             synthesis_kwargs = _synthesis_thinking_kwargs(self.model)
             return await self.client.messages.create(
