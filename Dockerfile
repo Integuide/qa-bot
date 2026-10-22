@@ -19,8 +19,11 @@ LABEL org.opencontainers.image.source="https://github.com/integuide/qa-bot"
 
 WORKDIR /app
 
-# Install additional tools needed for the entrypoint
+# Install additional tools needed for the entrypoint. Listing ca-certificates
+# upgrades the base's system CA store (what curl and git trust) to the newest
+# jammy package on every build, not whatever the base image shipped with.
 RUN apt-get update && apt-get install -y \
+    ca-certificates \
     git \
     curl \
     jq \
