@@ -11,6 +11,22 @@ from qa_bot.orchestrator.shared_state import SharedFlowState, format_user_data_f
 from qa_bot.orchestrator.flow import FlowStatus
 
 
+def _mentions_any(text: str, keywords: list[str]) -> bool:
+    """True when ``text`` names one of ``keywords`` as a whole word or phrase
+    (plural / -ed / -d forms allowed), case-insensitively.
+
+    Whole words, as _is_approval_block already matched: as substrings
+    "auth" hit "author", "card" hit "discard" and "scorecard", and "401"
+    hit any longer number, so a generic block became a credential request
+    (terminal in CI) or an unblock saying "use these credentials"
+    (state-machines.md SUP-2).
+    """
+    text = text.lower()
+    return any(
+        re.search(rf"\b{re.escape(keyword)}(?:s|ed|d)?\b", text) for keyword in keywords
+    )
+
+
 class SupervisorAgent:
     """
     Supervisor that monitors exploration and manages workers.
@@ -121,16 +137,16 @@ class SupervisorAgent:
         The preferred approach is to use request_data action which creates
         explicit data requests that don't require keyword guessing.
         """
-        reason_lower = reason.lower()
         credential_keywords = [
             'credential', 'login', 'password', 'username', 'auth',
-            'sign in', 'signin', 'log in', 'authentication',
+            'sign in', 'signin', 'log in', 'authentication', 'authenticate',
+            'authorization', 'unauthorized', 'unauthorised',
             'payment', 'card', 'checkout',
             # HTTP Basic/Digest Auth keywords
             'http auth', 'basic auth', 'digest auth', '401',
             'http_username', 'http_password', 'www-authenticate'
         ]
-        return any(keyword in reason_lower for keyword in credential_keywords)
+        return _mentions_any(reason, credential_keywords)
 
     def _is_data_request_block(self, reason: str) -> bool:
         """Check if the block reason is from a request_data action."""
@@ -179,8 +195,9 @@ class SupervisorAgent:
 
             # Check if this is a data request block (from request_data action)
             if self._is_data_request_block(reason):
-                # Get the pending data request for this worker
-                data_request = await self.state.get_data_request_by_worker(worker_id)
+                # The pending data request of the flow that blocked. By
+                # flow, not worker id: ids recycle (REQ-2)
+                data_request = await self.state.get_data_request_for_flow(flow_id)
 
                 if data_request:
                     # Check if data is already available
@@ -263,8 +280,7 @@ class SupervisorAgent:
 
                     # Determine what credentials are likely needed
                     needed = ["USERNAME", "PASSWORD"]  # Default
-                    reason_lower = reason.lower()
-                    if "payment" in reason_lower or "card" in reason_lower or "checkout" in reason_lower:
+                    if _mentions_any(reason, ["payment", "card", "checkout"]):
                         needed = ["CARD_NUMBER", "CARD_EXPIRY", "CARD_CVV"]
 
                     # Record the credential request (checkpoint_id will be set by worker)
@@ -395,6 +411,7 @@ class SupervisorAgent:
                     completed_flows=completed_flows,
                     issues=issues,
                     goal=self.state.goal,
+                    interactive=self.state.interactive,
                 )
 
                 # Track token usage by type
@@ -431,9 +448,13 @@ class SupervisorAgent:
                     }
                 }
 
-                # Execute the action
-                if action == "unblock":
-                    message = response.get("message", "Please continue")
+                # Execute the action. MESSAGE is guidance, and the only way
+                # guidance reaches a BLOCKED worker is its unblock response:
+                # it used to be stored where nothing read it, the worker
+                # stayed in _blocked_workers, and every pass paid for another
+                # supervisor call until the 300-s wait timed out (SUP-1).
+                if action in ("unblock", "message"):
+                    message = response.get("message") or "Please continue"
                     await self.state.unblock_worker(worker_id, {
                         "action": "unblock",
                         "message": message
@@ -442,6 +463,20 @@ class SupervisorAgent:
                 elif action == "stop":
                     reason = response.get("reason", "Supervisor requested stop")
                     await self.state.stop_worker(worker_id, reason)
+
+                elif action == "ask_user" and not self.state.interactive:
+                    # Nobody can answer in CLI/CI: a data request there is
+                    # terminal, so ASK_USER would sink the flow on one AI
+                    # choice (SUP-3). The context says so; this is the
+                    # backstop.
+                    await self.state.unblock_worker(worker_id, {
+                        "action": "unblock",
+                        "message": (
+                            "Nobody can answer questions during this run. Continue "
+                            "as best you can without that information; if it is "
+                            "essential, note what you could not test and move on."
+                        ),
+                    })
 
                 elif action == "ask_user":
                     question = response.get("question", response.get("reason", ""))
@@ -482,12 +517,6 @@ class SupervisorAgent:
                         "request_name": data_request.request_name,
                         "reason": f"Waiting for user guidance: {question}"
                     })
-
-                elif action == "message":
-                    # Just send a message without unblocking
-                    message = response.get("message", "")
-                    if message:
-                        await self.state.send_message_to_worker(worker_id, message)
 
                 else:  # observe
                     # Default: just unblock with generic message
@@ -553,6 +582,7 @@ class SupervisorAgent:
                 completed_flows=completed_flows,
                 issues=issues,
                 goal=self.state.goal,
+                interactive=self.state.interactive,
             )
 
             # Track token usage by type

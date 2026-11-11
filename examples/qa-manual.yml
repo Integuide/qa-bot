@@ -74,9 +74,10 @@ on:
         type: string
         default: ''
 
-      # Only ids the bot has pricing for (qa_bot/config.py MODEL_PRICING). An
-      # unknown id still runs, but its cost cap is billed at the most
-      # expensive known rates, so the run stops far earlier than expected.
+      # Only ids the bot offers (qa_bot/config.py OFFERED_MODELS: priced, and
+      # not replaced by a newer model). An unknown id still runs, but its cost
+      # cap is billed at the most expensive known rates, so the run stops far
+      # earlier than expected.
       # The form always sends a model, so this one always runs; the key
       # rule the other examples rely on never applies. The default is Sonnet
       # because it runs on the one required secret.
@@ -92,7 +93,7 @@ on:
           - claude-haiku-4-5
           - claude-opus-4-8
           - claude-opus-5-5
-          - claude-fable-5-1
+          - claude-fable-5-2
         default: 'claude-sonnet-5-5'
 
 jobs:

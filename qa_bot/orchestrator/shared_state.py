@@ -273,7 +273,6 @@ class SharedFlowState:
 
     # Supervisor communication
     _blocked_workers: dict = field(default_factory=dict)  # worker_id -> {"flow_id": str, "reason": str}
-    _worker_messages: dict = field(default_factory=dict)  # worker_id -> message
     _unblock_events: dict = field(default_factory=dict)  # worker_id -> asyncio.Event
     _unblock_responses: dict = field(default_factory=dict)  # worker_id -> response dict
     _supervisor_trigger: asyncio.Event = field(default_factory=asyncio.Event)
@@ -293,7 +292,7 @@ class SharedFlowState:
 
     # Resume flows created before the blocked worker finished saving its
     # checkpoint (the user answered the credentials/data/approval request
-    # first). Keyed by ("data", request_name) / ("credential", flow_id) /
+    # first). Keyed by ("data", request_name, flow_id) / ("credential", flow_id) /
     # ("approval", flow_id); when the worker's set_*_request_checkpoint call
     # arrives, the queued task is patched in place so the resume restores
     # from the checkpoint instead of restarting from scratch.
@@ -324,6 +323,19 @@ class SharedFlowState:
     paused: bool = False
     paused_at: Optional[datetime] = None
     pause_reason: str = ""
+    # Seconds spent paused by every pause that has ended. The time budget
+    # counts exploring time only (budget_elapsed_seconds), so a pause the
+    # user answers 15 minutes later doesn't spend 15 of the run's minutes
+    # (state-machines.md RUN-1). Reported durations stay wall clock.
+    paused_seconds: float = 0.0
+    # The pause whose cancellations are still landing: set by pause(),
+    # cleared by the coordinator (end_pause_cancellation) once its wind-down
+    # is over and it resumes. Never by resume(): a resume inside the 15-s
+    # wind-down (a re-attached tab is shown the pause prompt at once) made
+    # the still-cancelling workers read "not a pause", skip their
+    # checkpoints and leave their flows EXPLORING with no worker
+    # (state-machines.md RUN-3).
+    pause_cancel_reason: str = ""
     _resume_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     @classmethod
@@ -411,7 +423,6 @@ class SharedFlowState:
             self._blocked_workers.clear()
             self._unblock_events.clear()
             self._unblock_responses.clear()
-            self._worker_messages.clear()
             self._pause_checkpoints.clear()
             self._skip_set.clear()
             self._skip_reasons.clear()
@@ -484,6 +495,33 @@ class SharedFlowState:
 
             # Then the regular queue, highest priority first
             return self._queue_pop_next()
+
+    async def requeue_unstarted_flow(self, task: FlowTask) -> bool:
+        """Put a claimed flow that never reached its first turn back in the
+        queue, as it was (same task, start URL or checkpoint intact).
+
+        A pause can cancel a worker before it explores anything: before its
+        coroutine ever runs (a worker spawned in the coordinator step that
+        then pauses), or while it is still opening its browser context or
+        navigating. claim_pending_flow had already dequeued the flow, so
+        it was left PENDING with no queue entry (nothing could claim it
+        after the resume, and is_complete() ignored it), or FAILED with
+        nothing tried (state-machines.md RUN-2, review of 2026-11-07).
+
+        Idempotent: acts only on a PENDING or EXPLORING flow that is not
+        already queued. Returns True when it re-queued.
+        """
+        async with self._lock:
+            flow = self._flow_registry.get(task.flow_id)
+            if flow is None or flow.status not in (FlowStatus.PENDING, FlowStatus.EXPLORING):
+                return False
+            if any(queued.flow_id == task.flow_id for _, queued in self._task_queue):
+                return False
+            flow.status = FlowStatus.PENDING
+            flow.worker_id = None
+            flow.started_at = None
+            self._queue_put(task)
+            return True
 
     async def claim_pending_recheck(self) -> Optional[FlowTask]:
         """Claim the oldest queued re-check flow, if any (non-blocking).
@@ -563,13 +601,19 @@ class SharedFlowState:
                         # Flow with this name already exists - skip duplicate
                         return None
 
-            # Check branch limit (prevent infinite branching)
-            parent_branches = sum(
-                1 for cp in self._checkpoint_registry.values()
-                if cp.parent_flow_id == checkpoint.parent_flow_id
-            )
-            if parent_branches >= self.max_branches_per_flow:
-                return None
+            # Check branch limit (prevent infinite branching). New branches
+            # only: a resume checkpoint is the blocking flow's own
+            # continuation, and refusing it (a flow that had already forked
+            # max_branches_per_flow times) made its resume restart from the
+            # target URL with no history (state-machines.md REQ-4). The flow
+            # ends once it blocks, so it never forks again after one.
+            if queue_task:
+                parent_branches = sum(
+                    1 for cp in self._checkpoint_registry.values()
+                    if cp.parent_flow_id == checkpoint.parent_flow_id
+                )
+                if parent_branches >= self.max_branches_per_flow:
+                    return None
 
             # Save checkpoint
             self._checkpoint_registry[checkpoint.checkpoint_id] = checkpoint
@@ -1055,8 +1099,7 @@ class SharedFlowState:
         """
         if self.should_stop():
             return "the run is already stopping"
-        elapsed = (datetime.now() - self.start_time).total_seconds()
-        remaining_seconds = self.max_duration_minutes * 60 - elapsed
+        remaining_seconds = self.max_duration_minutes * 60 - self.budget_elapsed_seconds()
         if remaining_seconds < min_seconds:
             return f"only {max(0, int(remaining_seconds))}s of the run's time budget left"
         exploration_budget = self.max_cost_usd * (1 - self.SYNTHESIS_COST_RESERVE_RATIO)
@@ -1444,6 +1487,20 @@ class SharedFlowState:
     # Reserve 10% of cost budget for synthesis report generation
     SYNTHESIS_COST_RESERVE_RATIO = 0.10
 
+    def budget_elapsed_seconds(self) -> float:
+        """Seconds of the run that count against ``max_duration_minutes``:
+        wall clock since ``start_time`` minus every pause, the current one
+        included, so the clock stands still while paused. The one reader
+        for the time limit (should_stop, get_stop_reason,
+        limit_fraction_used, the re-check shortfall); durations reported to
+        the user (``elapsed_seconds``, ``duration_seconds``) stay wall clock.
+        """
+        now = datetime.now()
+        paused = self.paused_seconds
+        if self.paused_at is not None:
+            paused += (now - self.paused_at).total_seconds()
+        return (now - self.start_time).total_seconds() - paused
+
     def should_stop(self) -> bool:
         """Check if exploration should stop due to any limit.
 
@@ -1455,7 +1512,7 @@ class SharedFlowState:
             return True
 
         # Check duration limit
-        elapsed_minutes = (datetime.now() - self.start_time).total_seconds() / 60
+        elapsed_minutes = self.budget_elapsed_seconds() / 60
         if elapsed_minutes >= self.max_duration_minutes:
             return True
 
@@ -1481,7 +1538,7 @@ class SharedFlowState:
         cost_fraction = (
             self.total_cost_usd / exploration_budget if exploration_budget > 0 else 1.0
         )
-        elapsed_minutes = (datetime.now() - self.start_time).total_seconds() / 60
+        elapsed_minutes = self.budget_elapsed_seconds() / 60
         time_fraction = (
             elapsed_minutes / self.max_duration_minutes
             if self.max_duration_minutes > 0
@@ -1503,7 +1560,7 @@ class SharedFlowState:
         if self.total_cost_usd >= exploration_budget:
             return f"Cost limit reached (${self.total_cost_usd:.2f} of ${self.max_cost_usd:.2f} budget)"
 
-        elapsed_minutes = (datetime.now() - self.start_time).total_seconds() / 60
+        elapsed_minutes = self.budget_elapsed_seconds() / 60
         if elapsed_minutes >= self.max_duration_minutes:
             return "Time limit reached"
 
@@ -1524,6 +1581,7 @@ class SharedFlowState:
             self.paused = True
             self.paused_at = datetime.now()
             self.pause_reason = reason
+            self.pause_cancel_reason = reason
             self._resume_event.clear()
 
     async def resume(
@@ -1542,6 +1600,8 @@ class SharedFlowState:
             if new_max_duration_minutes is not None:
                 self.max_duration_minutes = new_max_duration_minutes
 
+            if self.paused_at is not None:
+                self.paused_seconds += (datetime.now() - self.paused_at).total_seconds()
             self.paused = False
             self.paused_at = None
             self.pause_reason = ""
@@ -1551,13 +1611,18 @@ class SharedFlowState:
         """Check if exploration is currently paused."""
         return self.paused
 
+    def end_pause_cancellation(self):
+        """The coordinator's wind-down for the last pause is over: a worker
+        cancelled from now on is not being paused (see pause_cancel_reason)."""
+        self.pause_cancel_reason = ""
+
     def is_pause_cancellation(self) -> bool:
         """Check if current stop is for pause (should checkpoint) vs user stop (no checkpoint).
 
         Returns True if workers should save checkpoints before exiting.
         Returns False if user explicitly requested stop (no checkpoint needed).
         """
-        if self.paused:
+        if self.paused or self.pause_cancel_reason:
             return True
         if not self.should_stop():
             return False
@@ -1753,6 +1818,8 @@ class SharedFlowState:
                 "exploration_id": self.exploration_id,
                 "target_url": self.target_url,
                 "elapsed_seconds": (datetime.now() - self.start_time).total_seconds(),
+                # What the time limit reads: elapsed minus time spent paused
+                "budget_elapsed_seconds": self.budget_elapsed_seconds(),
                 "total_actions": self.total_actions,
                 "tokens_used": self.total_tokens_used,
                 "cost_usd": self.total_cost_usd,
@@ -1910,23 +1977,33 @@ class SharedFlowState:
             self._supervisor_trigger.set()
 
     async def wait_for_unblock(self, worker_id: str, timeout: float = 300) -> Optional[dict]:
-        """Wait for supervisor to unblock this worker. Returns response or None on timeout."""
+        """Wait for supervisor to unblock this worker. Returns response or None on timeout.
+
+        The worker's three block entries are removed however the wait ends.
+        On a timeout, so the supervisor stops handling it; on a cancellation
+        (a pause cancels a blocked worker) too. A cancelled worker's entry
+        used to stay in _blocked_workers, and after the resume the
+        supervisor handled a dead worker under a recycled id: it filed a
+        credential request for a flow that already had a pause clone, and
+        the answer started a second, checkpoint-less continuation
+        (state-machines.md SUP-4).
+        """
         event = self._unblock_events.get(worker_id)
         if not event:
             return None
 
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
-            response = self._unblock_responses.pop(worker_id, None)
-            self._unblock_events.pop(worker_id, None)
-            return response
+            return self._unblock_responses.get(worker_id)
         except asyncio.TimeoutError:
-            # Clean up stale entries to prevent supervisor from repeatedly handling this worker
-            async with self._lock:
+            return None
+        finally:
+            # Only this wait's own event: a recycled worker id may have
+            # blocked again since (sync, so no await can interleave)
+            if self._unblock_events.get(worker_id) is event:
                 self._blocked_workers.pop(worker_id, None)
                 self._unblock_events.pop(worker_id, None)
                 self._unblock_responses.pop(worker_id, None)
-            return None
 
     async def unblock_worker(self, worker_id: str, response: dict):
         """Supervisor unblocks a worker with a response."""
@@ -1936,16 +2013,6 @@ class SharedFlowState:
             event = self._unblock_events.get(worker_id)
             if event:
                 event.set()
-
-    async def send_message_to_worker(self, worker_id: str, message: str):
-        """Supervisor sends a message to a specific worker."""
-        async with self._lock:
-            self._worker_messages[worker_id] = message
-
-    async def get_worker_message(self, worker_id: str) -> Optional[str]:
-        """Worker checks for supervisor message (consumes it)."""
-        async with self._lock:
-            return self._worker_messages.pop(worker_id, None)
 
     async def stop_worker(self, worker_id: str, reason: str):
         """Supervisor requests a worker to stop."""
@@ -2349,11 +2416,19 @@ class SharedFlowState:
         async with self._lock:
             return list(self._pending_data_requests)
 
-    async def get_data_request_by_worker(self, worker_id: str) -> Optional["UserDataRequest"]:
-        """Get the pending data request for a specific worker, if any."""
+    async def get_data_request_for_flow(self, flow_id: str) -> Optional["UserDataRequest"]:
+        """The newest pending data request filed by flow ``flow_id``, if any.
+
+        Looked up by flow, never by worker id: worker ids recycle as soon as
+        a flow exits, so a lookup by ``worker-1`` found an earlier
+        ``worker-1`` flow's unanswered request. The new flow was told to
+        wait for the wrong name, its own request never reached the user, and
+        its checkpoint was linked to the earlier flow's request
+        (state-machines.md REQ-2).
+        """
         async with self._lock:
-            for request in self._pending_data_requests:
-                if request.worker_id == worker_id:
+            for request in reversed(self._pending_data_requests):
+                if request.flow_id == flow_id:
                     return request
             return None
 
@@ -2448,10 +2523,12 @@ class SharedFlowState:
 
                 # The user may have answered before the blocked worker
                 # finished saving its checkpoint — let the worker's
-                # set_data_request_checkpoint call patch this task
+                # set_data_request_checkpoint call patch this task. Keyed by
+                # the requesting flow too: two flows waiting on one name
+                # each get their own checkpoint (REQ-1).
                 if request.checkpoint_id is None:
                     self._register_resume_awaiting_checkpoint(
-                        ("data", request_name), flow_task
+                        ("data", request_name, original_flow_id), flow_task
                     )
 
                 # Queue the task
@@ -2483,22 +2560,30 @@ class SharedFlowState:
         async with self._lock:
             return dict(self._user_data)
 
-    async def set_data_request_checkpoint(self, request_name: str, checkpoint_id: str):
+    async def set_data_request_checkpoint(
+        self, request_name: str, checkpoint_id: str, flow_id: str
+    ):
         """
-        Link a checkpoint ID to a pending data request.
+        Link a checkpoint ID to flow ``flow_id``'s pending data request.
 
         Called by worker after creating a checkpoint when told to checkpoint_and_exit.
+        Matched by name AND requesting flow: by name alone, the second of
+        two flows waiting on one name overwrote the first's link, so flow A
+        resumed from flow B's browser state and history, and B restarted
+        from scratch (state-machines.md REQ-1).
         """
         async with self._lock:
             for request in self._pending_data_requests:
-                if request.request_name == request_name:
+                if request.request_name == request_name and request.flow_id == flow_id:
                     request.checkpoint_id = checkpoint_id
                     break
             else:
                 # Request already consumed: the user provided the data before
                 # this checkpoint was saved. Patch the queued resume task so
                 # it restores from the checkpoint.
-                self._patch_resume_checkpoint(("data", request_name), checkpoint_id)
+                self._patch_resume_checkpoint(
+                    ("data", request_name, flow_id), checkpoint_id
+                )
 
     # -------------------------------------------------------------------------
     # Approval Management (for irreversible actions)
@@ -2682,6 +2767,10 @@ class SharedFlowState:
             )
             if original_flow_id in self._flow_registry:
                 self._flow_registry[original_flow_id].child_flow_ids.append(new_flow_id)
+            # The answer is for the flow that asked (above) and the resume
+            # created to act on it (here), never for any other child of the
+            # flow that asked: see get_approval_result
+            self._approval_responses[new_flow_id] = self._approval_responses[flow_id]
 
             # Mark original blocked flow as resumed (continuing via new child flow)
             if original_flow_id in self._flow_registry:
@@ -2723,19 +2812,17 @@ class SharedFlowState:
         The result includes:
         - approved: bool
         - always: bool (if it was "always approve")
+
+        Keyed by flow id only: ``provide_approval`` stores the answer under the
+        flow that asked and under the resume flow it creates. It used to fall
+        back to the PARENT's answer, so a fork taken from the flow before it
+        asked "delete account?" (a checkpoint-restored flow too, so it asks
+        here) was told "User APPROVED the action" for an action its history
+        never requested (state-machines.md REQ-3). A pause clone or a fork of
+        the resume already carries the note in its copied history.
         """
         async with self._lock:
-            # Check by flow_id directly
-            if flow_id in self._approval_responses:
-                return self._approval_responses[flow_id]
-
-            # Check if this is a resume flow by looking at parent
-            if flow_id in self._flow_registry:
-                parent_id = self._flow_registry[flow_id].parent_flow_id
-                if parent_id and parent_id in self._approval_responses:
-                    return self._approval_responses[parent_id]
-
-            return None
+            return self._approval_responses.get(flow_id)
 
     async def block_flow_for_approval(self, flow_id: str, reason: str):
         """

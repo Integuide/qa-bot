@@ -1170,9 +1170,10 @@ Examples:
     # A run that never produced exploration_complete failed outright
     # (Playwright launch failure, fatal crash with nothing salvaged, ...).
     # Fail loudly and do NOT write a result file: CI consumers (e.g. the
-    # GitHub Action entrypoint) treat the result file's existence as success,
-    # so writing one here would turn a total failure into a green run with
-    # an empty report.
+    # GitHub Action entrypoint) treat the result file's existence as a run
+    # that produced a report, so writing one here would post an empty one.
+    # A salvaged run (completed, with `error` set) does write it, and exits 2
+    # below.
     if not result.get("completed"):
         message = result.get("error") or "exploration ended before completing"
         print(f"Error: QA exploration failed: {message}", file=sys.stderr)
@@ -1216,6 +1217,19 @@ Examples:
     warning = curated_excess_warning(curated, raw_critical_count)
     if warning and log_level != "quiet":
         print(warning, file=sys.stderr)
+    # A run that ended on a fatal error (rejected key, no credit, a main-loop
+    # crash) exits 2 even when its findings were salvaged into a report: the
+    # result file above is kept so the report and the PR comment survive,
+    # but a deploy gate must never pass a run that died part-way. Until
+    # 2026-11-07 only `completed` was checked, so a salvaged abort exited 0
+    # whenever nothing was critical (state-machines.md GATE-1).
+    fatal_error = result.get("error")
+    if fatal_error:
+        print(
+            f"Error: QA exploration aborted: {log_safe(fatal_error)} — the "
+            "report covers only what ran before the abort",
+            file=sys.stderr,
+        )
     if gate_count > 0:
         if log_level != "quiet":
             if curated is not None:
@@ -1232,6 +1246,9 @@ Examples:
                     f"(raw worker findings; synthesis produced no curated verdict)",
                     file=sys.stderr,
                 )
+    if fatal_error:
+        sys.exit(2)
+    if gate_count > 0:
         sys.exit(1)
 
     sys.exit(0)

@@ -48,7 +48,9 @@ MODEL_SONNET = "claude-sonnet-5-5"
 MODEL_OPUS = "claude-opus-4-8"
 # Selectable via --model / AI_MODEL / the manual workflow, never defaults.
 MODEL_OPUS_5_5 = "claude-opus-5-5"
-MODEL_FABLE = "claude-fable-5-1"
+MODEL_FABLE = "claude-fable-5-2"
+# Priced for runs that still name them; no longer offered (SUPERSEDED_MODELS).
+MODEL_FABLE_5_1 = "claude-fable-5-1"
 MODEL_FABLE_5 = "claude-fable-5"
 MODEL_SONNET_5 = "claude-sonnet-5"
 MODEL_HAIKU_4_5 = "claude-haiku-4-5"
@@ -84,7 +86,7 @@ DEFAULT_CLAUDE_MODEL = MODEL_SONNET
 # Web UI server only: an explicit model override (empty = resolve_model's
 # default). It applies whenever the key a run uses can run it, so
 # AI_MODEL=claude-haiku-5-5 makes Anthropic-key runs default to Haiku while
-# OpenRouter-key runs keep Luna. An id not in MODEL_PRICING is ignored, with
+# OpenRouter-key runs keep Luna. An id not in OFFERED_MODELS is ignored, with
 # a warning (server/routes.py _ai_model_override). The CLI and the action
 # never read it (qa-bot/.env sets it for local web UI runs; --model / the
 # model input is their override).
@@ -184,7 +186,16 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
         "cache_creation": 5.0,     # $5/MTok (125% of input)
         "estimated_blended": 8.8,  # For max cost conversion (~70% input, ~30% output)
     },
+    # Fable 5.2 (launched 2026-11-09) costs less than 5.1; rates from
+    # platform.claude.com/docs/en/models/fable-5-2/whats-new-fable-5-2#pricing.
     MODEL_FABLE: {
+        "input": 8.0,           # $8/MTok for input tokens
+        "output": 40.0,         # $40/MTok for output tokens
+        "cache_read": 0.20,     # $0.20/MTok (2.5% of input)
+        "cache_creation": 10.0,    # $10/MTok (125% of input, 5-min TTL)
+        "estimated_blended": 17.6,  # For max cost conversion (~70% input, ~30% output)
+    },
+    MODEL_FABLE_5_1: {
         "input": 10.0,          # $10/MTok for input tokens
         "output": 50.0,         # $50/MTok for output tokens
         "cache_read": 0.25,     # $0.25/MTok (2.5% of input)
@@ -217,6 +228,24 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
         "cache_creation": 0.125,   # $0.125/MTok (125% of input)
         "estimated_blended": 0.22,  # For max cost conversion (~70% input, ~30% output)
     },
+}
+
+# Priced ids that are no longer OFFERED to a person choosing a model, each
+# mapped to the model that replaced it. The row stays in MODEL_PRICING so a
+# run that names the id (the CLI's --model, the action's `model` input, an
+# old workflow pin) is still costed at its own rates. Without the row it
+# would be billed at the per-field maximum and stop early. A menu lists
+# OFFERED_MODELS instead: the web UI's model list, the API's accepted `model`
+# values, the server's AI_MODEL override and the manual example's dropdown.
+# To retire a model from the menus, add it here; to drop it altogether,
+# delete its pricing row too.
+SUPERSEDED_MODELS: dict[str, str] = {
+    MODEL_FABLE_5_1: MODEL_FABLE,   # 5.2 is cheaper, launched 2026-11-09
+    MODEL_FABLE_5: MODEL_FABLE,
+}
+OFFERED_MODELS: dict[str, dict[str, float]] = {
+    model: rates for model, rates in MODEL_PRICING.items()
+    if model not in SUPERSEDED_MODELS
 }
 
 # Models whose WHOLE call bills at a higher rate once its prompt (input +

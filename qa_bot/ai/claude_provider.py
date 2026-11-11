@@ -180,6 +180,83 @@ def _synthesis_thinking_kwargs(model: str) -> dict:
     return {}
 
 
+def _refusal_category(message) -> str | None:
+    """Which safety classifier declined a message (its stop_details.category),
+    when the API says: cyber, bio, frontier_llm, reasoning_extraction or
+    general_harms on the current models."""
+    details = getattr(message, "stop_details", None)
+    return getattr(details, "category", None) if details else None
+
+
+# Preserved thinking: each thinking block's signature is bound to the
+# conversation that came before it (system prompt + every earlier message),
+# and the worker rewrites that conversation after every turn — the prompt it
+# sent becomes a stub (HISTORY_COMPACTION) or at least loses its screenshot,
+# a long history is windowed, a parse retry's correction exchange is not
+# stored, and a fork replays the parent's turns under its own system prompt.
+# So a thinking block replayed from history NEVER matches. What the API does
+# with it depends on the model and the account:
+# - Fable 5.2 checks every account: a worker's second turn was a 400 "The
+#   block is bound to a different conversation" (measured 2026-11-10).
+#   Anthropic documents the same for Mythos 5.1 and 5.2.
+# - Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 are documented to check
+#   only Anthropic accounts created on or after 2026-08-31 (same 400,
+#   mono#759). On an older account the block still reaches the model and is
+#   billed as input (measured on Sonnet 5.5, 2026-11-10: the API reports it
+#   as thinking_mismatch_allowed).
+# The worker therefore sends earlier turns WITHOUT their thinking blocks on
+# the always-checked models, and on any other model from the first time the
+# API rejects one (ClaudeProvider._drop_history_thinking). Sending none of
+# them is always valid. It costs the model its earlier reasoning — the
+# Recent Actions recap in every prompt is what carries continuity — which is
+# why models that still accept the blocks keep getting them.
+# Not the `drop_block` beta setting: it drops exactly the same blocks here
+# (every one), but needs a dated beta header to do it. Not an append-only
+# history either: that means re-sending every past screenshot and full
+# prompt on every turn, which compaction exists to avoid.
+_PREFIX_CHECK_ALWAYS_ON_PREFIXES = ("claude-fable-5-2", "claude-mythos")
+_STALE_THINKING_ERROR_MARKER = "bound to a different conversation"
+
+
+def _drop_thinking_blocks(messages: list[dict]) -> int:
+    """Remove every thinking block from a built request's assistant turns.
+
+    Returns how many were removed. Mutates ``messages`` (the per-request copy
+    from ``_build_messages_from_history``), never the stored history.
+    """
+    dropped = 0
+    for msg in messages:
+        content = msg.get("content")
+        if msg.get("role") != "assistant" or not isinstance(content, list):
+            continue
+        kept = [
+            block for block in content
+            if not (isinstance(block, dict)
+                    and block.get("type") in ("thinking", "redacted_thinking"))
+        ]
+        dropped += len(content) - len(kept)
+        msg["content"] = kept
+    return dropped
+
+
+def _is_stale_thinking_error(exc: Exception) -> bool:
+    """True for the 400 that rejects a replayed thinking block because the
+    conversation before it changed (see _PREFIX_CHECK_ALWAYS_ON_PREFIXES).
+
+    Matched on the phrase Anthropic's docs quote for this error, or on any
+    400 that names both a thinking block and its signature, so a reworded
+    message still recovers. Leaving the blocks out is the right answer to
+    every complaint about a replayed block's signature, and the caller only
+    retries when there was a block to leave out.
+    """
+    if not isinstance(exc, BadRequestError):
+        return False
+    message = api_error_message(exc).lower()
+    return _STALE_THINKING_ERROR_MARKER in message or (
+        "thinking" in message and "signature" in message
+    )
+
+
 def _calculate_wait_time(backoff: float) -> float:
     """Calculate wait time with jitter to prevent thundering herd."""
     # Add randomness: wait_time = backoff * (1 + random(0, JITTER_FACTOR))
@@ -242,6 +319,26 @@ def _extract_token_usage(usage) -> dict:
     }
 
 
+def _interrupted_stream_usage(stream) -> dict:
+    """Usage of a stream that failed after ``message_start``.
+
+    The input (and cache) tokens are billed once the message starts, but a
+    stream that raised mid-body never reached ``get_final_message()``, the
+    only place usage was read. Its retry then billed the turn again while
+    the cost cap counted it once (state-machines.md COST-1). The SDK's
+    running snapshot carries message_start's input counts and whatever
+    output count it had; it is None (an AssertionError) before the message
+    started, when nothing was billed.
+    """
+    if stream is None:
+        return _extract_token_usage(None)
+    try:
+        snapshot = stream.current_message_snapshot
+    except Exception:
+        return _extract_token_usage(None)
+    return _extract_token_usage(getattr(snapshot, "usage", None))
+
+
 def _as_blocks(content) -> list[dict]:
     """Message content as a list of blocks (a bare string becomes one text block)."""
     if isinstance(content, list):
@@ -287,6 +384,11 @@ class ClaudeProvider(AIProvider):
         # a long run crosses midnight.
         self.run_nonce = uuid.uuid4().hex[:6]
         self.run_date = datetime.now().strftime("%Y-%m-%d (%A)")
+        # Whether worker requests leave earlier turns' thinking blocks out
+        # (see _PREFIX_CHECK_ALWAYS_ON_PREFIXES). Known up front for the
+        # always-checked models; learned from the first rejection otherwise,
+        # and then kept for every worker in the run.
+        self._drop_history_thinking = model.startswith(_PREFIX_CHECK_ALWAYS_ON_PREFIXES)
 
     @staticmethod
     def _build_messages_from_history(
@@ -557,6 +659,8 @@ class ClaudeProvider(AIProvider):
         messages = self._build_messages_from_history(
             conversation_history or [], current_message
         )
+        if self._drop_history_thinking:
+            _drop_thinking_blocks(messages)
 
         self._apply_cache_breakpoint(messages)
 
@@ -581,6 +685,8 @@ class ClaudeProvider(AIProvider):
             backoff = INITIAL_BACKOFF
             stream_completed = False
             token_usage = _extract_token_usage(None)
+            # Billed by attempts whose stream failed mid-body (COST-1)
+            interrupted_usage = _extract_token_usage(None)
 
             for attempt in range(MAX_RETRIES):
                 # Reset state for each attempt
@@ -589,7 +695,9 @@ class ClaudeProvider(AIProvider):
                 thinking_signature = ""
                 in_thinking_block = False
                 stop_reason = None
+                refusal_category = None
                 wait_time = None
+                stream_ref = None
 
                 # Acquire semaphore only for the API call, not during sleep
                 async with self._api_semaphore:
@@ -618,6 +726,7 @@ class ClaudeProvider(AIProvider):
                                 self.model, 10000, stream_to_ui=True
                             )
                         ) as stream:
+                            stream_ref = stream
                             async for event in stream:
                                 if event.type == "content_block_start":
                                     if hasattr(event.content_block, 'type'):
@@ -649,6 +758,7 @@ class ClaudeProvider(AIProvider):
                             final_message = await stream.get_final_message()
                             token_usage = _extract_token_usage(final_message.usage)
                             stop_reason = getattr(final_message, "stop_reason", None)
+                            refusal_category = _refusal_category(final_message)
 
                         # Stream completed successfully
                         stream_completed = True
@@ -686,14 +796,37 @@ class ClaudeProvider(AIProvider):
                                 f"Worker stream: Server error {e.status_code} (attempt {attempt + 1}/{MAX_RETRIES}), "
                                 f"retrying in {wait_time:.1f}s..."
                             )
+                        elif _is_stale_thinking_error(e) and _drop_thinking_blocks(messages):
+                            # This model/account checks replayed thinking
+                            # against the (rewritten) history. Nothing was
+                            # generated or billed; resend at once without
+                            # the blocks, and leave them out from now on.
+                            # A request that had none left to drop falls
+                            # through to the raise below, so this can't loop.
+                            if not self._drop_history_thinking:
+                                logger.warning(
+                                    f"Worker stream: {self.model} rejected a replayed "
+                                    "thinking block (the worker compacts earlier turns); "
+                                    "sending earlier turns without thinking blocks for "
+                                    "the rest of the run"
+                                )
+                            self._drop_history_thinking = True
                         else:
                             # Non-retryable API error (e.g., 400, 401, 403)
                             raise
+
+                # Only a failed attempt gets here (success breaks above):
+                # keep what its stream billed before it failed
+                for usage_key, usage_value in _interrupted_stream_usage(stream_ref).items():
+                    interrupted_usage[usage_key] += usage_value
 
                 # Sleep outside the semaphore context to allow other workers to proceed
                 if wait_time is not None:
                     await asyncio.sleep(wait_time)
                     backoff *= BACKOFF_MULTIPLIER
+
+            for usage_key, usage_value in interrupted_usage.items():
+                token_usage[usage_key] = token_usage.get(usage_key, 0) + usage_value
 
             # Accumulate usage across parse attempts. The totals ride on the
             # terminal event either way — "complete" or "error" — and the
@@ -739,17 +872,33 @@ class ClaudeProvider(AIProvider):
             # its attempts on a content-filter rejection and reached none of
             # its goal.
             if stop_reason == "refusal":
+                # The category says which classifier declined. Without it a
+                # reasoning_extraction decline (the request read as asking
+                # for the model's own reasoning: the prompt's fault) looks
+                # the same as one about the test content (the site's).
+                category = refusal_category or "not given"
                 logger.warning(
                     "Worker stream: response declined by a safety classifier "
-                    "(stop_reason=refusal); not retrying the identical request"
+                    "(stop_reason=refusal, category=%s); not retrying the "
+                    "identical request", category,
                 )
+                if refusal_category == "reasoning_extraction":
+                    cause = (
+                        "a safety classifier read the request as asking for "
+                        "the model's internal reasoning. The test content is "
+                        "not the cause."
+                    )
+                else:
+                    cause = (
+                        "the test content most likely tripped a safety "
+                        "classifier. Retry with mundane, inoffensive free "
+                        "text."
+                    )
                 yield {
                     "type": "error",
                     "error": (
                         "Claude declined to generate this turn (stop_reason="
-                        "refusal) — the test content most likely tripped a "
-                        "safety classifier. Retry with mundane, inoffensive "
-                        "free text."
+                        f"refusal, category={category}) — {cause}"
                     ),
                     "thinking": full_thinking,
                     "raw_response": full_response,
@@ -1034,6 +1183,7 @@ class ClaudeProvider(AIProvider):
         completed_flows: list[dict],
         issues: list[dict],
         goal: str = "",
+        interactive: bool = True,
     ) -> dict:
         """
         Call AI for supervisor decisions.
@@ -1050,6 +1200,7 @@ class ClaudeProvider(AIProvider):
             completed_flows=completed_flows,
             issues=issues,
             goal=goal,
+            interactive=interactive,
         )
 
         async def _make_supervisor_request():
@@ -1261,9 +1412,10 @@ class ClaudeProvider(AIProvider):
             # this logs rather than changing control flow.
             logger.warning(
                 "Synthesis was declined by a safety classifier "
-                "(stop_reason=refusal) — falling back to the non-AI report, "
-                "so there will be no curated verdict and the gate will use "
-                "the raw worker critical count"
+                "(stop_reason=refusal, category=%s) — falling back to the "
+                "non-AI report, so there will be no curated verdict and the "
+                "gate will use the raw worker critical count",
+                _refusal_category(response) or "not given",
             )
         if response.stop_reason == "max_tokens":
             # Surface truncation instead of silently delivering a report that

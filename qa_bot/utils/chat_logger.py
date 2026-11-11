@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
@@ -106,6 +107,37 @@ def _mask_credentials_in_text(text: str) -> str:
     return text
 
 
+# Rotation never deletes a live run's directory (state-machines.md LOG-1):
+# one whose summary.json is missing or still "running" / "synthesizing" and
+# whose operations.log was written within this window. operations.log gets
+# every event (progress every 5 s); a run's longest quiet spell is a pause
+# (up to 30 min). A crashed run's directory is rotated once it has been
+# quiet this long. Checked from the files, not an in-process registry, so a
+# CLI run and the web server sharing one LOG_DIR protect each other too.
+LIVE_RUN_QUIET_SECONDS = 60 * 60
+_LIVE_SUMMARY_STATUSES = frozenset({"running", "synthesizing"})
+
+
+def _is_live_run_dir(run_dir: Path) -> bool:
+    """True when ``run_dir`` looks like a run that is still writing."""
+    try:
+        status = json.loads((run_dir / "summary.json").read_text(encoding="utf-8")).get("status")
+    except FileNotFoundError:
+        status = None  # a run in its first moments, before its first summary
+    except (OSError, ValueError, AttributeError):
+        return False
+    if status is not None and status not in _LIVE_SUMMARY_STATUSES:
+        return False
+    try:
+        last_write = (run_dir / "operations.log").stat().st_mtime
+    except OSError:
+        try:
+            last_write = run_dir.stat().st_mtime
+        except OSError:
+            return False
+    return time.time() - last_write < LIVE_RUN_QUIET_SECONDS
+
+
 class ChatLogger:
     """
     Logs AI chat interactions and operational events for debugging.
@@ -160,6 +192,7 @@ class ChatLogger:
 
         # Track which files we've initialized (to write headers)
         self._initialized_files: set[str] = set()
+        self._write_failure_logged = False
 
         # Secret values (credentials, password-typed user data) redacted from
         # everything written to disk. Key-name masking alone misses a typed
@@ -191,10 +224,13 @@ class ChatLogger:
         if not self._log_dir.exists():
             return
 
-        # Get all exploration directories (UUIDs)
+        # Get all exploration directories (UUIDs), except live runs': until
+        # 2026-11-07 ten run starts during one run deleted its directory,
+        # every later turn's log write raised after the AI call was billed,
+        # every flow failed twice and report.md was never written (LOG-1)
         exploration_dirs = [
             d for d in self._log_dir.iterdir()
-            if d.is_dir() and d.name != self.exploration_id
+            if d.is_dir() and d.name != self.exploration_id and not _is_live_run_dir(d)
         ]
 
         if len(exploration_dirs) < self._max_logs:
@@ -250,19 +286,39 @@ class ChatLogger:
         return self.chats_dir / "synthesis.txt"
 
     def _write_header(self, file_path: Path, title: str, metadata: dict):
-        """Write a header to a new chat file."""
-        with open(file_path, "w", encoding='utf-8') as f:
-            f.write("=" * 80 + "\n")
-            f.write(f"{title}\n")
-            f.write("=" * 80 + "\n")
-            for key, value in metadata.items():
-                f.write(f"{key}: {value}\n")
-            f.write("=" * 80 + "\n\n")
+        """Write a header to a new chat file (best-effort, like _append)."""
+        try:
+            with open(file_path, "w", encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write(f"{title}\n")
+                f.write("=" * 80 + "\n")
+                for key, value in metadata.items():
+                    f.write(f"{key}: {value}\n")
+                f.write("=" * 80 + "\n\n")
+        except OSError as e:
+            self._warn_write_failed(e)
 
     def _append(self, file_path: Path, content: str):
-        """Append content to a file, redacting registered secret values."""
-        with open(file_path, "a", encoding='utf-8') as f:
-            f.write(self._redact(content))
+        """Append content to a file, redacting registered secret values.
+
+        Best-effort, like write_report: a transcript that can't be written
+        (directory removed, disk full) must not fail the turn that was just
+        billed. It used to raise into the worker as an AI error.
+        """
+        try:
+            with open(file_path, "a", encoding='utf-8') as f:
+                f.write(self._redact(content))
+        except OSError as e:
+            self._warn_write_failed(e)
+
+    def _warn_write_failed(self, error: OSError):
+        """Log a failed transcript write once per run, not once per line."""
+        if not self._write_failure_logged:
+            self._write_failure_logged = True
+            logging.warning(
+                f"Chat log writes are failing for run {self.exploration_id} "
+                f"({error}); the run continues without its transcripts"
+            )
 
     # =========================================================================
     # Operations Log (SSE Events)
@@ -683,8 +739,12 @@ class ChatLogger:
         filename = f"{worker_id}_{short_flow_id}_turn{turn_number:03d}.png"
         filepath = self.screenshots_dir / filename
 
-        with open(filepath, "wb") as f:
-            f.write(screenshot_bytes)
+        try:
+            with open(filepath, "wb") as f:
+                f.write(screenshot_bytes)
+        except OSError as e:
+            self._warn_write_failed(e)
+            return None
 
         return filepath
 

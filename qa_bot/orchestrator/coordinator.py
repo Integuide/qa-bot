@@ -21,6 +21,13 @@ from qa_bot.utils.chat_logger import ChatLogger
 from qa_bot.utils.secrets import redact_obj, redact_values
 from qa_bot.services.email_service import EmailService
 
+# The fatal reason when Chromium crashes or is killed mid-run (OPS-2)
+BROWSER_CRASHED_REASON = (
+    "The browser (Chromium) crashed or was killed mid-run, so no further flow "
+    "could reach the site. Findings made before the crash are kept; re-run "
+    "the check (a crash is often memory pressure on the runner)."
+)
+
 # summary.json statuses that mean the run has finished. Anything else left on
 # disk ("running", "synthesizing") means the process died mid-run without
 # reaching the code that writes a terminal summary.
@@ -212,6 +219,9 @@ class FlowExplorationOrchestrator:
         self._shared_state: Optional[SharedFlowState] = None
         self._worker_semaphore: Optional[asyncio.Semaphore] = None
         self._active_worker_tasks: set[asyncio.Task] = set()
+        # The flow each live worker task was spawned for, so the pause path
+        # can re-queue a flow whose task was cancelled before it ran
+        self._worker_flow_tasks: dict[asyncio.Task, FlowTask] = {}
         # Worker number pool: recycles numbers 1 through max_agents
         self._available_worker_numbers: set[int] = set()
         # Slot(s) reserved for independent re-checks of critical findings, on
@@ -392,12 +402,17 @@ class FlowExplorationOrchestrator:
                 yield event
             return
 
-        # Initialize browser pool
+        # Initialize browser pool. A browser that dies mid-run aborts the
+        # run like a rejected key: every later flow would fail without
+        # reaching the site, and the report would read as site failures
+        # (OPS-2). The findings so far are salvaged.
+        run_state = self._shared_state
         self._browser_pool = BrowserPool(
             max_pages=num_agents * 2,
             headless=self.headless,
             viewport_width=VIEWPORT_WIDTH,
-            viewport_height=VIEWPORT_HEIGHT
+            viewport_height=VIEWPORT_HEIGHT,
+            on_disconnected=lambda: run_state.abort(BROWSER_CRASHED_REASON),
         )
 
         try:
@@ -474,6 +489,10 @@ class FlowExplorationOrchestrator:
                         await self._shared_state.pause(stop_reason)
 
                         # Cancel active workers gracefully - they will checkpoint because paused=True
+                        paused_workers = [
+                            (task, self._worker_flow_tasks.get(task))
+                            for task in self._active_worker_tasks
+                        ]
                         for task in list(self._active_worker_tasks):
                             task.cancel()
 
@@ -486,6 +505,7 @@ class FlowExplorationOrchestrator:
                                 )
                             except asyncio.TimeoutError:
                                 logger.warning("Pause: workers did not finish within 15s — proceeding")
+                        await self._requeue_unstarted_flows(paused_workers)
 
                         # Drain events from queue before pausing
                         while not self._event_queue.empty():
@@ -559,20 +579,7 @@ class FlowExplorationOrchestrator:
                         _log_event(event)
                         yield event
 
-                        # Reinitialize worker tracking for resumption
-                        # At this point, all cancelled workers should have completed their cleanup
-                        # (releasing semaphore slots, returning worker numbers, decrementing active count)
-                        # We reset our tracking to a clean state and let the semaphore/shared state
-                        # remain as workers left them (should be fully released)
-                        active_workers = self._shared_state._active_workers
-                        if active_workers > 0:
-                            logger.warning(f"Resuming with {active_workers} active workers still tracked - resetting to 0")
-                            self._shared_state._active_workers = 0
-                        self._active_worker_tasks.clear()
-                        self._available_worker_numbers = set(range(1, num_agents + 1))
-                        # Reset semaphore to full capacity for fresh start
-                        self._worker_semaphore = asyncio.Semaphore(num_agents)
-                        self._reset_recheck_slots(num_agents)
+                        self._reset_worker_tracking_for_resume(num_agents)
 
                         # Continue the main loop - will spawn workers for any pending flows
                         continue
@@ -636,6 +643,14 @@ class FlowExplorationOrchestrator:
                     yield event
                 except asyncio.QueueEmpty:
                     break
+
+            # The loop checks fatal_error only at its top, so an abort that
+            # landed in its last iteration (the completion break, a stop or
+            # pause break) or during the wind-down above would otherwise
+            # synthesize as a normal run: no `error`, so the CLI exits 0 and
+            # the deploy gate goes green on a run that died (GATE-1 review).
+            if self._shared_state.fatal_error:
+                raise FatalExplorationError(self._shared_state.fatal_error)
 
             # Final progress before synthesis: every worker has exited, so
             # this is the first progress payload with active_workers == 0
@@ -809,6 +824,39 @@ class FlowExplorationOrchestrator:
                 )
             await self._cleanup()
 
+    def _reset_worker_tracking_for_resume(self, num_agents: int):
+        """Reinitialize worker tracking when a paused run resumes.
+
+        The wind-down is over first of all: a worker cancelled from here on
+        is not being paused (RUN-3).
+
+        A straggler that outlived the 15-s wind-down is still running. It
+        stays in ``_active_worker_tasks``, so ``_is_exploration_complete``
+        waits for it, and on exit it decrements the active count and
+        releases the semaphore and number pool it took from. So the count is
+        re-synced to the stragglers, never zeroed. Zeroing let a straggler's
+        later decrement cancel a new worker's increment, and the supervisor
+        then read the run as complete and exited (RUN-4). A task cancelled
+        before it ever started never runs its finally. That is why the count
+        is re-synced rather than trusted, and why the semaphores and pools
+        are rebuilt at full capacity. A straggler's worker id can be handed
+        out again while it finishes.
+        """
+        self._shared_state.end_pause_cancellation()
+        stragglers = [t for t in self._active_worker_tasks if not t.done()]
+        if stragglers:
+            logger.warning(
+                f"Resuming with {len(stragglers)} worker(s) still finishing "
+                f"their pause cancellation"
+            )
+        self._active_worker_tasks.difference_update(
+            [t for t in self._active_worker_tasks if t.done()]
+        )
+        self._shared_state._active_workers = len(stragglers)
+        self._available_worker_numbers = set(range(1, num_agents + 1))
+        self._worker_semaphore = asyncio.Semaphore(num_agents)
+        self._reset_recheck_slots(num_agents)
+
     def _reset_recheck_slots(self, num_agents: int):
         """(Re)create the re-check slot(s): numbered after the regular
         workers, so worker ids stay unique across both pools."""
@@ -889,6 +937,8 @@ class FlowExplorationOrchestrator:
         )
         self._active_worker_tasks.add(task)
         task.add_done_callback(self._active_worker_tasks.discard)
+        self._worker_flow_tasks[task] = flow_task
+        task.add_done_callback(lambda t: self._worker_flow_tasks.pop(t, None))
 
     async def _run_worker_and_release(
         self,
@@ -930,9 +980,34 @@ class FlowExplorationOrchestrator:
             number_pool.add(worker_number)
             semaphore.release()
 
+    async def _requeue_unstarted_flows(self, workers: list[tuple]):
+        """After a pause's wind-down: re-queue the flow of every finished
+        worker task that never explored it.
+
+        A task the pause cancelled before its coroutine ran never reaches
+        the worker's own cancel handler, so its flow, already dequeued by
+        claim_pending_flow, was left PENDING with no queue entry (RUN-2
+        review, Path A). Tasks still running (stragglers) are left alone;
+        requeue_unstarted_flow is a no-op for a flow its worker already
+        checkpointed, re-queued or ended.
+        """
+        for task, flow_task in workers:
+            if flow_task is not None and task.done():
+                if await self._shared_state.requeue_unstarted_flow(flow_task):
+                    logger.info(
+                        f"Pause: re-queued {flow_task.flow_name} ({flow_task.flow_id}), "
+                        f"cancelled before it started"
+                    )
+
     async def _spawn_workers_for_pending_flows(self):
-        """Check for pending flows and spawn workers for them."""
+        """Check for pending flows and spawn workers for them.
+
+        Never once the run is stopping: a worker spawned in the step that
+        then pauses is cancelled before it starts (RUN-2 review).
+        """
         while True:
+            if self._shared_state.should_stop():
+                break
             # Check if semaphore has available slots (non-blocking)
             if self._worker_semaphore.locked():
                 # All worker slots in use
@@ -963,7 +1038,11 @@ class FlowExplorationOrchestrator:
         # A queued re-check of a critical finding never waits for a user flow
         # to finish: it decides the gate and must end inside the run's
         # budget, so it also has slot(s) of its own.
-        while self._recheck_semaphore is not None and not self._recheck_semaphore.locked():
+        while (
+            self._recheck_semaphore is not None
+            and not self._recheck_semaphore.locked()
+            and not self._shared_state.should_stop()
+        ):
             recheck_task = await self._shared_state.claim_pending_recheck()
             if recheck_task is None:
                 break
@@ -1290,6 +1369,7 @@ class FlowExplorationOrchestrator:
                 logger.warning("Cleanup: workers did not exit after cancellation")
 
         self._active_worker_tasks.clear()
+        self._worker_flow_tasks.clear()
 
         # Stop browser pool (with timeout — Playwright cleanup can hang
         # if there are stuck browser operations)
@@ -1305,6 +1385,15 @@ class FlowExplorationOrchestrator:
         # Close chat logger to prevent resource leaks
         if self._shared_state and self._shared_state.chat_logger:
             self._shared_state.chat_logger.close()
+
+        # The Testmail client's httpx.AsyncClient: nothing closed it, so a
+        # long-lived web server leaked one connection pool per run (OPS-3)
+        if self._shared_state and self._shared_state.email_service:
+            try:
+                await asyncio.wait_for(self._shared_state.email_service.close(), timeout=5.0)
+            except Exception as e:
+                logger.warning(f"Cleanup: email service close error: {e}")
+            self._shared_state.email_service = None
 
         # Release heavy data structures inside shared state so the GC can
         # reclaim memory without waiting for the full object graph to die.

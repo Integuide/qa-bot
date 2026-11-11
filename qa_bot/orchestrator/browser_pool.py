@@ -3,7 +3,7 @@
 import asyncio
 import base64
 import logging
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import urlparse, urlunparse
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Playwright
@@ -100,16 +100,24 @@ class BrowserPool:
         max_pages: int = 10,
         headless: bool = True,
         viewport_width: int = 1280,
-        viewport_height: int = 720
+        viewport_height: int = 720,
+        on_disconnected: Optional[Callable[[], None]] = None,
     ):
+        """``on_disconnected`` is called (sync, once) when the browser goes
+        away on its own: a Chromium crash, an OOM kill. Never for stop().
+        Until 2026-11-07 nothing listened, so every later
+        create_isolated_context failed, each remaining flow failed twice,
+        and the report read as site failures (state-machines.md OPS-2)."""
         self.max_pages = max_pages
         self.headless = headless
         self.viewport = {"width": viewport_width, "height": viewport_height}
+        self._on_disconnected = on_disconnected
 
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._lock = asyncio.Lock()
         self._started = False
+        self._closing = False  # our own teardown: its disconnect is expected
 
     async def start(self):
         """Initialize Playwright and launch browser.
@@ -123,18 +131,30 @@ class BrowserPool:
                 return
 
             try:
+                self._closing = False
                 self._playwright = await async_playwright().start()
                 self._browser = await self._playwright.chromium.launch(headless=self.headless)
+                self._browser.on("disconnected", self._handle_disconnected)
             except Exception:
                 await self._teardown()
                 raise
             self._started = True
+
+    def _handle_disconnected(self, *_args):
+        """Playwright's ``disconnected`` event: unexpected unless we closed it."""
+        if self._closing:
+            return
+        self._started = False  # create_isolated_context now says why
+        logger.error("Browser disconnected mid-run (crashed or killed)")
+        if self._on_disconnected is not None:
+            self._on_disconnected()
 
     async def _teardown(self):
         """Close the browser and stop Playwright, swallowing cleanup errors.
 
         Must be called while holding self._lock.
         """
+        self._closing = True
         if self._browser:
             try:
                 await self._browser.close()

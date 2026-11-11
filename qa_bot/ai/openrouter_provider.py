@@ -603,6 +603,7 @@ class OpenRouterProvider(AIProvider):
         completed_flows: list[dict],
         issues: list[dict],
         goal: str = "",
+        interactive: bool = True,
     ) -> dict:
         """Supervisor decision — same prompt and parsing as ClaudeProvider."""
         context = format_supervisor_context(
@@ -612,6 +613,7 @@ class OpenRouterProvider(AIProvider):
             completed_flows=completed_flows,
             issues=issues,
             goal=goal,
+            interactive=interactive,
         )
         reply = await self._complete(
             "Supervisor", SUPERVISOR_SYSTEM_PROMPT, [{"role": "user", "content": context}],

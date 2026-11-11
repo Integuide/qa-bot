@@ -1281,7 +1281,8 @@ class FlowExplorationWorker:
                             # Link checkpoint to data request
                             await self.state.set_data_request_checkpoint(
                                 request_name,
-                                checkpoint.checkpoint_id
+                                checkpoint.checkpoint_id,
+                                task.flow_id,
                             )
 
                         yield {
@@ -1573,34 +1574,66 @@ class FlowExplorationWorker:
                 await self.state.complete_flow(
                     task.flow_id, "Re-check interrupted before a verdict"
                 )
+            elif self.state.is_pause_cancellation() and browser is None:
+                # Paused before this attempt's first turn (no context or page
+                # yet, or still navigating to the start URL / restoring its
+                # checkpoint): nothing was explored, so the flow goes back in
+                # the queue as it was. A pause checkpoint here would carry an
+                # empty history for a continuation (history loads after the
+                # restore) and about:blank as its URL; FAILED would drop a
+                # flow nothing was tried on (RUN-2 review)
+                await self.state.requeue_unstarted_flow(task)
             elif self.state.is_pause_cancellation():
-                # Always mark the flow as blocked for pause, even if we can't checkpoint
-                # This prevents the flow from showing as "exploring" after pause
-                await self.state.block_flow_for_pause(task.flow_id, self.state.get_stop_reason())
-
-                # Only try to create checkpoint if browser context is available
-                if context and page:
-                    try:
-                        storage_state = await asyncio.wait_for(context.storage_state(), timeout=5.0)
-                        _strip_old_screenshots(conversation_history)
-                        checkpoint = FlowCheckpoint(
-                            parent_flow_id=task.flow_id,
-                            browser_storage_state=storage_state,
-                            # Active page (popup-aware). browser may be unbound
-                            # here: cancellation can land before the controller
-                            # is created (during the initial _safe_goto), so
-                            # fall back to the main page's URL.
-                            current_url=browser.current_url if browser else page.url,
-                            conversation_history=conversation_history.copy(),
-                            action_history=action_history.copy(),
-                            flow_path=task.flow_path,
-                            branch_name=task.flow_name,  # resume clone keeps the flow's human name
-                            created_by_worker=self.worker_id
+                # Paused, not stopped: save a pause checkpoint so a resume
+                # continues this flow. BLOCKED_FOR_PAUSE is set only once the
+                # checkpoint exists. Interactive runs wait on that status in
+                # is_complete() and only claiming the clone clears it, so a
+                # checkpoint-less one (cancelled before it had a page, a
+                # storage_state() timeout, the wind-down's second cancel
+                # landing mid-save) kept a resumed run from ever completing
+                # (RUN-2). There it ends FAILED instead, without a retry.
+                # Non-interactive runs never resume and go straight to
+                # synthesis, which reports BLOCKED_FOR_PAUSE as interrupted,
+                # so they keep it either way.
+                reason = self.state.pause_cancel_reason or self.state.get_stop_reason()
+                checkpointed = False
+                try:
+                    if context and page:
+                        try:
+                            storage_state = await asyncio.wait_for(context.storage_state(), timeout=5.0)
+                            _strip_old_screenshots(conversation_history)
+                            checkpoint = FlowCheckpoint(
+                                parent_flow_id=task.flow_id,
+                                browser_storage_state=storage_state,
+                                # Active page (popup-aware). browser may be unbound
+                                # here: cancellation can land before the controller
+                                # is created (during the initial _safe_goto), so
+                                # fall back to the main page's URL.
+                                current_url=browser.current_url if browser else page.url,
+                                conversation_history=conversation_history.copy(),
+                                action_history=action_history.copy(),
+                                flow_path=task.flow_path,
+                                branch_name=task.flow_name,  # resume clone keeps the flow's human name
+                                created_by_worker=self.worker_id
+                            )
+                            await self.state.add_pause_checkpoint(checkpoint, f"Resume after pause: {task.goal}")
+                            checkpointed = True
+                            # Checkpoint saved - coordinator will emit flow_paused_checkpoint events
+                        except Exception as e:
+                            logger.warning(f"Failed to save pause checkpoint for {task.flow_name}: {e}")
+                finally:
+                    # In a finally: a second cancellation inside the save
+                    # must still leave the flow in a terminal or resumable
+                    # status, never EXPLORING with no worker
+                    if checkpointed or not self.state.interactive:
+                        await self.state.block_flow_for_pause(task.flow_id, reason)
+                    else:
+                        await self.state.fail_flow(
+                            task.flow_id,
+                            f"Interrupted by the pause before its progress could be "
+                            f"saved ({reason}); not resumed",
+                            allow_retry=False,
                         )
-                        await self.state.add_pause_checkpoint(checkpoint, f"Resume after pause: {task.goal}")
-                        # Checkpoint saved - coordinator will emit flow_paused_checkpoint events
-                    except Exception as e:
-                        logger.warning(f"Failed to save pause checkpoint for {task.flow_name}: {e}")
             raise  # Re-raise CancelledError
 
         finally:

@@ -844,8 +844,15 @@ def format_supervisor_context(
     completed_flows: list[dict],
     issues: list[dict],
     goal: str = "",
+    interactive: bool = True,
 ) -> str:
-    """Format the supervisor context for the AI."""
+    """Format the supervisor context for the AI.
+
+    ``interactive=False`` (CLI/CI) tells the supervisor nobody can answer:
+    ASK_USER there files a data request that is terminal, so one choice
+    sank the flow (state-machines.md SUP-3; the supervisor also refuses it
+    in code).
+    """
 
     def format_workers(workers: list[dict]) -> str:
         if not workers:
@@ -888,8 +895,15 @@ def format_supervisor_context(
             lines.append(f"  ... and {len(issues) - max_items} more")
         return "\n".join(lines)
 
+    goal_text = f"  {goal.strip()}" if goal and goal.strip() else "  (none given — general exploration)"
+    if not interactive:
+        goal_text += (
+            "\n\n### Run Mode:\n  Non-interactive (CI): nobody can answer a question "
+            "during this run, so ASK_USER is not available. Help a blocked worker "
+            "with UNBLOCK, or STOP it."
+        )
     return SUPERVISOR_CONTEXT_TEMPLATE.format(
-        goal=f"  {goal.strip()}" if goal and goal.strip() else "  (none given — general exploration)",
+        goal=goal_text,
         active_workers=format_workers(active_workers),
         blocked_workers=format_blocked(blocked_workers),
         pending_flows=format_flows(pending_flows),

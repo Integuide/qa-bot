@@ -49,6 +49,8 @@ To post the report as a PR comment, the job also needs `permissions: pull-reques
 | `testmail-namespace` | No | - | Testmail.app namespace (experimental — not yet active) |
 | `dangerously-skip-permissions` | No | `true` | Auto-approve destructive actions (enabled by default in CI) |
 
+A run that ended on a fatal error (a rejected API key, no credit, a crash) always fails, whatever `fail-on-critical` and `fail-on-zero-flows` say. Any findings it made before the abort are still posted, marked **Run aborted**.
+
 ## Outputs
 
 | Output | Description |
@@ -271,13 +273,19 @@ the token estimate. **With an OpenRouter key, screenshots, page text and
 test credentials go to OpenRouter and the model vendor (OpenAI), not
 Anthropic.**
 
-**Known issue — newer Claude models on new Anthropic accounts:** on
-accounts created on or after 2026-08-31, Claude Haiku 5.5, Sonnet 5.5 and
-Opus 5.5 can fail with an HTTP 400 on a worker's second turn. The worker
-rewrites each stored prompt into a short summary after the turn, and these
-models reject a replayed thinking block whose earlier conversation changed
-(the preserved-thinking history check). See [mono#759](https://github.com/Integuide/mono/issues/759); older accounts
-are not affected.
+**Earlier reasoning on newer Claude models:** after each turn the worker
+replaces the prompt it sent with a short summary, and Claude's
+preserved-thinking check rejects a replayed thinking block once the
+conversation before it has changed (HTTP 400, "bound to a different
+conversation"). Claude Fable 5.2 applies the check to every account; Haiku
+5.5, Sonnet 5.5, Opus 5.5 and Fable 5.1 apply it to Anthropic accounts
+created on or after 2026-08-31. Where it applies, the bot sends earlier
+turns without their thinking blocks: from the start on Fable 5.2, and
+otherwise after the first rejected request of a run, which is retried at
+once and logged as a warning. The model then works from each turn's
+screenshot and the Recent Actions recap, without its own earlier reasoning.
+Older accounts on the other models are unchanged. Background:
+[mono#759](https://github.com/Integuide/mono/issues/759).
 
 Haiku 5.5's cost figure is a lower bound for very long flows: a call whose
 prompt passes 100K tokens bills at $0.50/$2.50 per MTok (5x), which the

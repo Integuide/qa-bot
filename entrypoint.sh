@@ -410,6 +410,16 @@ if ! [[ "$FLOWS_EXPLORED" =~ ^[0-9]+$ ]]; then
     echo "::warning::Non-numeric flows_explored in result file; treating as 0"
     FLOWS_EXPLORED=0
 fi
+# A salvaged run: the run ended on a fatal error (rejected key, no credit, a
+# main-loop crash) after some work, so the CLI wrote the result file with the
+# findings so far AND `error` set, and exited 2. The report and comment are
+# posted as usual; the gate below fails on it whatever the other inputs say.
+# Exception text, so flattened to one line and capped for the ::error:: line.
+RUN_ERROR=$(jq -r '.error // empty | tostring | gsub("[\\r\\n]+"; " ") | .[0:300]' /tmp/qa-result.json 2>/dev/null || true)
+ABORT_NOTE=""
+if [ -n "$RUN_ERROR" ]; then
+    ABORT_NOTE="**Run aborted:** \`$RUN_ERROR\` — the report covers only what ran before the abort, so this check fails whatever it found."
+fi
 DURATION=$(jq -r '.duration_seconds // 0' /tmp/qa-result.json)
 COST_USD=$(jq -r '.estimated_cost_usd // 0' /tmp/qa-result.json)
 # Never write unvalidated result-file content to GITHUB_OUTPUT: a malformed
@@ -499,6 +509,7 @@ fi
 
 echo "::group::Results Summary"
 echo "Mode: $INPUT_MODE"
+echo "Run aborted: ${RUN_ERROR:-no}"
 echo "Flows explored: $FLOWS_EXPLORED"
 echo "Issues found: $ISSUES_COUNT"
 echo "Critical issues (raw worker findings): $CRITICAL_COUNT"
@@ -588,6 +599,7 @@ $REPORT
 
 ---
 **Run stats:** Explored $FLOWS_EXPLORED user flows | $ISSUES_COUNT raw issue(s) detected during exploration ($CRITICAL_COUNT critical) | Duration: ${DURATION}s | $COST_NOTE
+$ABORT_NOTE
 **Gate:** $GATE_DISPLAY
 $SINCE_PREVIOUS_NOTE
 $RECHECK_NOTE
@@ -626,6 +638,14 @@ if [ "$INPUT_FAIL_ON_CRITICAL" = "true" ] && [ "$GATE_COUNT" -gt 0 ]; then
     else
         echo "::error::Found $CRITICAL_COUNT critical issue(s) (raw worker findings; synthesis produced no curated verdict)"
     fi
+    EXIT_CODE=1
+fi
+
+# A run that died part-way never reads as a green check, whatever
+# fail-on-critical / fail-on-zero-flows say: the same rule as a run with no
+# result file at all (above), which fails whatever the inputs say too.
+if [ -n "$RUN_ERROR" ]; then
+    echo "::error::QA Bot run aborted: $RUN_ERROR — the report covers only what ran before the abort"
     EXIT_CODE=1
 fi
 

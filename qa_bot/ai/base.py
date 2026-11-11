@@ -219,6 +219,7 @@ class AIProvider(ABC):
         completed_flows: list[dict],
         issues: list[dict],
         goal: str = "",
+        interactive: bool = True,
     ) -> dict:
         """
         Call AI for supervisor decisions.
