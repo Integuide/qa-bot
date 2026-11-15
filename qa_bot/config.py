@@ -75,8 +75,8 @@ OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "300"
 # is available: a live A/B on the same 8-minute run cost ~13x less than
 # Sonnet 5 ($0.146 vs $1.89) with no protocol errors, at somewhat shallower
 # coverage. Claude Sonnet 5.5 otherwise (Sonnet 5 until 2026-09-29, same
-# price), so a caller with only an Anthropic key (every public action user
-# before this change) runs Claude as before.
+# price but for cache reads), so a caller with only an Anthropic key (every
+# public action user before this change) runs Claude as before.
 # DEFAULT_CLAUDE_MODEL is also ClaudeProvider's default and the cost-pricing
 # fallback when no model is known (the pricier of the two keeps a cost cap
 # conservative).
@@ -135,7 +135,8 @@ def resolve_model(
 # pricing for Claude Sonnet 5, announced at launch as introductory pricing
 # through August 31, 2026, is now the standard price. The previously scheduled
 # increase to $3/$15 ... will not occur."); Sonnet 5.5 launched 2026-09-29 at
-# the same price and tokenizer. Note: Sonnet 5's tokenizer (and Haiku 5.5's)
+# the same price and tokenizer, except cache reads: $0.10, 0.05x input (read
+# 2026-11-13; the row said $0.20 until then). Note: Sonnet 5's tokenizer (and Haiku 5.5's)
 # emits ~30% more tokens for the same text than Haiku 4.5/Sonnet 4.6, so a given
 # dollar cap buys less exploration than the raw per-token rate ratio suggests.
 MODEL_PRICING: dict[str, dict[str, float]] = {
@@ -168,7 +169,7 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     MODEL_SONNET: {
         "input": 2.0,           # $2/MTok for input tokens
         "output": 10.0,         # $10/MTok for output tokens
-        "cache_read": 0.20,     # $0.20/MTok (10% of input)
+        "cache_read": 0.10,     # $0.10/MTok (5% of input; Sonnet 5 is 10%)
         "cache_creation": 2.50,    # $2.50/MTok (125% of input)
         "estimated_blended": 4.4,  # For max cost conversion (~70% input, ~30% output)
     },
