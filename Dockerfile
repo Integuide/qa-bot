@@ -14,7 +14,7 @@
 FROM mcr.microsoft.com/playwright/python:v1.63.0-jammy
 
 LABEL org.opencontainers.image.title="QA Bot"
-LABEL org.opencontainers.image.description="AI-powered website QA testing using Claude"
+LABEL org.opencontainers.image.description="AI-powered website QA testing: GPT-6 Luna via OpenRouter, or Claude"
 LABEL org.opencontainers.image.source="https://github.com/integuide/qa-bot"
 
 WORKDIR /app
@@ -29,10 +29,12 @@ RUN apt-get update && apt-get install -y \
     jq \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies. The image is rebuilt on
-# every run, so requirements.txt's ranges alone let the anthropic/playwright
-# versions change between two runs of the same code; the constraints file
-# pins the exact set the last verified gate ran with (dev keeps the ranges).
+# Copy requirements and install Python dependencies: only what the qa_bot
+# package imports (requirements.txt), not the web server's or the test
+# suite's packages. The image is rebuilt on every run, so the file's ranges
+# alone let versions change between two runs of the same code; the
+# constraints file pins the exact set the last verified gate ran with (dev
+# keeps the ranges).
 COPY requirements.txt action-constraints.txt ./
 RUN pip install --no-cache-dir -r requirements.txt -c action-constraints.txt
 

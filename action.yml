@@ -62,7 +62,7 @@ inputs:
     default: ''
 
   post-comment:
-    description: 'Post results as a PR comment (true/false)'
+    description: 'Post results as a PR comment. `true` or `false` in any letter case; any other value (`yes`, `1`, a typo) fails the step before the run starts.'
     required: false
     default: 'true'
 
@@ -72,12 +72,12 @@ inputs:
     default: 'update'
 
   fail-on-critical:
-    description: 'Fail the workflow if critical issues are found (true/false)'
+    description: 'Fail the workflow if critical issues are found. `true` or `false` in any letter case; any other value (`yes`, `1`, a typo) fails the step before the run starts, so a misspelt value can never switch the gate off.'
     required: false
     default: 'true'
 
   fail-on-zero-flows:
-    description: 'Fail the workflow when no flows were tested at all (missing credentials, unreachable target). A run that tested nothing should not read as a green check. (true/false)'
+    description: 'Fail the workflow when no flows were tested at all (missing credentials, unreachable target). A run that tested nothing should not read as a green check. `true` or `false` in any letter case; any other value (`yes`, `1`, a typo) fails the step before the run starts, so a misspelt value can never switch the gate off.'
     required: false
     default: 'true'
 
@@ -95,7 +95,7 @@ inputs:
     required: false
 
   dangerously-skip-permissions:
-    description: 'Auto-approve all irreversible actions (payments, deletions). Enabled by default in CI since there is no human to respond to approval requests.'
+    description: 'Auto-approve all irreversible actions (payments, deletions). Enabled by default in CI since there is no human to respond to approval requests. `true` or `false` in any letter case; any other value (`yes`, `1`, a typo) fails the step before the run starts; an empty value means false.'
     required: false
     default: 'true'
 

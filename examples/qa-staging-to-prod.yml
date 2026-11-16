@@ -160,7 +160,7 @@ jobs:
 
       - name: Checkout repository
         if: github.event_name == 'pull_request' || steps.pr-details.outputs.valid == 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.pr-details.outputs.ref || github.event.pull_request.head.sha }}
 

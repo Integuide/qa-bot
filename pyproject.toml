@@ -1,0 +1,35 @@
+# Packaging for the public repo (Integuide/qa-bot), where this file sits at
+# the root next to qa_bot/ and requirements.txt:
+#
+#   pip install git+https://github.com/Integuide/qa-bot
+#   playwright install chromium
+#   qa-bot https://staging.example.com
+#
+# It is not on PyPI: install from the repository, never `pip install qa-bot`.
+# In the monorepo it lives in qa-bot/action/ and is not used; the release
+# sync copies it (scripts/public_tree.sh).
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "integuide-qa-bot"
+description = "AI website QA testing: agents explore user flows in real browsers and write a QA report"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dynamic = ["version", "dependencies"]
+
+[project.urls]
+Repository = "https://github.com/Integuide/qa-bot"
+
+[project.scripts]
+qa-bot = "qa_bot.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "qa_bot._version.__version__" }
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["qa_bot*"]

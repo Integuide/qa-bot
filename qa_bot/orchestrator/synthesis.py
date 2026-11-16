@@ -408,12 +408,11 @@ class SynthesisAgent:
 
         description = self._describe_action(action)
         pinned = False
-        if action.get("action_type") == "type" and not is_sensitive_field_label(
+        entered = self._entered_text(action)
+        if entered and not is_sensitive_field_label(
             action.get("element") or action.get("ref") or ""
         ):
-            tokens = self._carried_tokens(
-                str(action.get("text") or ""), later_searches or [], run_nonce
-            )
+            tokens = self._carried_tokens(entered, later_searches or [], run_nonce)
             if tokens:
                 description = f"{description} (text contains {'; '.join(tokens)})"
                 pinned = True
@@ -439,6 +438,28 @@ class SynthesisAgent:
         if pinned:
             summary["pinned"] = True
         return summary
+
+    @staticmethod
+    def _entered_text(action: dict) -> str:
+        """The text an action put into a field: a `type` action's text, or a
+        `form_input` action's value when it is a string (form_input also
+        drives text fields; a checkbox's True or a number is not text)."""
+        kind = action.get("action_type")
+        if kind == "type":
+            return str(action.get("text") or "")
+        if kind == "form_input" and isinstance(action.get("value"), str):
+            return action["value"]
+        return ""
+
+    @staticmethod
+    def _shown_text(text: str, label: str) -> str:
+        """Entered text as the action summary shows it: masked when the
+        field's label looks like a secret (the fallback for a password the
+        worker never registered: one the AI invented or was told inline),
+        else cut to 30 chars."""
+        if is_sensitive_field_label(label):
+            return "***"
+        return text[:27] + "..." if len(text) > 30 else text
 
     def _describe_action(self, action: dict) -> str:
         """
@@ -474,19 +495,17 @@ class SynthesisAgent:
 
         # Type text
         if action_type == "type":
-            text = action.get("text", "")
             target = element or ref or "field"
-            # Mask sensitive fields (passwords, tokens, etc.)
-            if is_sensitive_field_label(element or ref or ""):
-                text = "***"
-            elif len(text) > 30:
-                text = text[:27] + "..."
+            text = self._shown_text(action.get("text", ""), element or ref or "")
             return f"Type '{text}' into {target}"
 
-        # Form input
+        # Form input: a string (select option, date, text) is shown like
+        # typed text; a checkbox's True/False or a number as it is
         if action_type == "form_input":
             value = action.get("value", "")
             target = element or ref or "field"
+            if isinstance(value, str):
+                value = self._shown_text(value, element or ref or "")
             return f"Set {target} to '{value}'"
 
         # Scroll
@@ -520,9 +539,19 @@ class SynthesisAgent:
                 return f"Navigate {target_url}"
             return f"Navigate to {target_url[:50]}" if target_url else "Navigate"
 
+        # Drag
+        if action_type == "left_click_drag":
+            start = action.get("start_coordinate")
+            end = action.get("coordinate")
+            if start and end:
+                return f"Drag from {tuple(start)} to {tuple(end)}"
+            return "Drag"
+
         # Wait
         if action_type == "wait":
             duration = action.get("duration", "")
+            if isinstance(duration, float):
+                duration = f"{duration:g}"  # 2.0 -> "2"
             return f"Wait {duration}s" if duration else "Wait for page update"
 
         # Resize

@@ -15,6 +15,10 @@ Usage:
 
     # With inline credentials
     python -m qa_bot.cli https://example.com --credential "USERNAME=user" --credential "PASSWORD=pass"
+
+Exit codes (the table is in --help): 0 tested and no critical finding gates,
+1 critical findings, 2 no verdict (aborted, nothing tested, or a
+configuration or run error), 130 interrupted.
 """
 
 import argparse
@@ -23,16 +27,19 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
 
+from qa_bot import __version__
 from qa_bot.config import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_OPENROUTER_MODEL,
     LOG_LEVEL,
     MAX_CONCURRENT_API_CALLS,
+    MAX_COST_CAP_USD,
     ModelChoice,
     is_openrouter_model,
     resolve_model,
@@ -46,11 +53,40 @@ logging.basicConfig(
 )
 
 from qa_bot.ai import MissingAPIKeyError, create_provider
+from qa_bot.gate import EXIT_NO_VERDICT, EXIT_PASS, NO_REPORT, evaluate_gate
 from qa_bot.orchestrator.coordinator import FlowExplorationOrchestrator
 from qa_bot.orchestrator.shared_state import SMOKE_GOAL
+from qa_bot.run_inputs import (
+    MAX_AGENTS_CAP,
+    check_max_agents,
+    check_max_cost,
+    check_max_duration,
+    normalize_target_url,
+)
 
 
 LogLevel = Literal["quiet", "summary", "full"]
+
+# The HTTP clients log one INFO line per request ("HTTP Request: POST …
+# 200 OK"): httpx for OpenRouter and the preflight probe, httpx2 inside the
+# Anthropic SDK. That is one stderr line per AI call, hundreds in a full run.
+_HTTP_REQUEST_LOGGERS = ("httpx", "httpx2")
+
+
+def quiet_http_request_logs(log_level: LogLevel) -> None:
+    """Keep the per-request HTTP lines out of a ``quiet`` or ``summary`` run.
+
+    ``--log-level full`` keeps them (the Action runs at full, and people
+    debug from that log), and so does ``LOG_LEVEL=DEBUG``. Keyed on the
+    CLI's own flag, not on whether LOG_LEVEL is set: .env.example sets
+    LOG_LEVEL=INFO, so "set explicitly" is true for most installs. Only
+    these two loggers change. Warnings and errors still print, and the
+    ``Model:`` line is a print, not a log record, so no level can hide it.
+    """
+    if log_level == "full" or LOG_LEVEL == "DEBUG":
+        return
+    for name in _HTTP_REQUEST_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 # The GitHub Actions runner runs any output line that starts with "::"
@@ -347,8 +383,9 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
                 )
                 return f"[{timestamp}] [Action] Hover: {element}"
             elif action_type == "type":
-                element = data.get("element", "unknown element")
-                text = data.get("text", "")[:30]  # Truncate long text
+                element = data.get("element") or data.get("ref") or "unknown element"
+                # One log line, cut to 30 chars
+                text = log_safe(data.get("text", ""))[:30]
                 # CI runs this at --log-level full, so a value typed into a
                 # password-looking field must not reach workflow stdout
                 # (the worker masks known credential values at the source;
@@ -357,8 +394,15 @@ def format_event_for_log(event: dict, log_level: LogLevel) -> str | None:
                     text = "***"
                 return f"[{timestamp}] [Action] Type: '{text}' into {element}"
             elif action_type == "form_input":
-                element = data.get("element", "unknown element")
+                # A model may give a ref and no element label, so fall back
+                # to the ref like the click lines
+                element = data.get("element") or data.get("ref") or "unknown element"
                 value = data.get("value", "")
+                if not isinstance(value, (bool, int, float)):
+                    # A select option, a date, free text or a list of options:
+                    # one log line, cut like typed text (a checkbox's True or
+                    # a number as it is)
+                    value = log_safe(str(value))[:30]
                 if is_sensitive_field_label(element):
                     value = "***"
                 return f"[{timestamp}] [Action] Form input: {value} into {element}"
@@ -525,6 +569,8 @@ async def run_exploration(
     previous_report: str = "",
     openrouter_api_key: Optional[str] = None,
     recheck_criticals: Optional[bool] = None,
+    testmail_api_key: Optional[str] = None,
+    testmail_namespace: Optional[str] = None,
 ) -> dict:
     """
     Run QA exploration and return results.
@@ -555,6 +601,8 @@ async def run_exploration(
         recheck_criticals: Independent re-check of CRITICAL findings; None =
             default (``RECHECK_CRITICALS`` env, else on — the CLI is
             non-interactive). A not-reproduced critical arrives as major.
+        testmail_api_key, testmail_namespace: Testmail.app credentials for
+            the run's EmailService (experimental: nothing reads email yet).
 
     Returns:
         dict with report, issues, and metadata. ``completed`` is False when the
@@ -593,12 +641,13 @@ async def run_exploration(
     exploration_completed = False
     fatal_error = None
     recheck_summary = None
+    log_format_failed = False
 
     if smoke:
         goal = SMOKE_GOAL  # the orchestrator forces this too; keep the result honest
 
     if log_level != "quiet":
-        print(f"Starting {'SMOKE TEST' if smoke else 'exploration'} of {url}", file=sys.stderr)
+        print(f"QA Bot {__version__}: starting {'SMOKE TEST' if smoke else 'exploration'} of {url}", file=sys.stderr)
         print(f"Goal: {log_safe(goal)}", file=sys.stderr)
         limit_info = f"Max agents: {max_agents}, Max duration: {max_duration} min, Max cost: ${max_cost_usd:.2f}"
         print(limit_info, file=sys.stderr)
@@ -614,6 +663,8 @@ async def run_exploration(
         smoke=smoke,
         previous_report=previous_report,
         recheck_criticals=recheck_criticals,
+        testmail_api_key=testmail_api_key,
+        testmail_namespace=testmail_namespace,
     ):
         events.append(event)
         event_type = event.get("type", "")
@@ -654,10 +705,24 @@ async def run_exploration(
         if event_type == "error" and event.get("data", {}).get("fatal"):
             fatal_error = event.get("data", {}).get("message") or "Unknown fatal error"
 
-        # Log event based on log level
-        log_line = format_event_for_log(event, log_level)
-        if log_line:
-            print(ci_log_lines(log_line), file=sys.stderr)
+        # Log event based on log level. The log is a view of the run, not
+        # part of it: an event the formatter cannot handle (a field of an
+        # unexpected type, a new event shape) must cost one log line, not
+        # the run. Unguarded, the exception left this loop and discarded
+        # everything the run had found and been charged for.
+        try:
+            log_line = format_event_for_log(event, log_level)
+            if log_line:
+                print(ci_log_lines(log_line), file=sys.stderr)
+        except Exception as e:
+            if not log_format_failed:
+                log_format_failed = True
+                print(
+                    f"Warning: could not format a '{log_safe(event_type)}' event for the log "
+                    f"({type(e).__name__}: {log_safe(e)}); the run continues, and further "
+                    "log formatting failures are not reported",
+                    file=sys.stderr,
+                )
 
     if log_level != "quiet":
         print("-" * 70, file=sys.stderr)
@@ -665,14 +730,15 @@ async def run_exploration(
     charged_cost_usd = getattr(ai_provider, "charged_cost_usd", None)
 
     return {
-        "report": report or "No report generated",
+        "report": report or NO_REPORT,
         "issues": issues,
         "issues_found": len(issues),
-        # Curated verdict from the synthesis report. The exit code below and
-        # the action's gate use curated_critical_count when it is non-null
-        # (the report is the source of truth) and fall back to the RAW
-        # "issues" list when it is null (no AI verdict: fallback / NOT
-        # TESTED report). Both numbers stay visible side by side.
+        # Curated verdict from the synthesis report. The gate
+        # (qa_bot.gate.evaluate_gate, and the action's own) uses
+        # curated_critical_count when it is non-null (the report is the
+        # source of truth) and falls back to the RAW "issues" list when it
+        # is null (no AI verdict: fallback / NOT TESTED report). Both
+        # numbers stay visible side by side.
         "curated_critical_count": verdict["critical_count"] if verdict else None,
         "curated_critical_titles": (
             [c["title"] for c in verdict["critical"]] if verdict else None
@@ -754,6 +820,41 @@ def load_previous_report(value: str) -> str:
     return value
 
 
+def read_known_issues_file(path: str) -> str:
+    """The entries of a ``--known-issues-file``, in the documented
+    ``.qa-known-issues.md`` format: one issue per line, with ``#`` comment
+    lines and blank lines dropped (what the workflows' ``grep -v`` pair
+    does before they pass the rest inline).
+
+    A file has its own flag, where ``--previous-report`` takes a path or
+    text in one, on purpose. ``--known-issues`` is what the Action passes
+    its ``known-issues`` input to, and a one-line value there can come from
+    less trusted text than the workflow file. If such a value could name a
+    file, it would be read inside the Action's container and sent to the
+    model as a known issue, and from there into the report.
+    """
+    with open(path, encoding="utf-8") as f:
+        return "\n".join(
+            line for line in f.read().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+
+
+def is_a_file_name_not_an_issue(known_issues: str) -> bool:
+    """True when the ``--known-issues`` text is unmistakably a file name:
+    one word ending in .md or .txt (``.qa-known-issues.md``). The text is
+    still sent as it is; ``main`` warns that ``--known-issues-file`` was
+    probably meant. A one-line known issue often contains a ``/`` ("The
+    /pricing page shows the old plan name"), so a slash alone says nothing.
+    """
+    candidate = known_issues.strip()
+    return (
+        bool(candidate)
+        and not any(c.isspace() for c in candidate)
+        and candidate.endswith((".md", ".txt"))
+    )
+
+
 # Per-mode defaults for the limit flags (None on the argparse side so an
 # explicit value always wins over the mode default).
 LIMIT_DEFAULTS = {
@@ -763,18 +864,111 @@ LIMIT_DEFAULTS = {
 
 
 def resolve_limits(args) -> tuple[int, int, float]:
-    """Return (max_agents, max_duration, max_cost) for the parsed args.
+    """Return (max_agents, max_duration, max_cost) for the parsed args: the
+    values the run will use.
 
     Each limit is the explicit flag value when given, else the default for
     the run mode: 3 agents / 30 min / $5.00 for a full run, 1 / 5 / $0.75
-    for ``--smoke``.
+    for ``--smoke``. They are checked by the rule the web API uses
+    (qa_bot.run_inputs): zero, a negative number or NaN raises ValueError
+    (it used to start a run that could test nothing), and a value above the
+    cap is lowered to it with a note on stderr, where the coordinator used
+    to lower it silently after the banner had printed the larger number.
     """
     defaults = LIMIT_DEFAULTS["smoke" if getattr(args, "smoke", False) else "full"]
-    return (
-        args.max_agents if args.max_agents is not None else defaults["max_agents"],
-        args.max_duration if args.max_duration is not None else defaults["max_duration"],
-        args.max_cost if args.max_cost is not None else defaults["max_cost"],
-    )
+    asked_agents = args.max_agents if args.max_agents is not None else defaults["max_agents"]
+    asked_duration = args.max_duration if args.max_duration is not None else defaults["max_duration"]
+    asked_cost = args.max_cost if args.max_cost is not None else defaults["max_cost"]
+
+    max_agents = check_max_agents(asked_agents, "--max-agents")
+    max_duration = check_max_duration(asked_duration, "--max-duration")
+    max_cost = check_max_cost(asked_cost, "--max-cost")
+    if max_agents != asked_agents:
+        print(
+            f"Note: --max-agents {asked_agents} is above the maximum of "
+            f"{MAX_AGENTS_CAP}; this run uses {max_agents}",
+            file=sys.stderr,
+        )
+    if max_cost != asked_cost:
+        print(
+            f"Note: --max-cost {asked_cost:g} is above the maximum of "
+            f"${max_cost:.2f}; this run uses ${max_cost:.2f}",
+            file=sys.stderr,
+        )
+    return max_agents, max_duration, max_cost
+
+
+def prepare_output_file(path: str) -> Optional[str]:
+    """Get ``--output-file`` ready before the run is paid for. Returns what
+    is wrong with the path, or None when the result can be written there.
+
+    An earlier run's result at the path is removed: a run that then fails
+    writes no result file, and a wrapper that looks for the file would read
+    the previous run's (possibly green) result as this one's. Nothing is
+    created: an empty file would read as a result too.
+
+    Only a regular file is removed. A device, a FIFO or a symlink
+    (``/dev/stdout``) is written in place and only has to be writable. So
+    is a regular file that cannot be removed but can be written (one in a
+    read-only directory, a Docker single-file bind mount): it is emptied,
+    which is at least not the earlier result.
+    """
+    if os.path.isdir(path):
+        return "it is a directory"
+    if os.path.exists(path):
+        if os.path.islink(path) or not os.path.isfile(path):
+            return None if os.access(path, os.W_OK) else "it is not writable"
+        try:
+            os.unlink(path)
+        except OSError as e:
+            try:
+                os.truncate(path, 0)
+            except OSError:
+                return f"an earlier result is there and could not be removed or emptied ({e.strerror})"
+        return None
+    directory = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(directory):
+        return f"the directory {directory} does not exist"
+    if not os.access(directory, os.W_OK):
+        return f"the directory {directory} is not writable"
+    return None
+
+
+class InputFileError(Exception):
+    """A file the run was told to read cannot be used. ``str()`` is the
+    line for stderr."""
+
+
+def read_input_files(args) -> tuple[dict[str, str], str, str]:
+    """Everything a run reads from a file the caller named: (the
+    ``--credentials`` file's credentials, the ``--known-issues-file``
+    entries, the previous report). Raises InputFileError for the first one
+    that cannot be used.
+
+    One function so that ``main`` can read them all before it prepares
+    ``--output-file``, which removes what is at that path.
+    """
+    credentials = {}
+    if args.credentials:
+        try:
+            credentials = parse_credentials_file(args.credentials)
+        except FileNotFoundError as e:
+            raise InputFileError(f"Error: {e}") from e
+        except Exception as e:
+            raise InputFileError(f"Error parsing credentials file: {e}") from e
+    # UnicodeDecodeError too: a binary file named by mistake was a traceback
+    # and exit 1, the "critical findings" code.
+    known_issues_entries = ""
+    if args.known_issues_file:
+        try:
+            known_issues_entries = read_known_issues_file(args.known_issues_file)
+        except (OSError, UnicodeDecodeError) as e:
+            raise InputFileError(f"Error reading known issues: {e}") from e
+    try:
+        previous_report = load_previous_report(args.previous_report)
+    except (OSError, UnicodeDecodeError) as e:
+        raise InputFileError(f"Error reading previous report: {e}") from e
+    return credentials, known_issues_entries, previous_report
 
 
 def resolve_cli_model(args) -> ModelChoice:
@@ -841,11 +1035,17 @@ def format_markdown_output(result: dict) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
+        # Named as it is run. argparse's default is the file name, so usage
+        # and error lines read "cli.py", which is not a command (and
+        # "__main__.py" under `python -m qa_bot`). An installed copy
+        # (`pip install`, the public repo's pyproject.toml) runs as `qa-bot`.
+        prog="qa-bot" if Path(sys.argv[0]).name == "qa-bot" else "python -m qa_bot.cli",
         description="QA Bot - AI-powered website testing",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Basic usage (quiet, just outputs report)
+    # Basic usage (the report on stdout; stderr carries the Model line,
+    # warnings and errors)
     python -m qa_bot.cli https://example.com
 
     # With custom goal
@@ -872,12 +1072,25 @@ Examples:
     # Smoke test only: one worker opens each top-level nav link once
     # (defaults: 1 agent, 5 min, $0.75; report tagged SMOKE TEST ONLY)
     python -m qa_bot.cli https://example.com --smoke
+
+Exit codes:
+    0    the site was tested and no critical finding gates
+    1    critical findings (the report's curated count when it has a
+         verdict, else the raw worker count)
+    2    no verdict: the run aborted (rejected key, no credit, a crash);
+         nothing was tested (unreachable target, no user flow completed,
+         no report; --allow-zero-flows accepts a run with no flow tested);
+         or a configuration or usage error (missing key, bad credentials
+         file, unwritable --output-file, a URL or limit that cannot work)
+    130  interrupted (Ctrl-C)
+    The result JSON's "gate" key carries the same verdict and its reasons.
+    Gate a deploy on it with:  python -m qa_bot.cli URL && deploy
         """
     )
 
     parser.add_argument(
         "url",
-        help="Target URL to test"
+        help="Target URL to test (https:// is added when no scheme is given)"
     )
     parser.add_argument(
         "--goal", "-g",
@@ -889,9 +1102,19 @@ Examples:
         default="",
         help=(
             "Known issues / environment caveats the team has already "
-            "acknowledged (free text, e.g. one per line). Workers won't "
-            "re-investigate matching observations and the report lists them "
-            "as one-line 'observed again' notes instead of new findings."
+            "acknowledged (free text, e.g. one per line; always text, never "
+            "a path: see --known-issues-file). Workers won't re-investigate "
+            "matching observations and the report lists them as one-line "
+            "'observed again' notes instead of new findings."
+        )
+    )
+    parser.add_argument(
+        "--known-issues-file",
+        metavar="PATH",
+        help=(
+            "Read known issues from a file such as .qa-known-issues.md: one "
+            "per line; blank lines and lines starting with # are skipped. "
+            "Its entries are added to any --known-issues text."
         )
     )
     parser.add_argument(
@@ -933,13 +1156,16 @@ Examples:
         "--max-agents", "-a",
         type=int,
         default=None,
-        help="Maximum parallel agents (default: 3; 1 with --smoke)"
+        help=f"Maximum parallel agents (default: 3; 1 with --smoke; at most {MAX_AGENTS_CAP})"
     )
     parser.add_argument(
         "--max-cost",
         type=float,
         default=None,
-        help="Maximum cost in USD (default: $5.00; $0.75 with --smoke)"
+        help=(
+            "Maximum cost in USD (default: $5.00; $0.75 with --smoke; at most "
+            f"${MAX_COST_CAP_USD:.0f})"
+        )
     )
     parser.add_argument(
         "--max-duration", "-d",
@@ -979,6 +1205,16 @@ Examples:
         )
     )
     parser.add_argument(
+        "--version",
+        action="version",
+        version=f"qa-bot {__version__}",
+        help=(
+            "Print the version and exit. A release from the public repo "
+            "(Integuide/qa-bot) carries its tag's number; a monorepo checkout "
+            "is 0.0.0.dev0"
+        ),
+    )
+    parser.add_argument(
         "--print-model",
         action="store_true",
         help=(
@@ -990,12 +1226,16 @@ Examples:
     parser.add_argument(
         "--testmail-api-key",
         default=None,
-        help="Testmail.app API key for email verification testing (or set TESTMAIL_API_KEY env var)"
+        help=(
+            "Testmail.app API key (or set TESTMAIL_API_KEY env var). "
+            "Experimental: accepted, but the bot cannot read verification "
+            "emails yet"
+        )
     )
     parser.add_argument(
         "--testmail-namespace",
         default=None,
-        help="Testmail.app namespace (or set TESTMAIL_NAMESPACE env var)"
+        help="Testmail.app namespace (or set TESTMAIL_NAMESPACE env var). Experimental, as above"
     )
     parser.add_argument(
         "--output", "-o",
@@ -1005,7 +1245,11 @@ Examples:
     )
     parser.add_argument(
         "--output-file", "-f",
-        help="Write output to file instead of stdout"
+        help=(
+            "Write output to file instead of stdout. A result an earlier run "
+            "left at that path is removed when the run starts, so a run that "
+            "fails never sits next to a previous run's result"
+        )
     )
     parser.add_argument(
         "--headed",
@@ -1016,7 +1260,11 @@ Examples:
         "--log-level", "-l",
         choices=["quiet", "summary", "full"],
         default="quiet",
-        help="Log verbosity: quiet (default), summary (flow events), full (all activity)"
+        help=(
+            "Log verbosity on stderr: quiet (default: the Model line, "
+            "warnings, errors and a failing Gate line), summary (flow "
+            "events), full (all activity, including one line per HTTP request)"
+        )
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -1036,6 +1284,16 @@ Examples:
         help="Inline credential (can be specified multiple times)"
     )
     parser.add_argument(
+        "--allow-zero-flows",
+        action="store_true",
+        help=(
+            "Exit 0 even when no user flow was tested (a report-only run; the "
+            "Action's fail-on-zero-flows: 'false'). By default a run that "
+            "tested nothing exits 2, so an unreachable or mistyped target can "
+            "never pass a deploy gate."
+        )
+    )
+    parser.add_argument(
         "--dangerously-skip-permissions",
         action="store_true",
         help="Auto-approve all irreversible actions (payments, deletions, etc.). Use with caution."
@@ -1052,6 +1310,7 @@ Examples:
         log_level = "summary"
     else:
         log_level = "quiet"
+    quiet_http_request_logs(log_level)
 
     # API keys from args or environment; only the chosen model's provider
     # needs one (create_provider raises MissingAPIKeyError otherwise).
@@ -1069,20 +1328,53 @@ Examples:
         print(model_choice.reason)
         sys.exit(0)
 
-    # Parse credentials
-    credentials = {}
-    if args.credentials:
-        try:
-            credentials.update(parse_credentials_file(args.credentials))
-            if log_level != "quiet":
-                print(f"Loaded {len(credentials)} credentials from {args.credentials}", file=sys.stderr)
-        except FileNotFoundError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
-        except Exception as e:
-            print(f"Error parsing credentials file: {e}", file=sys.stderr)
-            sys.exit(1)
+    # Everything below that can refuse the run does it here, before any
+    # browser or AI spend, and exits 2 (no verdict).
+    #
+    # The input files are read first, because preparing --output-file
+    # removes what is at that path and an input may be at the same one:
+    # `--previous-report report.md --output-file report.md` is the local
+    # run-over-run loop. A file that cannot be read is reported only after
+    # the output file is prepared: an earlier run's result must not outlive
+    # that failure, or any of the ones that follow.
+    input_error = None
+    credentials, known_issues_entries, previous_report = {}, "", ""
+    try:
+        credentials, known_issues_entries, previous_report = read_input_files(args)
+    except InputFileError as e:
+        input_error = e
+    # A result replaces an earlier one with the earlier one's permissions
+    # (never looser: the umask still applies), so a file the caller made
+    # private (`mktemp`) is not swapped for a world-readable one.
+    output_mode = 0o666
+    if args.output_file:
+        if os.path.isfile(args.output_file):
+            output_mode = stat.S_IMODE(os.stat(args.output_file).st_mode)
+        problem = prepare_output_file(args.output_file)
+        if problem:
+            print(f"Error: cannot write --output-file {args.output_file}: {problem}", file=sys.stderr)
+            sys.exit(EXIT_NO_VERDICT)
+    if input_error:
+        print(input_error, file=sys.stderr)
+        sys.exit(EXIT_NO_VERDICT)
 
+    # The URL and the limits by the web API's rule (qa_bot.run_inputs). The
+    # URL is checked after --print-model on purpose: the Action resolves its
+    # model with `cli URL --print-model` first, and a bad URL must not show
+    # up there as "could not resolve the model".
+    try:
+        url = normalize_target_url(args.url)
+        max_agents, max_duration, max_cost = resolve_limits(args)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(EXIT_NO_VERDICT)
+    if url != args.url.strip():
+        # Every log level: the run is about to test something the caller
+        # did not literally type.
+        print(f"Note: no scheme in '{log_safe(args.url.strip())}'; testing {log_safe(url)}", file=sys.stderr)
+
+    if args.credentials and log_level != "quiet":
+        print(f"Loaded {len(credentials)} credentials from {args.credentials}", file=sys.stderr)
     if args.inline_credentials:
         for cred_str in args.inline_credentials:
             try:
@@ -1090,27 +1382,54 @@ Examples:
                 credentials[key] = value
             except ValueError as e:
                 print(f"Error: {e}", file=sys.stderr)
-                sys.exit(1)
+                sys.exit(EXIT_NO_VERDICT)
         if log_level != "quiet":
             print(f"Added {len(args.inline_credentials)} inline credentials", file=sys.stderr)
 
-    # Set Testmail.app credentials if provided (coordinator reads from env)
+    # Testmail.app credentials, passed to the run below. (They used to be
+    # written to os.environ here, after qa_bot.config had already read it,
+    # so the two flags never reached the coordinator.) The feature is not
+    # active: no email-reading action exists yet, so the line must not say
+    # "enabled" while entrypoint.sh, the docs and the READMEs say otherwise.
     testmail_key = args.testmail_api_key or os.getenv("TESTMAIL_API_KEY")
     testmail_namespace = args.testmail_namespace or os.getenv("TESTMAIL_NAMESPACE")
     if testmail_key and testmail_namespace:
-        os.environ["TESTMAIL_API_KEY"] = testmail_key
-        os.environ["TESTMAIL_NAMESPACE"] = testmail_namespace
         if log_level != "quiet":
-            print("Email testing enabled (Testmail.app)", file=sys.stderr)
+            print(
+                "Email testing: Testmail.app credentials set (experimental: "
+                "email-reading actions are not active yet, so email "
+                "verification steps are reported as untestable)",
+                file=sys.stderr,
+            )
     elif testmail_key or testmail_namespace:
-        print("Warning: Both --testmail-api-key and --testmail-namespace are required for email testing", file=sys.stderr)
+        print(
+            "Warning: Testmail.app needs both --testmail-api-key and "
+            "--testmail-namespace; the one given is ignored",
+            file=sys.stderr,
+        )
+        testmail_key = testmail_namespace = None
 
-    max_agents, max_duration, max_cost = resolve_limits(args)
-    try:
-        previous_report = load_previous_report(args.previous_report)
-    except OSError as e:
-        print(f"Error reading previous report: {e}", file=sys.stderr)
-        sys.exit(1)
+    # --known-issues is text and is passed on unchanged (what the Action
+    # sends); a file's entries come from --known-issues-file and go first.
+    known_issues = args.known_issues
+    if args.known_issues_file:
+        known_issues = "\n".join(part for part in (known_issues_entries, known_issues) if part.strip())
+        if log_level != "quiet":
+            print(
+                f"Known issues: {len(known_issues_entries.splitlines())} entr(y/ies) from "
+                f"{log_safe(args.known_issues_file)}",
+                file=sys.stderr,
+            )
+    if is_a_file_name_not_an_issue(args.known_issues):
+        # Every log level: it used to go to the workers as the known issue
+        # with nothing said, and nothing was suppressed.
+        name = log_safe(args.known_issues.strip())
+        print(
+            f"Warning: --known-issues takes the known issues as text, and '{name}' "
+            "looks like a file name. It is sent as text and no file is read; "
+            f"use --known-issues-file {name} to read a file.",
+            file=sys.stderr,
+        )
     if previous_report and log_level != "quiet":
         print(
             f"Previous report loaded ({len(previous_report)} chars) — findings "
@@ -1129,9 +1448,9 @@ Examples:
     # Run exploration
     try:
         result = asyncio.run(run_exploration(
-            url=args.url,
+            url=url,
             goal=args.goal,
-            known_issues=args.known_issues,
+            known_issues=known_issues,
             max_agents=max_agents,
             max_duration=max_duration,
             api_key=api_key,
@@ -1145,6 +1464,8 @@ Examples:
             previous_report=previous_report,
             openrouter_api_key=openrouter_api_key,
             recheck_criticals=args.recheck_criticals,
+            testmail_api_key=testmail_key,
+            testmail_namespace=testmail_namespace,
         ))
     except MissingAPIKeyError as e:
         if not api_key and not openrouter_api_key and not args.model:
@@ -1159,13 +1480,22 @@ Examples:
             flag = "--openrouter-api-key" if e.env_var == "OPENROUTER_API_KEY" else "--api-key"
             print(f"Error: {e}", file=sys.stderr)
             print(f"Set it via {flag} or the {e.env_var} environment variable", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_NO_VERDICT)
     except KeyboardInterrupt:
         print("\nExploration cancelled", file=sys.stderr)
         sys.exit(130)
     except Exception as e:
+        # Not 1: exit 1 means "critical findings" and nothing else.
         print(f"Error during exploration: {e}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_NO_VERDICT)
+
+    # The verdict: exit code, final stderr line and the result's `gate` key
+    # all come from qa_bot.gate.evaluate_gate.
+    gate = evaluate_gate(result, fail_on_zero_flows=not args.allow_zero_flows)
+    gate_line = (
+        f"Gate: {gate.status.replace('_', ' ').upper()} (exit {gate.exit_code}): "
+        f"{log_safe(gate.message)}"
+    )
 
     # A run that never produced exploration_complete failed outright
     # (Playwright launch failure, fatal crash with nothing salvaged, ...).
@@ -1173,11 +1503,13 @@ Examples:
     # GitHub Action entrypoint) treat the result file's existence as a run
     # that produced a report, so writing one here would post an empty one.
     # A salvaged run (completed, with `error` set) does write it, and exits 2
-    # below.
-    if not result.get("completed"):
-        message = result.get("error") or "exploration ended before completing"
-        print(f"Error: QA exploration failed: {message}", file=sys.stderr)
-        sys.exit(2)
+    # below. (`completed: false` is the gate's "aborted" too, so the exit
+    # code here is the gate's.)
+    if result.get("completed") is False:
+        print(gate_line, file=sys.stderr)
+        sys.exit(gate.exit_code)
+
+    result["gate"] = gate.as_dict()
 
     # Format output
     if args.output == "json":
@@ -1187,24 +1519,24 @@ Examples:
 
     # Write output
     if args.output_file:
-        with open(args.output_file, "w") as f:
-            f.write(output)
+        try:
+            with open(args.output_file, "w", opener=lambda p, flags: os.open(p, flags, output_mode)) as f:
+                f.write(output)
+        except OSError as e:
+            # The run is paid for: put its result on stdout rather than lose it.
+            print(output)
+            print(
+                f"Error: could not write --output-file {args.output_file} ({e}); "
+                "the result was printed to stdout instead",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_NO_VERDICT)
         if log_level != "quiet":
             print(f"Output written to {args.output_file}", file=sys.stderr)
     else:
         print(output)
 
-    # Exit 1 on critical issues. Gate on the CURATED count from the synthesis
-    # verdict when present (the report is the source of truth — a raw worker
-    # critical that synthesis downgraded must not fail the run), else on the
-    # RAW worker-reported count (synthesis fell back to a non-AI report).
-    # Mirrors action/entrypoint.sh so CLI and action agree.
-    raw_critical_count = sum(
-        1 for i in result["issues"]
-        if i.get("severity", "").lower() == "critical"
-    )
-    curated = result.get("curated_critical_count")
-    gate_count = curated if curated is not None else raw_critical_count
+    curated, raw_critical_count = gate.curated_critical_count, gate.raw_critical_count
     if curated is not None and curated < raw_critical_count and log_level != "quiet":
         # The curated verdict is AI-written from site-influenced text; a
         # downgrade must be visible wherever the exit code is read.
@@ -1217,41 +1549,15 @@ Examples:
     warning = curated_excess_warning(curated, raw_critical_count)
     if warning and log_level != "quiet":
         print(warning, file=sys.stderr)
-    # A run that ended on a fatal error (rejected key, no credit, a main-loop
-    # crash) exits 2 even when its findings were salvaged into a report: the
-    # result file above is kept so the report and the PR comment survive,
-    # but a deploy gate must never pass a run that died part-way. Until
-    # 2026-11-07 only `completed` was checked, so a salvaged abort exited 0
-    # whenever nothing was critical (state-machines.md GATE-1).
-    fatal_error = result.get("error")
-    if fatal_error:
-        print(
-            f"Error: QA exploration aborted: {log_safe(fatal_error)} — the "
-            "report covers only what ran before the abort",
-            file=sys.stderr,
-        )
-    if gate_count > 0:
-        if log_level != "quiet":
-            if curated is not None:
-                titles = result.get("curated_critical_titles") or []
-                titles_note = f": {' | '.join(log_safe(t) for t in titles)}" if titles else ""
-                print(
-                    f"Found {curated} critical issue(s) after curation{titles_note} "
-                    f"({raw_critical_count} raw worker finding(s))",
-                    file=sys.stderr,
-                )
-            else:
-                print(
-                    f"Found {raw_critical_count} critical issue(s) "
-                    f"(raw worker findings; synthesis produced no curated verdict)",
-                    file=sys.stderr,
-                )
-    if fatal_error:
-        sys.exit(2)
-    if gate_count > 0:
-        sys.exit(1)
 
-    sys.exit(0)
+    # A failing verdict is said at every log level, quiet included: a
+    # non-zero exit with nothing on stderr leaves a script's author guessing
+    # which of "critical findings" and "nothing was tested" happened. The
+    # result file above is written either way, so the report and the PR
+    # comment survive a salvaged abort (state-machines.md GATE-1).
+    if gate.exit_code != EXIT_PASS or log_level != "quiet":
+        print(gate_line, file=sys.stderr)
+    sys.exit(gate.exit_code)
 
 
 if __name__ == "__main__":

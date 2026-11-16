@@ -706,9 +706,10 @@ class FlowExplorationOrchestrator:
                         "report": report,
                         # Curated verdict parsed from the AI report (None when
                         # synthesis fell back to a deterministic report or the
-                        # block was unparseable). The deploy gate still counts
-                        # RAW worker criticals — this is surfaced alongside so
-                        # both numbers are visible.
+                        # block was unparseable). The deploy gate fails on its
+                        # critical count when it is present and on the RAW
+                        # worker criticals only when it is None
+                        # (qa_bot.gate.evaluate_gate, action/entrypoint.sh).
                         "verdict": verdict,
                         "timestamp": datetime.now().isoformat()
                     }

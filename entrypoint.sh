@@ -9,6 +9,13 @@
 
 set -e
 
+# Outside GitHub Actions (the local `docker run` in docs/github-action.md)
+# there is no outputs file. Appending to an empty path killed the script
+# after the paid run and before the report was printed, so discard the
+# outputs instead: the report and the gate verdict still reach the log and
+# the exit code.
+GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
+
 # Run mode: `full` (default) or `smoke`. Smoke maps to the CLI's --smoke:
 # preflight probe, one turn-capped worker opening each top-level nav link
 # once, no forking, report tagged SMOKE TEST ONLY. Anything else is a typo
@@ -24,11 +31,113 @@ case "$INPUT_MODE" in
 esac
 SMOKE_TAG="SMOKE TEST ONLY — not a regression test"
 
+# Boolean inputs. The script compares each to the exact string "true", so
+# 'True', 'yes' or '1' used to switch the deploy gate off without a word and
+# a run with critical findings ended green. Normalise them here, before any
+# browser or AI cost: true/false in any case is accepted, anything else is a
+# typo in the workflow and fails the step — a gate input never fails open.
+# $1 names the variable, $2 the action input, $3 is the value an empty input
+# takes.
+normalise_boolean_input() {
+    local VALUE
+    # Trimmed and on one line, so the ::error:: below prints what was passed
+    # and a value with a newline cannot start a second workflow command.
+    VALUE=$(printf '%s' "${!1}" | tr '\r\n\t' '   ' | sed -e 's/^ *//' -e 's/ *$//')
+    case "${VALUE,,}" in
+        true|false) printf -v "$1" '%s' "${VALUE,,}" ;;
+        "") printf -v "$1" '%s' "$3" ;;
+        *)
+            echo "::error::Invalid $2 '$VALUE' — expected 'true' or 'false'"
+            exit 1
+            ;;
+    esac
+}
+# Empty takes the action.yml default for the two gates and the comment…
+normalise_boolean_input INPUT_FAIL_ON_CRITICAL fail-on-critical true
+normalise_boolean_input INPUT_FAIL_ON_ZERO_FLOWS fail-on-zero-flows true
+normalise_boolean_input INPUT_POST_COMMENT post-comment true
+# …but not for this one. Empty reaches here from a local `docker run` that
+# leaves the variable out, or a workflow expression that evaluated to nothing
+# (GitHub passes that instead of the default); neither asked for payments and
+# deletions to be auto-approved.
+normalise_boolean_input INPUT_DANGEROUSLY_SKIP_PERMISSIONS dangerously-skip-permissions false
+
 # Hidden markers identify QA Bot comments on re-runs: the report comment and
 # the failure notice both carry QABOT_COMMENT_MARKER so a later run updates
 # (or supersedes) whichever is newest instead of stacking a new one.
 QABOT_COMMENT_MARKER="<!-- qa-bot-report -->"
 QABOT_SUPERSEDED_MARKER="<!-- qa-bot-report:superseded -->"
+
+# GitHub rejects an issue comment over 65,536 characters. The PATCH and the
+# fallback POST then both fail, and in update mode the previous run's report
+# stays on the PR looking current. So the long part of every comment is
+# capped, in BYTES: text never has more characters than bytes, so the cap
+# holds however GitHub counts, and it keeps the JSON request inside the
+# kernel's 128 KiB limit on one argument (curl -d).
+# - The report in a report comment: 58,000, which leaves 6,000 for the
+#   marker, the title and the footer (under 3,000 with every note present
+#   at its longest; a test holds that).
+# - An earlier comment's body inside the "Superseded" <details> wrapper (113
+#   bytes): 64,000 — so a comment capped as above is always wrapped whole.
+QABOT_REPORT_MAX_BYTES=58000
+QABOT_SUPERSEDED_MAX_BYTES=64000
+
+# Print the line that closes the code fence text $1 ends inside, or nothing
+# when it ends outside one. The closer is the opener's own indent and fence
+# characters: a fence under a list item is indented with it, and a column-0
+# ``` there would end the list and then OPEN a block; a ~~~ fence is closed
+# only by ~~~; a longer fence only by one at least as long.
+open_fence_closer() {
+    local OPENER='^( *)(`{3,}|~{3,})(.*)$' CLOSER='^ *(`{3,}|~{3,})[[:space:]]*$'
+    local LINE INDENT="" FENCE=""
+    while IFS= read -r LINE || [ -n "$LINE" ]; do
+        if [ -z "$FENCE" ]; then
+            # (a ``` line with a backtick later on it is inline code)
+            if [[ "$LINE" =~ $OPENER ]] &&
+                [[ "${BASH_REMATCH[2]}" == "~"* || "${BASH_REMATCH[3]}" != *'`'* ]]; then
+                INDENT="${BASH_REMATCH[1]}"
+                FENCE="${BASH_REMATCH[2]}"
+            fi
+        elif [[ "$LINE" =~ $CLOSER ]] && [[ "${BASH_REMATCH[1]}" == "$FENCE"* ]]; then
+            FENCE=""
+        fi
+    done <<< "$1"
+    if [ -n "$FENCE" ]; then
+        printf '%s%s' "$INDENT" "$FENCE"
+    fi
+}
+
+# Print text $1 cut to at most $2 bytes, with note $3 appended when anything
+# was cut (the note counts toward $2). The cut is at a line boundary, and a
+# code fence it leaves open is closed, so whatever follows the text in the
+# comment (the Gate line, the footer) is not swallowed into a code block.
+truncate_for_comment() {
+    local LC_ALL=C  # ${#TEXT} and ${TEXT:0:n} in bytes
+    local TEXT="$1" MAX="$2" NOTE=$'\n\n'"$3" KEEP FENCE
+    local FENCE_RESERVE=32  # a newline and the closing fence, if one is needed
+    if [ "${#TEXT}" -le "$MAX" ]; then
+        printf '%s' "$TEXT"
+        return 0
+    fi
+    KEEP=$((MAX - ${#NOTE} - FENCE_RESERVE))
+    if [ "$KEEP" -lt 0 ]; then
+        KEEP=0
+    fi
+    TEXT="${TEXT:0:$KEEP}"
+    if [[ "$TEXT" == *$'\n'* ]]; then
+        TEXT="${TEXT%$'\n'*}"
+    else
+        # One enormous line: drop the UTF-8 character the cut may have split
+        while [[ "$TEXT" == *[$'\x80'-$'\xbf'] ]]; do TEXT="${TEXT%?}"; done
+        if [[ "$TEXT" == *[$'\xc0'-$'\xff'] ]]; then TEXT="${TEXT%?}"; fi
+    fi
+    FENCE=$(open_fence_closer "$TEXT")
+    # (a fence too long for the reserve stays open: the byte cap comes first)
+    if [ -n "$FENCE" ] && [ "${#FENCE}" -lt "$FENCE_RESERVE" ]; then
+        TEXT+=$'\n'"$FENCE"
+    fi
+    printf '%s%s' "$TEXT" "$NOTE"
+}
 
 # Post (or update) the QA Bot comment on PR $PR_NUMBER with body $QABOT_BODY.
 # comment-mode=update (default): PATCH the newest earlier QA Bot comment and
@@ -39,7 +148,7 @@ QABOT_SUPERSEDED_MARKER="<!-- qa-bot-report:superseded -->"
 upsert_qabot_comment() {
     local COMMENTS_API="https://api.github.com/repos/$GITHUB_REPOSITORY/issues"
     local PRIOR_COMMENT_IDS="" PAGE=1 LIST_STATUS PAGE_IDS LATEST_COMMENT_ID HTTP_STATUS
-    local POSTED="" UPDATED_ID="" OLD_ID OLD_STATUS SUPERSEDED_BODY
+    local POSTED="" UPDATED_ID="" OLD_ID OLD_STATUS SUPERSEDED_BODY OLD_BODY
     while [ "$PAGE" -le 10 ]; do
         LIST_STATUS=$(curl -s -o /tmp/comments-page.json -w "%{http_code}" \
             -H "Authorization: token $GITHUB_TOKEN" \
@@ -95,7 +204,10 @@ upsert_qabot_comment() {
     fi
 
     # The current comment is up: collapse every other earlier QA Bot comment
-    # (body kept verbatim inside <details>) so only one reads as current.
+    # (body kept verbatim inside <details>) so only one reads as current. The
+    # body is cut only when the wrapped comment would not fit, which takes a
+    # report posted before reports were capped; uncut, that PATCH was
+    # rejected and the old report stayed looking current.
     for OLD_ID in $PRIOR_COMMENT_IDS; do
         [ "$OLD_ID" = "$UPDATED_ID" ] && continue
         OLD_STATUS=$(curl -s -o /tmp/comment-old.json -w "%{http_code}" \
@@ -106,9 +218,15 @@ upsert_qabot_comment() {
             echo "::warning::Could not read earlier report comment $OLD_ID (HTTP $OLD_STATUS); leaving it as is"
             continue
         fi
-        SUPERSEDED_BODY=$(jq -r --arg s "$QABOT_SUPERSEDED_MARKER" \
-            '$s + "\n<details><summary>Superseded QA Bot report (" + ((.created_at // "") | split("T")[0]) + ")</summary>\n\n" + (.body // "") + "\n\n</details>"' \
-            /tmp/comment-old.json)
+        OLD_BODY=$(truncate_for_comment "$(jq -r '.body // ""' /tmp/comment-old.json)" \
+            "$QABOT_SUPERSEDED_MAX_BYTES" \
+            "*(This earlier report was shortened to fit GitHub's comment size limit.)*")
+        SUPERSEDED_BODY="$QABOT_SUPERSEDED_MARKER
+<details><summary>Superseded QA Bot report ($(jq -r '((.created_at // "") | split("T")[0]) // ""' /tmp/comment-old.json))</summary>
+
+$OLD_BODY
+
+</details>"
         OLD_STATUS=$(curl -s -o /tmp/comment-old.json -w "%{http_code}" -X PATCH \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
@@ -318,8 +436,9 @@ if [ -n "$INPUT_MAX_DURATION" ]; then
 fi
 
 # Run QA bot and capture output. A non-zero exit here is not necessarily
-# fatal (the CLI exits 1 when critical issues are found but still writes
-# results), so capture the exit code and decide based on the result file.
+# fatal (the CLI exits 1 on critical findings, and 2 when nothing was tested
+# or a run was salvaged after an abort, and still writes results), so capture
+# the exit code and decide based on the result file.
 echo "::group::Running QA Bot Exploration"
 # The CLI's log (event lines, Python logging at INFO) carries model output
 # from site-influenced text; a line of it starting with "::" would run as a
@@ -401,7 +520,10 @@ Common causes: unreachable target URL, API authentication or credit errors."
 fi
 
 # Parse results
-REPORT=$(jq -r '.report // "No report generated"' /tmp/qa-result.json)
+# A report that is missing or not text reads as "No report generated", the
+# same words the CLI writes when synthesis delivered nothing; the gate below
+# fails on it.
+REPORT=$(jq -r 'if (.report | type) == "string" then .report else "No report generated" end' /tmp/qa-result.json)
 ISSUES_COUNT=$(jq -r '.issues_found // 0' /tmp/qa-result.json)
 FLOWS_EXPLORED=$(jq -r '.flows_explored // 0' /tmp/qa-result.json)
 # Guard the numeric comparisons below — a malformed value would kill the
@@ -565,13 +687,14 @@ if [ "$INPUT_POST_COMMENT" = "true" ]; then
         if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
             echo "Posting comment to PR #$PR_NUMBER..."
 
+            RUN_REF="this workflow run"
+            if [ -n "$GITHUB_RUN_ID" ] && [ -n "$GITHUB_REPOSITORY" ]; then
+                RUN_REF="the [workflow run](${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+            fi
+
             # Point reviewers at the visual evidence when screenshots exist
             SCREENSHOTS_NOTE=""
             if [ "$SCREENSHOT_COUNT" -gt 0 ]; then
-                RUN_REF="this workflow run"
-                if [ -n "$GITHUB_RUN_ID" ] && [ -n "$GITHUB_REPOSITORY" ]; then
-                    RUN_REF="the [workflow run](${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
-                fi
                 SCREENSHOTS_NOTE="**Screenshots:** $SCREENSHOT_COUNT issue screenshot(s) captured — download the \`qa-bot-screenshots\` artifact from $RUN_REF (uploaded if your workflow includes the upload-artifact step from the QA Bot examples)."
             fi
 
@@ -590,12 +713,22 @@ if [ "$INPUT_POST_COMMENT" = "true" ]; then
                 MODE_NOTE="**Mode:** $SMOKE_TAG (one worker opened each top-level navigation link once; nothing else was exercised)"
             fi
 
+            # Only the report is ever cut to fit GitHub's comment limit (see
+            # QABOT_REPORT_MAX_BYTES), so the marker, the Gate line and the
+            # footer always survive. The gate itself, the `report` output and
+            # the log below all use the full report from the result file.
+            COMMENT_REPORT=$(truncate_for_comment "$REPORT" "$QABOT_REPORT_MAX_BYTES" \
+                "> **Report truncated here:** it is too long for a GitHub comment. The full report is in the log of $RUN_REF, under \"Full QA Report\", and in \`report.md\` in its artifacts (uploaded if your workflow includes the upload-artifact steps from the QA Bot examples). The Gate line below was computed from the full results, not from this shortened text.")
+            if [ "$COMMENT_REPORT" != "$REPORT" ]; then
+                echo "::warning::The report is too long for a GitHub comment; the PR comment carries a truncated copy. The full report is under \"Full QA Report\" below and in the exported report.md."
+            fi
+
             # Build comment body with proper escaping
             COMMENT_BODY=$(cat <<COMMENT_EOF
 $QABOT_COMMENT_MARKER
 $COMMENT_TITLE
 
-$REPORT
+$COMMENT_REPORT
 
 ---
 **Run stats:** Explored $FLOWS_EXPLORED user flows | $ISSUES_COUNT raw issue(s) detected during exploration ($CRITICAL_COUNT critical) | Duration: ${DURATION}s | $COST_NOTE
@@ -654,6 +787,19 @@ fi
 # target, ...). The posted report names the blockers.
 if [ "${INPUT_FAIL_ON_ZERO_FLOWS:-true}" = "true" ] && [ "$FLOWS_EXPLORED" -eq 0 ]; then
     echo "::error::QA Bot completed without testing any flows — the target was NOT verified. See the report for blockers."
+    EXIT_CODE=1
+fi
+
+# A run with no report has nothing to base a verdict on, so it is never a
+# green check either: flows ran, synthesis delivered nothing, and the comment
+# would say "No report generated" under a passing gate. Not an input, like
+# the abort rule above. (The CLI's exit 2 for the same result:
+# qa_bot/gate.py REASON_NO_REPORT; tests/test_gate_parity.py keeps the two
+# in step.)
+REPORT_TEXT="${REPORT#"${REPORT%%[![:space:]]*}"}"
+REPORT_TEXT="${REPORT_TEXT%"${REPORT_TEXT##*[![:space:]]}"}"
+if [ -z "$REPORT_TEXT" ] || [ "$REPORT_TEXT" = "No report generated" ]; then
+    echo "::error::QA Bot produced no report, so there is nothing to base a verdict on"
     EXIT_CODE=1
 fi
 

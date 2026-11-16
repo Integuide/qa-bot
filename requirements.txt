@@ -1,13 +1,13 @@
-# Every deploy brings the venv up to the newest release at least 7 days old
-# that these lines allow (scripts/venv_sync.py), so each range stops below the
-# next major: a major of a package listed here arrives as a Dependabot PR,
-# never with a deploy. A package that only arrives as a dependency is not
-# capped: it moves to the newest release its parents allow, majors included
-# (still 7 days old). List it here with a cap if that matters.
+# What the QA Bot package itself needs: the CLI and the GitHub Action image.
+# The image installs exactly this file (action/Dockerfile, pinned further by
+# action-constraints.txt), and the sync publishes it as the public repo's
+# requirements.txt. The web server and the test suite add theirs in
+# requirements.txt, which includes this file. Add a package here only if
+# something under qa_bot/ imports it (tests/test_action_image.py checks).
+#
+# The same deploy rule as requirements.txt applies: every range stops below
+# the next major, so a major arrives as a Dependabot PR, never with a deploy.
 
-# Core dependencies
-fastapi==0.162.0
-uvicorn[standard]==0.35.0
 python-dotenv==1.2.2
 pydantic>=2.0.0,<3
 
@@ -24,12 +24,5 @@ anthropic==1.7.0
 # Dependabot ignores it, so move it by hand: docs/github-action.md.
 playwright==1.63.0
 
-# Testing
-pytest>=9.0.0,<10
-pytest-asyncio>=1.0.0,<2
-
-# HTTP Client (for Testmail.app email testing)
+# HTTP client (OpenRouter provider, the pre-flight probe, Testmail.app)
 httpx>=0.27.0,<1
-
-# System Monitoring
-psutil>=5.9.0,<8

@@ -51,9 +51,9 @@ Element actions (clicks, hover, type, scroll_to) take a "ref" from the CURRENT I
 {"action_type": "type", "ref": "ref_3", "element": "Email input", "text": "qa-{run_nonce}-4821@example.com", "reasoning": "Entering a unique test email address"}
 
 **Set form value (checkboxes, selects, date/time inputs):**
-{"action_type": "form_input", "ref": "ref_7", "value": true, "reasoning": "Checking the terms checkbox"}
-{"action_type": "form_input", "ref": "ref_9", "value": "Option 2", "reasoning": "Selecting dropdown option"}
-{"action_type": "form_input", "ref": "ref_11", "value": "15/01/1990", "reasoning": "Setting date of birth"}
+{"action_type": "form_input", "ref": "ref_7", "element": "Terms checkbox", "value": true, "reasoning": "Checking the terms checkbox"}
+{"action_type": "form_input", "ref": "ref_9", "element": "Plan select", "value": "Option 2", "reasoning": "Selecting dropdown option"}
+{"action_type": "form_input", "ref": "ref_11", "element": "Date of birth", "value": "15/01/1990", "reasoning": "Setting date of birth"}
 form_input is the ONLY way to operate a `<select>` dropdown — clicking one open cannot work (see above). For selects, "value" matches the option's value or visible label; if no option matches you'll get the real option list back to retry with.
 
 **Scroll the page:**

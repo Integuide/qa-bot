@@ -1,59 +1,41 @@
 # Exact dependency set for the GitHub Action image ONLY — action/Dockerfile
-# installs requirements.txt with `-c action-constraints.txt`. Development
-# keeps requirements.txt's ranges; this file only stops the CI image from
-# drifting between builds (it is rebuilt from scratch on every run).
+# installs requirements-action.txt with `-c action-constraints.txt`.
+# Development keeps the requirements files' ranges; this file only stops the
+# CI image from drifting between builds (it is rebuilt from scratch on every
+# run).
 #
-# Source: the docs' uv regeneration on 2026-11-04 (7-day window), for
-# fastapi 0.162 / starlette 1.x (security posture); until then, the last green
-# deploy gate's own install (run 35740756563, 2026-09-22). The image is
-# Python 3.10 (Ubuntu jammy), hence tomli /
-# exceptiongroup / backports-asyncio-runner. playwright must match the
-# Dockerfile's base image tag (v<playwright>-jammy) so Chromium ships in the
-# base instead of being downloaded on every build.
+# Source: the docs' uv regeneration on 2026-11-04 (7-day window), cut on
+# 2026-11-16 to what requirements-action.txt needs (43 pins to 23, no version
+# moved): the image used to install the web server's and the test suite's
+# packages too (fastapi, uvicorn, pytest and what they pull in), which
+# nothing under qa_bot/ imports. The image is Python 3.10 (Ubuntu jammy),
+# hence exceptiongroup. playwright must match the Dockerfile's base image tag
+# (v<playwright>-jammy) so Chromium ships in the base instead of being
+# downloaded on every build.
 #
 # Bump procedure: docs/github-action.md "Action image dependencies".
 # Hand-bumped since: none (certifi 2026.10.19, the eMudhra root removal, was
 # hand-pinned 2026-10-22 until a regeneration resolved past it).
-annotated-doc==0.0.5
 annotated-types==0.8.0
 anthropic==1.7.0
 anyio==4.15.1
-backports-asyncio-runner==1.2.0
 certifi==2026.10.23
-click==8.5.0
 docstring-parser==0.18.0
 exceptiongroup==1.3.1
-fastapi==0.162.0
 greenlet==3.5.6
 h11==0.16.0
 httpcore==1.0.9
 httpcore2==2.14.0
-httptools==0.9.0
 httpx==0.28.1
 httpx2==2.14.0
 idna==3.20
-iniconfig==2.3.1
 jiter==0.18.0
-opentelemetry-api==1.45.1
-packaging==26.3
 playwright==1.63.0
-pluggy==1.7.0
-psutil==7.2.2
 pydantic==2.14.1
 pydantic-core==2.50.1
 pyee==13.0.1
-pygments==2.21.0
-pytest==9.2.0
-pytest-asyncio==1.4.1
 python-dotenv==1.2.2
-pyyaml==6.0.3
 sniffio==1.3.1
-starlette==1.7.0
-tomli==2.5.0
 truststore==0.10.5
 typing-extensions==4.16.0
 typing-inspection==0.4.4
-uvicorn==0.35.0
-uvloop==0.23.0
-watchfiles==1.3.0
-websockets==16.1.1

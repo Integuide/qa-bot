@@ -27,7 +27,7 @@ from qa_bot.browser.controller import (
 )
 from qa_bot.orchestrator.browser_pool import BrowserPool, strip_url_credentials
 from qa_bot.orchestrator.shared_state import SharedFlowState, UserDataField, UserDataRequest, format_user_data_for_prompt
-from qa_bot.utils.secrets import mask_value, redact_values
+from qa_bot.utils.secrets import redact_obj
 from qa_bot.orchestrator.flow import FlowTask, FlowCheckpoint, FlowStatus
 from qa_bot.orchestrator import recheck as rc
 
@@ -796,6 +796,123 @@ class ReportedIssue:
     """An issue reported during action execution."""
     description: str
     severity: str
+
+
+def effective_action(action: AgentAction) -> AgentAction:
+    """The action as the worker executes it: a parameter the model left out
+    is filled with the default the worker uses, and an out-of-range one is
+    clamped.
+
+    ``_execute_action`` and ``build_action_record`` both read the action
+    through this, so the record states what was done. A scroll the model
+    asked to run for 50 ticks runs for 10, and a record saying 50 would
+    read to synthesis as a scroll to the bottom of the page.
+    """
+    kind = action.action_type
+    if kind == "scroll":
+        return action.model_copy(update={
+            "scroll_direction": action.scroll_direction or "down",
+            # Ticks, 1-10, default 3 (100px each)
+            "scroll_amount": max(1, min(action.scroll_amount or 3, 10)),
+        })
+    if kind == "key":
+        return action.model_copy(update={"key": action.key or "Enter"})
+    if kind == "wait":
+        # Chrome MCP style: seconds, default 2, max 30
+        duration = action.duration if action.duration is not None else 2.0
+        return action.model_copy(update={"duration": min(duration, 30.0)})
+    if kind == "resize":
+        return action.model_copy(update={
+            "width": action.width or 1280,
+            "height": action.height or 720,
+        })
+    return action
+
+
+# AgentAction fields recorded under another name. A bare "url" in an action
+# record means the page the action ran on to the record's older readers, so
+# the navigate target is "target_url".
+_ACTION_RECORD_RENAMES = {"url": "target_url"}
+
+# Record keys that are never masked. Each holds a value the worker generates
+# (timestamp) or the schema limits to a fixed vocabulary, so it cannot carry
+# a secret, and readers parse or branch on it: with a registered code of
+# "2026", masking every string turned each timestamp into
+# "[MASKED - 4 chars]-11-14T15:30:43" (the web UI's "Invalid Date").
+# `ref` is not here: the model writes it as free text.
+_ACTION_RECORD_UNMASKED = frozenset({
+    "action_type", "timestamp", "scroll_direction", "severity", "recheck_outcome",
+})
+
+
+def build_action_record(
+    action: AgentAction,
+    *,
+    page_url: str,
+    success: bool,
+    secrets,
+    note: str = "",
+    error: str = "",
+    error_corrective: bool = False,
+) -> dict:
+    """The record of one executed action.
+
+    One dict with three readers, so it has to carry everything each needs:
+    the SSE ``action`` event (CLI log, operations.log, web UI activity log
+    and JSON export), the worker's ``action_history`` (the AI's Recent
+    Actions recap, carried in every FlowCheckpoint), and the flow's recorded
+    actions (the action summary synthesis curates from, and the steps an
+    independent re-check is given).
+
+    Every parameter the model set is recorded under its AgentAction field
+    name (``url`` as ``target_url``), as executed (``effective_action``).
+    The list comes from the schema, not from a hand-kept set of keys: the
+    hand-kept set carried ten fields fewer than its readers read, so every
+    scroll reached the CI log and synthesis as "Scroll down", every key
+    press as "Press key: " and every form_input as "Set field to ''"
+    whatever had happened. An empty string or list counts as not set,
+    except ``value``, where "" is what a field was cleared to.
+
+    Known secret values (``secrets``, required so that no caller gets an
+    unmasked record by leaving it out) are masked in every free-text string
+    of the record. The raw value only ever reaches the browser: a credential
+    typed, selected, quoted in the reasoning or written into a forked flow's
+    description must not leave the worker in cleartext through any key.
+    Substring redaction (same as the loggers), so "user:hunter2" or a value
+    the model padded does not slip out for not being byte-identical to the
+    secret. The keys in ``_ACTION_RECORD_UNMASKED`` cannot hold one and are
+    left as they are.
+    """
+    action = effective_action(action)
+    record = {
+        "action_type": action.action_type,
+        "reasoning": action.reasoning,
+        # URL where the action was executed
+        "page_url": page_url,
+        "timestamp": datetime.now().isoformat(),
+        "success": success,
+    }
+    params = action.model_dump(
+        mode="json",  # tuples (coordinate, region) as lists
+        exclude={"action_type", "reasoning"},
+        exclude_defaults=True,
+    )
+    for name, value in params.items():
+        if name != "value" and (value == "" or value == []):
+            continue
+        record[_ACTION_RECORD_RENAMES.get(name, name)] = value
+    if note:
+        record["note"] = note
+    if error:
+        record["error"] = error
+        if error_corrective:
+            # Crafted instruction for the AI — the history formatter
+            # must not apply the tight raw-error truncation to it
+            record["error_corrective"] = True
+    return {
+        key: value if key in _ACTION_RECORD_UNMASKED else redact_obj(value, secrets)
+        for key, value in record.items()
+    }
 
 
 class FlowExplorationWorker:
@@ -2055,39 +2172,9 @@ class FlowExplorationWorker:
                     }
                 })
 
-            # Build action record for history
-            action_dict = {
-                "action_type": action.action_type,
-                "reasoning": action.reasoning,
-                # URL where the action was executed — the active page (popup
-                # when one is open), matching where ref actions are routed
-                "page_url": browser.current_url,
-                "timestamp": datetime.now().isoformat(),
-                "success": exec_result.success,
-            }
-            # Add action-specific fields
-            if action.ref is not None:
-                action_dict["ref"] = action.ref
-            if action.element:
-                action_dict["element"] = action.element
-            if action.coordinate is not None:
-                action_dict["coordinate"] = list(action.coordinate)
-            if action.text:
-                # A typed credential/password must not leave the worker in
-                # cleartext: this dict feeds the SSE `action` event (UI
-                # activity log, JSON export), operations.log and the AI's
-                # own history. The raw value only ever reaches the browser.
-                # Substring redaction (same as the loggers): "user:hunter2"
-                # or a value the model padded must not slip out because it is
-                # not byte-identical to the registered secret.
-                action_dict["text"] = redact_values(action.text, self.state.get_secret_values())
-            if action.url:
-                action_dict["target_url"] = action.url  # Target URL for navigate action
-            if action.reason:
-                action_dict["reason"] = action.reason
-            # The crafted note goes first: the history formatter caps the
-            # line, and the typed-field note's remedy sentence is the part
-            # that must not be the one cut off.
+            # Build action record for history. The crafted note goes first:
+            # the history formatter caps the line, and the typed-field note's
+            # remedy sentence is the part that must not be the one cut off.
             notes = [exec_result.note] if exec_result.note else []
             if downloads:
                 # Surface the download in action history so the next AI turn
@@ -2096,15 +2183,19 @@ class FlowExplorationWorker:
                     d.suggested_filename or d.url for d in downloads
                 )
                 notes.append(f"Triggered file download: {filenames}")
-            if notes:
-                action_dict["note"] = " ".join(notes)
+            action_dict = build_action_record(
+                action,
+                # The active page (popup when one is open), matching where
+                # ref actions are routed
+                page_url=browser.current_url,
+                success=exec_result.success,
+                secrets=self.state.get_secret_values(),
+                note=" ".join(notes),
+                error=exec_result.error,
+                error_corrective=exec_result.corrective_error,
+            )
 
             if exec_result.error:
-                action_dict["error"] = exec_result.error
-                if exec_result.corrective_error:
-                    # Crafted instruction for the AI — the history formatter
-                    # must not apply the tight raw-error truncation to it
-                    action_dict["error_corrective"] = True
                 events.append({
                     "type": "action_error",
                     "worker_id": self.worker_id,
@@ -2502,6 +2593,9 @@ class FlowExplorationWorker:
                 corrective_error=True,
                 error=RECHECK_DISABLED_ERROR.format(action=action.action_type),
             )
+        # Defaults and clamps are applied once, in the function the action
+        # record also reads, so what runs and what is recorded cannot differ
+        action = effective_action(action)
         try:
             # Click actions. Refs are preferred (auto-wait, actionability
             # checks), but a bare [x, y] coordinate from the screenshot is
@@ -2635,10 +2729,8 @@ class FlowExplorationWorker:
                 )
 
             elif action.action_type == "scroll":
-                direction = action.scroll_direction or "down"
-                # Clamp scroll_amount to 1-10 range, default 3, convert ticks to pixels
-                scroll_ticks = max(1, min(action.scroll_amount or 3, 10))
-                amount = scroll_ticks * 100
+                direction = action.scroll_direction
+                amount = action.scroll_amount * 100  # ticks to pixels
                 delta_y = amount if direction == "down" else -amount if direction == "up" else 0
                 delta_x = amount if direction == "right" else -amount if direction == "left" else 0
                 # Route through active_page: the AI is looking at the popup
@@ -2673,7 +2765,7 @@ class FlowExplorationWorker:
                 )
 
             elif action.action_type == "key":
-                key = action.key or "Enter"
+                key = action.key
                 if action.modifiers:
                     modifier_map = {
                         "ctrl": "Control",
@@ -2837,14 +2929,13 @@ class FlowExplorationWorker:
                 return ActionResult(success=True, message=f"Navigated to {url}")
 
             elif action.action_type == "wait":
-                # Use duration if provided (Chrome MCP style), default to 2 seconds, max 30
-                duration = min(action.duration if action.duration is not None else 2, 30)
+                duration = action.duration
                 await asyncio.sleep(duration)
                 return ActionResult(success=True, message=f"Waited {duration} seconds")
 
             elif action.action_type == "resize":
-                width = action.width or 1280
-                height = action.height or 720
+                width = action.width
+                height = action.height
                 # Resize the page the AI is looking at (screenshots and
                 # viewport size already come from active_page)
                 await browser.active_page.set_viewport_size({"width": width, "height": height})

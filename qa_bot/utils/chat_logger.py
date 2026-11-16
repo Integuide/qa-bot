@@ -118,6 +118,17 @@ LIVE_RUN_QUIET_SECONDS = 60 * 60
 _LIVE_SUMMARY_STATUSES = frozenset({"running", "synthesizing"})
 
 
+def _is_run_dir(path: Path) -> bool:
+    """True when ``path`` is a directory a QA Bot run wrote.
+
+    Every run opens ``operations.log`` in its directory before anything else
+    (``_setup_ops_logger``), so its presence is the mark. Rotation must only
+    ever look at these: LOG_DIR defaults to ``./logs`` relative to wherever
+    the CLI is run, and a project's own ``logs/`` folder holds other things.
+    """
+    return path.is_dir() and (path / "operations.log").is_file()
+
+
 def _is_live_run_dir(run_dir: Path) -> bool:
     """True when ``run_dir`` looks like a run that is still writing."""
     try:
@@ -224,13 +235,16 @@ class ChatLogger:
         if not self._log_dir.exists():
             return
 
-        # Get all exploration directories (UUIDs), except live runs': until
-        # 2026-11-07 ten run starts during one run deleted its directory,
-        # every later turn's log write raised after the AI call was billed,
-        # every flow failed twice and report.md was never written (LOG-1)
+        # Only directories a QA Bot run wrote: until 2026-11-14 this took every
+        # subdirectory, so a CLI run from a project whose own logs/ held more
+        # than LOG_MAX_RUNS folders deleted the oldest of them (LOG-3). And
+        # never a live run's: until 2026-11-07 ten run starts during one run
+        # deleted its directory, every later turn's log write raised after the
+        # AI call was billed, every flow failed twice and report.md was never
+        # written (LOG-1)
         exploration_dirs = [
             d for d in self._log_dir.iterdir()
-            if d.is_dir() and d.name != self.exploration_id and not _is_live_run_dir(d)
+            if _is_run_dir(d) and d.name != self.exploration_id and not _is_live_run_dir(d)
         ]
 
         if len(exploration_dirs) < self._max_logs:

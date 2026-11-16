@@ -35,7 +35,7 @@ To post the report as a PR comment, the job also needs `permissions: pull-reques
 | `known-issues` | No | - | Already-acknowledged issues / environment caveats (free text, one per line). Matches aren't re-investigated and appear only as one-line "observed again" notes in the report, not as new findings |
 | `previous-report` | No | - | The previous run's report for the same target (path to its `report.md`, or the markdown inline). Findings are labelled **NEW** / **recurring (seen in previous run)** and previous findings not observed are listed once (never as "fixed"); the PR footer prints "N new, M recurring". Labels only — severity never changes; use `known-issues` to acknowledge a finding |
 | `mode` | No | `full` | `full` explores user flows against the goal; `smoke` runs one turn-capped worker that opens each top-level navigation link once (no sign-up/login/forms, no flow forking, `goal` ignored) and tags the report and PR comment "SMOKE TEST ONLY — not a regression test". For deploys that don't change the surface under test |
-| `max-agents` | No | `3` (smoke: `1`) | Parallel AI agents (1-10). Empty = the default for the mode |
+| `max-agents` | No | `3` (smoke: `1`) | Parallel AI agents (1-20; 1-10 recommended). Empty = the default for the mode |
 | `max-cost` | No | `5.0` (smoke: `0.75`) | Maximum cost in USD. Empty = the default for the mode |
 | `max-duration` | No | `30` (smoke: `5`) | Maximum duration in minutes. Empty = the default for the mode |
 | `model` | No | (empty) | Empty = `openai/gpt-6-luna` when `openrouter-api-key` is set, else `claude-sonnet-5-5`. Or a Claude model / an OpenRouter `vendor/slug` id, which always wins |
@@ -49,7 +49,9 @@ To post the report as a PR comment, the job also needs `permissions: pull-reques
 | `testmail-namespace` | No | - | Testmail.app namespace (experimental — not yet active) |
 | `dangerously-skip-permissions` | No | `true` | Auto-approve destructive actions (enabled by default in CI) |
 
-A run that ended on a fatal error (a rejected API key, no credit, a crash) always fails, whatever `fail-on-critical` and `fail-on-zero-flows` say. Any findings it made before the abort are still posted, marked **Run aborted**.
+The four on/off inputs (`post-comment`, `fail-on-critical`, `fail-on-zero-flows`, `dangerously-skip-permissions`) take `true` or `false` in any case. Any other value (`yes`, `0`, `off`) fails the step with an error naming the input, so a misspelt `fail-on-critical` can't quietly switch the gate off. `known-issues` is always text: a value that names a file is not read.
+
+A run that ended on a fatal error (a rejected API key, no credit, a crash) always fails, whatever `fail-on-critical` and `fail-on-zero-flows` say. So does a run that produced no report: there is nothing to base a verdict on. Any findings it made before the abort are still posted, marked **Run aborted**.
 
 ## Outputs
 
@@ -142,7 +144,7 @@ jobs:
       - uses: Integuide/qa-bot@main
         with:
           url: 'https://staging.example.com'
-          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          openrouter-api-key: ${{ secrets.QA_BOT_OPENROUTER_API_KEY }}  # or anthropic-api-key for Claude
           github-token: ${{ github.token }}
 
       # Publish issue screenshots as an artifact (referenced by the PR comment)
@@ -179,7 +181,7 @@ jobs:
         with:
           url: ${{ inputs.url }}
           goal: ${{ inputs.goal }}
-          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          openrouter-api-key: ${{ secrets.QA_BOT_OPENROUTER_API_KEY }}  # or anthropic-api-key for Claude
           post-comment: 'false'  # No PR to comment on
 ```
 
@@ -191,7 +193,7 @@ Provide credentials for authenticated flows:
 - uses: Integuide/qa-bot@main
   with:
     url: 'https://staging.example.com'
-    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    openrouter-api-key: ${{ secrets.QA_BOT_OPENROUTER_API_KEY }}  # or anthropic-api-key for Claude
     github-token: ${{ github.token }}
     credentials: |
       TEST_USER_EMAIL=${{ secrets.TEST_USER_EMAIL }}
@@ -215,8 +217,10 @@ jobs:
       - uses: Integuide/qa-bot@main
         with:
           url: 'https://staging.example.com'
-          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-          fail-on-critical: 'true'
+          openrouter-api-key: ${{ secrets.QA_BOT_OPENROUTER_API_KEY }}  # or anthropic-api-key for Claude
+          fail-on-critical: 'true'    # the default, shown for clarity
+          fail-on-zero-flows: 'true'  # the default: a run that tested nothing fails too
+          post-comment: 'false'       # a push has no PR to comment on
 
   deploy:
     needs: qa
@@ -233,21 +237,78 @@ Inputs for testing email verification flows with [Testmail.app](https://testmail
 - uses: Integuide/qa-bot@main
   with:
     url: 'https://staging.example.com'
-    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    openrouter-api-key: ${{ secrets.QA_BOT_OPENROUTER_API_KEY }}  # or anthropic-api-key for Claude
     github-token: ${{ github.token }}
     goal: 'Test the full signup flow including email verification'
     testmail-api-key: ${{ secrets.TESTMAIL_API_KEY }}
     testmail-namespace: ${{ secrets.TESTMAIL_NAMESPACE }}
 ```
 
+## Command Line
+
+The same tester runs from a terminal, with no GitHub involved. It needs
+Python 3.10 or newer.
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install git+https://github.com/Integuide/qa-bot
+playwright install chromium
+
+export OPENROUTER_API_KEY=...   # GPT-6 Luna; or ANTHROPIC_API_KEY for Claude
+qa-bot https://staging.example.com --goal "Test the checkout flow"
+qa-bot --help                   # every option
+qa-bot --version
+```
+
+It is installed from this repository and is not on PyPI, so never
+`pip install qa-bot`. Add a [release tag](https://github.com/Integuide/qa-bot/tags) from
+`v0.2.0` on to the URL (`...qa-bot@v0.2.0`) to install that release. From a clone, `pip install .` does the
+same, and `python -m qa_bot.cli` runs it without installing
+(`pip install -r requirements.txt` first).
+
+The report is printed to stdout (`--output json --output-file result.json`
+writes the full result instead). Stderr carries a `Model:` line saying which
+model ran and why, then warnings and errors; `-v` adds flow progress and `-vv`
+every action. Run logs, the report and issue screenshots are also kept under
+`./logs/<run id>/` (the newest 10 runs).
+
+The exit code is the deploy gate, so `qa-bot URL && deploy` only
+deploys a site that was tested and came back clean:
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | The site was tested and no critical finding gates |
+| `1` | Critical findings (the report's curated count when it has a verdict, else the raw worker count) |
+| `2` | No verdict: the run aborted (rejected key, no credit, a crash), nothing was tested (unreachable target, no user flow completed, no report), or a configuration error (missing key, bad credentials file, a URL or limit that cannot work) |
+| `130` | Interrupted (Ctrl-C) |
+
+`--allow-zero-flows` accepts a run in which no flow was tested (a report-only
+run). With `--output json`, the result's `gate` key carries the same verdict
+and its reasons.
+
+The Action's inputs have matching flags: `--smoke`, `--max-agents`,
+`--max-cost`, `--max-duration`, `--model`, `--credentials creds.env` (or
+`--credential KEY=VALUE`), `--previous-report report.md`, and
+`--dangerously-skip-permissions`, which is **off** by default here (the Action
+turns it on because nobody can answer an approval request in CI). Known issues
+come as text (`--known-issues "one per line"`) or from a file
+(`--known-issues-file .qa-known-issues.md`; blank lines and `#` lines are
+skipped). `--previous-report report.md --output-file report.md` keeps one
+file as the run-over-run memory: the old report is read before it is
+replaced.
+
 ## Cost Management
 
 QA Bot tracks API costs in real-time and stops when limits are reached:
 
-- **Default limit:** $5.00 per run
-- **Sonnet 5.5 model (default):** ~$1.50-7.00 per typical full run (smoke runs ~$0.25)
-- **Haiku 5.5 model (budget, `claude-haiku-5-5`):** GPT-6 Luna's per-token rates ($0.10/$0.50 per MTok), so roughly a tenth of Haiku 4.5's ~$0.50-2.00 per run (not yet measured on a full run); a lower bound for very long flows (see [Model and keys](#model-and-keys))
-- **Opus 4.8 model (premium):** ~$4.00-15.00 per typical run
+- **Default limit:** $5.00 per full run, $0.75 per smoke run
+
+| Model | When it runs | Cost |
+|-------|--------------|------|
+| **GPT-6 Luna** (`openai/gpt-6-luna`) | The default with an OpenRouter key | $0.10 / $0.50 per million input / output tokens. One measured comparison: the same 8-minute run cost $0.15 on Luna and $1.89 on Claude Sonnet 5, about 13x less. No typical full-run range has been measured yet |
+| **Claude Sonnet 5.5** (`claude-sonnet-5-5`) | The default with only an Anthropic key | About $1.50-7.00 per typical full run (smoke runs about $0.25) |
+| **Claude Haiku 5.5** (`claude-haiku-5-5`) | When named as `model` | The same per-token rates as GPT-6 Luna; not yet measured on a full run, and a lower bound for very long flows (see [Model and keys](#model-and-keys)) |
+| **Claude Opus 4.8** (`claude-opus-4-8`) | When named as `model` | About $4.00-15.00 per typical full run |
 
 Adjust with `max-cost` and `max-duration` inputs.
 
@@ -284,8 +345,7 @@ turns without their thinking blocks: from the start on Fable 5.2, and
 otherwise after the first rejected request of a run, which is retried at
 once and logged as a warning. The model then works from each turn's
 screenshot and the Recent Actions recap, without its own earlier reasoning.
-Older accounts on the other models are unchanged. Background:
-[mono#759](https://github.com/Integuide/mono/issues/759).
+Older accounts on the other models are unchanged.
 
 Haiku 5.5's cost figure is a lower bound for very long flows: a call whose
 prompt passes 100K tokens bills at $0.50/$2.50 per MTok (5x), which the
@@ -298,10 +358,10 @@ Issues are categorized by severity:
 
 | Severity | Description | Example |
 |----------|-------------|---------|
-| **Critical** | Blocks core functionality | Signup fails, checkout broken |
-| **High** | Major feature broken | Search returns wrong results |
-| **Medium** | Noticeable problems | Form validation missing |
-| **Low** | Minor issues | Typos, styling glitches |
+| **Critical** | Blocks core functionality, a security issue, or data loss. The only level that fails the check | Signup fails, checkout broken |
+| **Major** | A feature is broken, or a significant UX problem | Search returns wrong results |
+| **Minor** | Small bugs and inconsistencies | A missing validation message |
+| **Cosmetic** | Visual styling only | Misaligned buttons, typos |
 
 Before a critical can fail the check, a separate verifier re-tests it during
 the run in a fresh browser. If it does not reproduce, the finding is demoted
@@ -311,14 +371,53 @@ criticals stay critical. The PR footer's **Independent re-check of
 criticals** line gives the counts. Set `RECHECK_CRITICALS: 'false'` in the
 step's `env:` to turn it off.
 
+## Versions and Pinning
+
+`Integuide/qa-bot@main` always runs the newest QA Bot: the tester's prompts,
+default model and gate logic can change between two of your runs. That suits a
+report-only check. For a deploy gate you may prefer to choose when it changes:
+pin a release and move the pin when you want the newer one.
+
+Since `v0.1.0`, every change to this repository is a release with a tag
+(`v0.2.0`, `v0.3.0`, ...; see [tags](https://github.com/Integuide/qa-bot/tags)). Pin the tag's
+commit and keep the tag in a comment:
+
+```yaml
+- uses: Integuide/qa-bot@<full commit sha>  # v0.2.0
+```
+
+With that comment, Dependabot's `github-actions` updates open a pull request
+when a newer release exists, so the tester changes when you merge it. `main`
+cannot be force-pushed or deleted, so a pinned commit stays valid. The run's
+log starts with the version (`QA Bot 0.2.0: starting ...`).
+
 ## Requirements
 
 - An OpenRouter API key ([get one here](https://openrouter.ai/settings/keys)) or an Anthropic API key ([get one here](https://console.anthropic.com/))
 - Publicly accessible URL (or use a tunnel for localhost)
 
-**Re-running on the same PR?** The report comment is updated in place by default (it carries a hidden `<!-- qa-bot-report -->` marker), so a fix-and-rerun cycle never leaves a stack of stale reports. Set `comment-mode: new` to keep each run as its own comment — earlier reports are then collapsed under a "Superseded QA Bot report" summary. A run that fails before producing results always posts a separate, short failure notice.
+**Re-running on the same PR?** The report comment is updated in place by default (it carries a hidden `<!-- qa-bot-report -->` marker), so a fix-and-rerun cycle never leaves a stack of stale reports. Set `comment-mode: new` to keep each run as its own comment — earlier reports are then collapsed under a "Superseded QA Bot report" summary. A run that fails before producing results posts a short failure notice the same way: in `update` mode it replaces the earlier report comment, so the PR never shows a stale report as current.
+
+**Very long report?** GitHub caps a comment at 65,536 characters. A report over 58,000 bytes is cut at a line boundary in the comment, with a note linking the workflow run; the `report` output, the job log and the `report.md` artifact keep the whole report.
 
 **Report not appearing as a PR comment?** Make sure the workflow passes `github-token: ${{ github.token }}` to the action and the job grants `permissions: pull-requests: write` — without both, the run completes but the comment is silently skipped.
+
+## Contributing and Security
+
+This repository is generated from Integuide's private monorepo on every
+release, and each sync replaces its whole contents. A pull request merged
+here would be overwritten by the next one, so please open an
+[issue](https://github.com/Integuide/qa-bot/issues) instead: bug reports,
+false positives the tester should not have raised, and feature requests are
+all welcome there.
+
+QA Bot is given an API key and, if you pass them, test-account credentials,
+and it drives a browser against a site whose content it cannot trust. If you
+find a way for a tested page to make it leak a credential or act outside the
+target site, please report it privately through the repository's
+**Security** tab ("Report a vulnerability") instead of a public issue. If
+that button is not shown, open an issue that asks for a private contact and
+leaves the details out.
 
 ## License
 
