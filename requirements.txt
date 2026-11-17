@@ -8,14 +8,14 @@
 # The same deploy rule as requirements.txt applies: every range stops below
 # the next major, so a major arrives as a Dependabot PR, never with a deploy.
 
-python-dotenv==1.2.2
-pydantic>=2.0.0,<3
+python-dotenv==1.2.4
+pydantic>=2.14.3,<3
 
 # AI Providers
 # Pinned, so a deploy never changes live API calls the suite only mocks, at
 # the version the GitHub Action image runs (action-constraints.txt): every
 # deploy gate exercises it. Upgrades arrive as Dependabot PRs.
-anthropic==1.7.0
+anthropic==1.17.0
 
 # Browser Automation
 # Pinned with the Action image's base tag (action/Dockerfile): each release
